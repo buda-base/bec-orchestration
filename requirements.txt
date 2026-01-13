@@ -1,0 +1,39 @@
+# This project is validated on AWS Deep Learning AMI (DLAMI) for PyTorch (GPU).
+# Assumptions: Pytorch already installed, usually in a venv in /opt/pytorch/ .
+#
+# IMPORTANT:
+# - Do NOT add `torch` / `torchvision` / `torchaudio` here when using DLAMI unless you
+#   intentionally want to replace the AMI-provided CUDA/PyTorch stack.
+# - If you are NOT using DLAMI, install a matching CUDA-enabled PyTorch build first,
+#   then install this file.
+#
+# Reference (DLAMI GPU PyTorch Base):
+# Python==3.12.12
+# torch==2.9.1+cu130  # preinstalled in the AMI; verify on your instance via `python -c "import torch; print(torch.__version__)"`
+# botocore==1.42.21
+#
+# Core numerics (also pre-installed on the AMI)
+# numpy==1.26.4
+# scipy==1.16.3
+
+# Image IO / processing
+# pillow==12.1.0 (pre-installed on AMI)
+opencv-python-headless==4.11.0.86 # unfortunately 4.12 would be better (improved detectContours performance) but 4.12 requires numpy 2 (incompatible with pytorch)
+
+# Outputs
+# pyarrow==22.0.0 (pre-installed)
+
+# S3 + async S3 (note: botocore already installed on the AMI, aiboto3 should sync)
+# boto3==1.42.21 (pinned)
+# botocore==1.42.21 (pinned)
+
+# CLI UI
+# rich==14.2.0 (pinned in AMI)
+
+# TPS (provides `from tps import ThinPlateSpline`)
+thin-plate-spline==1.2.1
+
+segmentation_models_pytorch # for line segmentation
+
+pyvips==3.1.1
+pyvips[binary]

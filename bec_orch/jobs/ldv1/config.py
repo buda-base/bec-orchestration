@@ -39,6 +39,7 @@ class PipelineConfig:
 
     # GPU batching
     use_gpu: bool = True
+    model_path: Optional[str] = None  # Path to model .pth file (required for inference)
     compile_model: bool = False
     precision: Precision = "fp16" # bf16, fp16, fp32 or auto
     pin_tile_memory: bool = True  # Pin tiled tensors for faster async GPU transfer

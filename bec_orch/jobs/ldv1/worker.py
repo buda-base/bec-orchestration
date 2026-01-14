@@ -1,7 +1,12 @@
 import asyncio
+import json
+import logging
 import os
 import contextlib
+import time
+from dataclasses import replace
 from typing import Optional, Dict, Any
+
 from .config import PipelineConfig
 from .types_common import *
 from .prefetch import BasePrefetcher, LocalPrefetcher, S3Prefetcher
@@ -12,7 +17,7 @@ from .ld_inference_runner import LDInferenceRunner
 from .parquet_writer import ParquetWriter
 from .s3ctx import S3Context
 
-# TODO: adjust from async worker to sync worker, adjust signature so it inherits from JobWorker (jobs/base.py)
+logger = logging.getLogger(__name__)
 
 class LDVolumeWorker:
     """Owns a single volume and runs all stages concurrently.
@@ -184,3 +189,185 @@ class LDVolumeWorker:
             # If we're being cancelled or a stage failed unexpectedly, ensure no background tasks linger.
             await self.aclose()
             self._is_running = False
+
+
+# ============================================================================
+# JobWorker Adapter for BEC Orchestration
+# ============================================================================
+
+class LDV1JobWorker:
+    """
+    Synchronous adapter for LDVolumeWorker to integrate with BEC orchestration.
+    
+    Implements the JobWorker protocol expected by BECWorkerRuntime.
+    """
+    
+    def __init__(self):
+        """Initialize the job worker."""
+        pass
+    
+    def run(self, ctx: 'JobContext') -> 'TaskResult':
+        """
+        Run line detection on a volume.
+        
+        Args:
+            ctx: Job context with volume info, config, and artifact location
+            
+        Returns:
+            TaskResult with metrics
+        """
+        from bec_orch.jobs.base import JobContext
+        from bec_orch.core.models import TaskResult
+        
+        logger.info(f"Starting LDV1 job for volume {ctx.volume.w_id}/{ctx.volume.i_id}")
+        start_time = time.time()
+        
+        # Build PipelineConfig from job config with defaults
+        pipeline_cfg = self._build_pipeline_config(ctx)
+        
+        # Build VolumeTask from context
+        volume_task = self._build_volume_task(ctx)
+        
+        # Track metrics
+        metrics = {
+            'total_images': len(ctx.volume_manifest.manifest),
+            'nb_errors': 0,
+            'image_durations': [],
+        }
+        
+        # Progress hook to collect metrics
+        def progress_hook(event: Dict[str, Any]) -> None:
+            if event.get('type') == 'image_complete':
+                duration_ms = event.get('duration_ms', 0)
+                metrics['image_durations'].append(duration_ms)
+            elif event.get('type') == 'error':
+                metrics['nb_errors'] += 1
+        
+        # Run async pipeline
+        try:
+            async def run_pipeline():
+                # Create S3 context within async context
+                global_sem = asyncio.Semaphore(pipeline_cfg.s3_max_inflight_global)
+                s3ctx = S3Context(pipeline_cfg, global_sem)
+                
+                async with LDVolumeWorker(pipeline_cfg, volume_task, progress=progress_hook, s3ctx=s3ctx) as worker:
+                    await worker.run()
+            
+            asyncio.run(run_pipeline())
+            
+        except Exception as e:
+            logger.error(f"Pipeline failed: {e}", exc_info=True)
+            # Re-classify exceptions for orchestration layer
+            from bec_orch.errors import RetryableTaskError, TerminalTaskError
+            
+            # Classify based on error type
+            if 'CUDA out of memory' in str(e) or 'OOM' in str(e):
+                raise RetryableTaskError(f"GPU OOM error: {e}")
+            elif 'NotFound' in str(type(e).__name__) or '404' in str(e):
+                raise TerminalTaskError(f"Resource not found: {e}")
+            else:
+                # Default: retryable
+                raise RetryableTaskError(f"Pipeline error: {e}")
+        
+        # Calculate metrics
+        elapsed_ms = (time.time() - start_time) * 1000
+        total_images = metrics['total_images']
+        nb_errors = metrics['nb_errors']
+        
+        # Average duration per image (from collected durations or fallback to elapsed/count)
+        if metrics['image_durations']:
+            avg_duration_per_page_ms = sum(metrics['image_durations']) / len(metrics['image_durations'])
+            total_duration_ms = sum(metrics['image_durations'])
+        else:
+            # Fallback: use wall clock time
+            total_duration_ms = elapsed_ms
+            avg_duration_per_page_ms = elapsed_ms / max(1, total_images)
+        
+        logger.info(
+            f"LDV1 job completed: {total_images} images, {nb_errors} errors, "
+            f"avg {avg_duration_per_page_ms:.2f}ms/page"
+        )
+        
+        return TaskResult(
+            total_images=total_images,
+            nb_errors=nb_errors,
+            total_duration_ms=total_duration_ms,
+            avg_duration_per_page_ms=avg_duration_per_page_ms,
+        )
+    
+    def _build_pipeline_config(self, ctx: 'JobContext') -> PipelineConfig:
+        """
+        Build PipelineConfig from job context.
+        
+        Starts with defaults and overrides with job config from DB.
+        Model path comes from environment variable BEC_LD_MODEL_PATH.
+        """
+        # Get model path from environment (required for ldv1)
+        model_path = os.environ.get('BEC_LD_MODEL_PATH')
+        if not model_path:
+            raise ValueError(
+                "BEC_LD_MODEL_PATH environment variable not set. "
+                "Provide model path via --model-path argument or set environment variable."
+            )
+        
+        # Start with default config
+        defaults = {
+            's3_bucket': ctx.artifacts_location.bucket,
+            's3_region': os.environ.get('BEC_REGION', 'us-east-1'),
+            'aws_profile': 'default',
+            'model_path': model_path,
+            'use_gpu': True,
+            'precision': 'fp16',
+            'batch_size': 16,
+            'debug_mode': False,
+        }
+        
+        # Merge with job config from DB (but model_path always comes from env)
+        config_dict = {**defaults, **ctx.job_config}
+        config_dict['model_path'] = model_path  # Ensure model_path is not overridden
+        
+        # Create PipelineConfig instance
+        # Handle any missing required fields with sensible defaults
+        return PipelineConfig(**config_dict)
+    
+    def _build_volume_task(self, ctx: 'JobContext') -> VolumeTask:
+        """
+        Build VolumeTask from job context.
+        """
+        # Build list of ImageTask from manifest
+        image_tasks = []
+        
+        # Get S3 folder prefix for source images
+        from bec_orch.core.worker_runtime import get_s3_folder_prefix
+        vol_prefix = get_s3_folder_prefix(ctx.volume.w_id, ctx.volume.i_id)
+        
+        for item in ctx.volume_manifest.manifest:
+            filename = item.get('filename')
+            if not filename:
+                continue
+            
+            # Build S3 URI for source image
+            source_uri = f"s3://archive.tbrc.org/{vol_prefix}{filename}"
+            
+            image_tasks.append(ImageTask(
+                source_uri=source_uri,
+                img_filename=filename
+            ))
+        
+        # Build output URIs
+        prefix = ctx.artifacts_location.prefix.rstrip('/')
+        basename = ctx.artifacts_location.basename
+        
+        output_parquet_uri = f"s3://{ctx.artifacts_location.bucket}/{prefix}/{basename}.parquet"
+        output_jsonl_uri = f"s3://{ctx.artifacts_location.bucket}/{prefix}/{basename}.jsonl"
+        
+        # Debug folder (local only, not used in production)
+        debug_folder_path = os.environ.get('BEC_DEBUG_FOLDER', '/tmp/bec_debug')
+        
+        return VolumeTask(
+            io_mode='s3',
+            debug_folder_path=debug_folder_path,
+            output_parquet_uri=output_parquet_uri,
+            output_jsonl_uri=output_jsonl_uri,
+            image_tasks=image_tasks,
+        )

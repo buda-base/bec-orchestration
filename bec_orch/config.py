@@ -6,11 +6,7 @@ class OrchestrationConfig:
     db_dsn: str
     aws_region: str
 
-    job_id: int
-    job_name: str
-
-    queue_url: str
-    dlq_url: Optional[str] = None
+    job_name: str  # Job name (unique identifier, more user-friendly than ID)
 
     poll_wait_seconds: int = 20
     max_messages: int = 1                 # sequential worker

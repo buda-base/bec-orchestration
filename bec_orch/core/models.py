@@ -1,6 +1,6 @@
 from __future__ import annotations
 from dataclasses import dataclass
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 @dataclass(frozen=True)
 class VolumeRef:
@@ -17,6 +17,7 @@ class VolumeManifest:
 class ArtifactLocation:
     bucket: str
     prefix: str                # no leading '/', no trailing required
+    basename: str              # base name for artifacts (e.g., volume identifier)
 
     @property
     def success_key(self) -> str:
@@ -48,6 +49,8 @@ class JobRecord:
     id: int
     name: str
     config_text: str           # json most of the time; free-form
+    queue_url: str             # SQS queue URL for tasks
+    dlq_url: Optional[str]     # optional dead-letter queue URL
 
 @dataclass(frozen=True)
 class WorkerRecord:

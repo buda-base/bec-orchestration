@@ -253,10 +253,10 @@ class DBClient:
         volume_id: int,
         s3_etag_bytes: bytes,
         worker_id: int,
-    ) -> Optional[int]:
+    ) -> tuple[Optional[int], Optional[str], Optional[Any]]:
         """
         Atomically claim a (job_id, volume_id, s3_etag).
-        Returns task_execution.id if inserted, else None if already exists.
+        Returns (task_execution.id, None, None) if inserted, else (None, existing_status, started_at) if already exists.
         Requires UNIQUE(job_id, volume_id, s3_etag).
         
         Args:
@@ -267,13 +267,13 @@ class DBClient:
             worker_id: Worker ID
             
         Returns:
-            task_execution_id or None if already claimed
+            (task_execution_id, None, None) if successfully claimed, or (None, existing_status, started_at) if already exists
         """
         with conn.cursor() as cur:
             # Try to find existing task execution
             cur.execute(
                 """
-                SELECT id, status FROM task_executions
+                SELECT id, status, started_at FROM task_executions
                 WHERE job_id = %s AND volume_id = %s AND s3_etag = %s
                 """,
                 (job_id, volume_id, s3_etag_bytes)
@@ -281,10 +281,10 @@ class DBClient:
             row = cur.fetchone()
             
             if row is not None:
-                # Task already exists
-                # If it's done, we might want to return None (idempotent)
-                # If it's running, also return None (someone else is working on it)
-                return None
+                # Task already exists - return None with the existing status and started_at
+                existing_status = row['status']
+                started_at = row['started_at']
+                return None, existing_status, started_at
             
             # Create new task execution
             try:
@@ -298,11 +298,64 @@ class DBClient:
                 )
                 result = cur.fetchone()
                 conn.commit()
-                return result['id']
+                return result['id'], None, None
             except psycopg.errors.UniqueViolation:
-                # Race condition: another worker claimed it
+                # Race condition: another worker claimed it between our SELECT and INSERT
                 conn.rollback()
-                return None
+                # Fetch the status and started_at of the task that was just claimed
+                cur.execute(
+                    """
+                    SELECT status, started_at FROM task_executions
+                    WHERE job_id = %s AND volume_id = %s AND s3_etag = %s
+                    """,
+                    (job_id, volume_id, s3_etag_bytes)
+                )
+                row = cur.fetchone()
+                existing_status = row['status'] if row else 'running'
+                started_at = row['started_at'] if row else None
+                return None, existing_status, started_at
+
+    def claim_stale_task_execution(
+        self,
+        conn: psycopg.Connection,
+        job_id: int,
+        volume_id: int,
+        s3_etag_bytes: bytes,
+        worker_id: int,
+    ) -> Optional[int]:
+        """
+        Claim a stale task execution (any status, started_at > 5 minutes ago).
+        Updates the existing record to claim it for this worker.
+        Note: success.json is the source of truth, so even 'done' status can be stale if success.json is missing.
+        
+        Args:
+            conn: Database connection
+            job_id: Job ID
+            volume_id: Volume ID
+            s3_etag_bytes: S3 etag as bytes (16 bytes MD5)
+            worker_id: Worker ID
+            
+        Returns:
+            task_execution_id if successfully claimed, None if not stale or doesn't exist
+        """
+        with conn.cursor() as cur:
+            # Update stale task (any status) to claim it for this worker
+            cur.execute(
+                """
+                UPDATE task_executions
+                SET worker_id = %s, started_at = now(), attempt = attempt + 1, status = 'running'
+                WHERE job_id = %s AND volume_id = %s AND s3_etag = %s
+                  AND started_at < now() - INTERVAL '5 minutes'
+                RETURNING id
+                """,
+                (worker_id, job_id, volume_id, s3_etag_bytes)
+            )
+            row = cur.fetchone()
+            if row is not None:
+                conn.commit()
+                return row['id']
+            conn.rollback()
+            return None
 
     def mark_task_done(
         self,

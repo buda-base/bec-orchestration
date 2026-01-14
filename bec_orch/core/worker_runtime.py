@@ -204,9 +204,12 @@ class BECWorkerRuntime:
         High-level flow:
         - Resolve manifest info + etag
         - Ensure volume exists in DB
-        - Claim task in DB (idempotent)
         - Compute artifact location
-        - Check success marker (success.json, optional secondary guard)
+        - Check success.json first (source of truth) - if exists, skip
+        - Try to claim task in DB
+        - If claim fails:
+          - If stale (any status, > 5 min old): claim stale task and proceed
+          - If not stale: skip with warning (another worker likely active)
         - Run job worker
         - Write success.json
         - Update DB
@@ -232,8 +235,19 @@ class BECWorkerRuntime:
         )
         logger.info(f"Volume ID: {volume_id}")
         
-        # Claim task execution (idempotent)
-        task_execution_id = self.db.claim_task_execution(
+        # Compute artifact location (needed for success.json check)
+        artifacts_location = self._get_artifact_location(volume, manifest.s3_etag)
+        logger.info(f"Artifacts location: s3://{artifacts_location.bucket}/{artifacts_location.prefix}")
+        
+        # Check success.json first (source of truth)
+        if self._check_success_marker(artifacts_location):
+            logger.info("Success marker (success.json) already exists, task already completed, skipping")
+            # Still delete the message to avoid reprocessing
+            self.sqs.delete(self.queue_url, msg.receipt_handle)
+            return
+        
+        # Try to claim task execution in DB
+        task_execution_id, existing_status, existing_started_at = self.db.claim_task_execution(
             self.conn,
             self.job_record.id,
             volume_id,
@@ -242,38 +256,63 @@ class BECWorkerRuntime:
         )
         
         if task_execution_id is None:
-            logger.info(f"Task already claimed or completed, skipping")
-            # Still delete the message to avoid reprocessing
-            self.sqs.delete(self.queue_url, msg.receipt_handle)
-            return
-        
-        logger.info(f"Claimed task execution: {task_execution_id}")
-        
-        # Compute artifact location
-        artifacts_location = self._get_artifact_location(volume, manifest.s3_etag)
-        logger.info(f"Artifacts location: s3://{artifacts_location.bucket}/{artifacts_location.prefix}")
-        
-        # Check if already done (success.json exists)
-        if self._check_success_marker(artifacts_location):
-            logger.info("Success marker already exists, marking task as done")
-            # Read success marker to get metrics
-            success_data = self._read_success_marker(artifacts_location)
-            result = TaskResult(
-                total_images=success_data.get('total_images', len(manifest.manifest)),
-                nb_errors=success_data.get('nb_errors', 0),
-                total_duration_ms=success_data.get('total_duration_ms', 0),
-                avg_duration_per_page_ms=success_data.get('avg_duration_per_page_ms', 0),
-            )
-            self.db.mark_task_done(
-                self.conn,
-                task_execution_id,
-                result.total_images,
-                result.nb_errors,
-                result.total_duration_ms,
-                result.avg_duration_per_page_ms,
-            )
-            self.sqs.delete(self.cfg.queue_url, msg.receipt_handle)
-            return
+            # Task already exists in database - check if it's stale
+            # success.json is the source of truth, so if it doesn't exist, the task is not done
+            # regardless of DB status. A task is considered stale if: started_at > 5 minutes ago
+            is_stale = False
+            if existing_started_at is not None:
+                from datetime import datetime, timezone, timedelta
+                if isinstance(existing_started_at, str):
+                    # Parse ISO format string if needed
+                    existing_started_at = datetime.fromisoformat(existing_started_at.replace('Z', '+00:00'))
+                if existing_started_at.tzinfo is None:
+                    # Assume UTC if timezone-naive
+                    existing_started_at = existing_started_at.replace(tzinfo=timezone.utc)
+                
+                age = datetime.now(timezone.utc) - existing_started_at
+                is_stale = age > timedelta(minutes=5)
+            
+            if is_stale:
+                # Stale record - likely from a crashed worker, claim it and proceed
+                status_msg = f"status='{existing_status}'" if existing_status else "unknown status"
+                logger.warning(
+                    f"Task already exists in database with stale {status_msg} "
+                    f"(started_at={existing_started_at}, age > 5 minutes) but no success.json found. "
+                    f"Assuming previous worker crashed. Claiming stale task and proceeding. "
+                    f"job_id={self.job_record.id}, volume_id={volume_id}"
+                )
+                # Try to claim the stale task
+                task_execution_id = self.db.claim_stale_task_execution(
+                    self.conn,
+                    self.job_record.id,
+                    volume_id,
+                    etag_bytes,
+                    self.worker_id
+                )
+                if task_execution_id is None:
+                    # Race condition: another worker claimed it first, skip
+                    logger.warning(
+                        f"Failed to claim stale task (another worker may have claimed it). Skipping."
+                    )
+                    self.sqs.delete(self.queue_url, msg.receipt_handle)
+                    return
+                logger.info(f"Claimed stale task execution: {task_execution_id}")
+            else:
+                # Not stale - another worker is likely active, skip with warning
+                status_msg = f"status='{existing_status}'" if existing_status else "unknown status"
+                etag_preview = manifest.s3_etag[:16] if len(manifest.s3_etag) > 16 else manifest.s3_etag
+                logger.warning(
+                    f"Task already exists in database ({status_msg}) but no success.json found. "
+                    f"job_id={self.job_record.id}, volume_id={volume_id}, etag={etag_preview}..., "
+                    f"started_at={existing_started_at}. "
+                    f"Assuming another worker is processing. Skipping."
+                )
+                # Still delete the message to avoid reprocessing
+                self.sqs.delete(self.queue_url, msg.receipt_handle)
+                return
+        else:
+            # Successfully claimed new task
+            logger.info(f"Claimed new task execution: {task_execution_id}")
         
         # Run job worker
         try:

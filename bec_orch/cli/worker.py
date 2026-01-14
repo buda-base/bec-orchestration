@@ -53,6 +53,11 @@ def worker(
     Queue URLs are fetched from the job record in the database.
     """
     
+    # Setup logging: root=WARNING, bec namespace=INFO
+    # This overrides the CLI's setup_logging() which sets root to INFO
+    from bec_orch.logging_setup import setup_logging
+    setup_logging()
+    
     from bec_orch.config import OrchestrationConfig
     from bec_orch.core.worker_runtime import BECWorkerRuntime
     from bec_orch.io.db import DBClient

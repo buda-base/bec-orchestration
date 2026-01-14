@@ -27,7 +27,8 @@ from bec_orch.io.db import DBClient, etag_to_bytes
 from bec_orch.io.sqs import SQSClient
 from bec_orch.jobs.base import JobContext, JobWorker
 
-logger = logging.getLogger(__name__)
+# Use "bec" namespace so logs appear at INFO level (not WARNING from root)
+logger = logging.getLogger("bec.core.worker_runtime")
 
 # Common image file extensions (case-insensitive)
 IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.tif', '.tiff'}
@@ -171,9 +172,13 @@ class BECWorkerRuntime:
             # Reset empty poll counter
             self._empty_polls = 0
             
+            # Log message receipt
+            logger.info(
+                f"Received message from SQS: {msg.message_id} for volume {msg.volume.w_id}/{msg.volume.i_id}"
+            )
+            
             # Process message
             try:
-                logger.info(f"Processing message: {msg.message_id} for volume {msg.volume.w_id}/{msg.volume.i_id}")
                 self._process_message(msg)
                 logger.info(f"Successfully processed message: {msg.message_id}")
             except Exception as e:

@@ -28,7 +28,7 @@ def create_job(
     """
     with conn.cursor() as cur:
         cur.execute(
-            "INSERT INTO jobs (name, config, queue_url, dlq_url) VALUES (%s, %s, %s, %s) RETURNING id",
+            "INSERT INTO jobs (name, config, queue_url, dlq_url, created_at, updated_at) VALUES (%s, %s, %s, %s, now(), now()) RETURNING id",
             (name, config_text, queue_url, dlq_url)
         )
         result = cur.fetchone()

@@ -4,13 +4,17 @@ BEC Queue CLI - Manage task queues.
 Usage:
   bec queue enqueue --queue-url <url> --file volumes.txt
   bec queue enqueue --queue-url <url> --volume W12345,I0123
+  bec queue enqueue --job-name ldv1 --volume W12345,I0123
   bec queue stats --queue-url <url>
+  bec queue stats --job-name ldv1
   bec queue purge --queue-url <url>
+  bec queue purge --job-name ldv1
 """
 
 import os
 import sys
 from datetime import datetime
+from urllib.parse import quote_plus
 
 import click
 from rich.console import Console
@@ -27,6 +31,36 @@ def get_sqs_client():
     return SQSClient(region)
 
 
+def get_queue_url_from_job_name(job_name: str) -> str:
+    """Get queue URL from job name by querying the database."""
+    from bec_orch.io.db import DBClient
+    from bec_orch.orch.job_admin import get_job_by_name
+    
+    sql_host = os.environ.get('BEC_SQL_HOST')
+    sql_port = os.environ.get('BEC_SQL_PORT', '5432')
+    sql_user = os.environ.get('BEC_SQL_USER')
+    sql_password = os.environ.get('BEC_SQL_PASSWORD')
+    sql_database = os.environ.get('BEC_SQL_DATABASE', 'pipeline_v1')
+    
+    if not all([sql_host, sql_user, sql_password]):
+        console.print("[red]Error:[/red] Missing required SQL environment variables")
+        console.print("Required: BEC_SQL_HOST, BEC_SQL_USER, BEC_SQL_PASSWORD")
+        sys.exit(1)
+    
+    # URL-encode password to handle special characters
+    encoded_password = quote_plus(sql_password)
+    # Add SSL requirement for secure connections
+    dsn = f"postgresql://{sql_user}:{encoded_password}@{sql_host}:{sql_port}/{sql_database}?sslmode=require"
+    
+    db = DBClient(dsn)
+    conn = db.connect()
+    try:
+        job = get_job_by_name(conn, job_name)
+        return job.queue_url
+    finally:
+        conn.close()
+
+
 @click.group()
 def queue():
     """Manage task queues (enqueue, stats, purge)."""
@@ -34,14 +68,26 @@ def queue():
 
 
 @queue.command()
-@click.option('--queue-url', required=True, help='SQS queue URL')
+@click.option('--queue-url', help='SQS queue URL')
+@click.option('--job-name', help='Job name (alternative to --queue-url)')
 @click.option('--file', type=click.Path(exists=True), help='File with volume list (one per line: W12345,I0123)')
 @click.option('--volume', multiple=True, help='Single volume (format: W12345,I0123). Can be specified multiple times.')
 @click.option('--region', help='AWS region (default: from BEC_REGION env or us-east-1)')
-def enqueue(queue_url, file, volume, region):
+def enqueue(queue_url, job_name, file, volume, region):
     """Enqueue volumes to task queue."""
     from bec_orch.core.models import VolumeRef
     from bec_orch.orch.enqueue import enqueue_volumes, enqueue_volume_list_from_file
+    
+    # Get queue URL from job name if provided
+    if job_name:
+        if queue_url:
+            console.print("[red]Error:[/red] Cannot specify both --queue-url and --job-name")
+            sys.exit(1)
+        queue_url = get_queue_url_from_job_name(job_name)
+        console.print(f"[dim]Using queue URL from job '{job_name}': {queue_url}[/dim]")
+    elif not queue_url:
+        console.print("[red]Error:[/red] Must specify either --queue-url or --job-name")
+        sys.exit(1)
     
     if not file and not volume:
         console.print("[red]Error:[/red] Must specify either --file or --volume")
@@ -82,11 +128,23 @@ def enqueue(queue_url, file, volume, region):
 
 
 @queue.command()
-@click.option('--queue-url', required=True, help='SQS queue URL')
+@click.option('--queue-url', help='SQS queue URL')
+@click.option('--job-name', help='Job name (alternative to --queue-url)')
 @click.option('--region', help='AWS region (default: from BEC_REGION env or us-east-1)')
-def stats(queue_url, region):
+def stats(queue_url, job_name, region):
     """Show queue statistics."""
     from bec_orch.orch.enqueue import get_queue_stats
+    
+    # Get queue URL from job name if provided
+    if job_name:
+        if queue_url:
+            console.print("[red]Error:[/red] Cannot specify both --queue-url and --job-name")
+            sys.exit(1)
+        queue_url = get_queue_url_from_job_name(job_name)
+        console.print(f"[dim]Using queue URL from job '{job_name}': {queue_url}[/dim]")
+    elif not queue_url:
+        console.print("[red]Error:[/red] Must specify either --queue-url or --job-name")
+        sys.exit(1)
     
     # Override region if provided
     if region:
@@ -120,12 +178,24 @@ def stats(queue_url, region):
 
 
 @queue.command()
-@click.option('--queue-url', required=True, help='SQS queue URL')
+@click.option('--queue-url', help='SQS queue URL')
+@click.option('--job-name', help='Job name (alternative to --queue-url)')
 @click.option('--yes', is_flag=True, help='Skip confirmation')
 @click.option('--region', help='AWS region (default: from BEC_REGION env or us-east-1)')
-def purge(queue_url, yes, region):
+def purge(queue_url, job_name, yes, region):
     """Purge all messages from queue (WARNING: irreversible!)."""
     from bec_orch.orch.enqueue import purge_queue
+    
+    # Get queue URL from job name if provided
+    if job_name:
+        if queue_url:
+            console.print("[red]Error:[/red] Cannot specify both --queue-url and --job-name")
+            sys.exit(1)
+        queue_url = get_queue_url_from_job_name(job_name)
+        console.print(f"[dim]Using queue URL from job '{job_name}': {queue_url}[/dim]")
+    elif not queue_url:
+        console.print("[red]Error:[/red] Must specify either --queue-url or --job-name")
+        sys.exit(1)
     
     if not yes:
         console.print("[yellow]WARNING:[/yellow] This will delete all messages from the queue!")

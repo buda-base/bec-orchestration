@@ -16,6 +16,7 @@ For ldv1 job:
 import logging
 import os
 import sys
+from urllib.parse import quote_plus
 
 import click
 from dotenv import load_dotenv
@@ -69,7 +70,10 @@ def worker(
         console.print("Required: BEC_SQL_HOST, BEC_SQL_USER, BEC_SQL_PASSWORD")
         sys.exit(1)
     
-    dsn = f"postgresql://{sql_user}:{sql_password}@{sql_host}:{sql_port}/{sql_database}"
+    # URL-encode password to handle special characters
+    encoded_password = quote_plus(sql_password)
+    # Add SSL requirement for secure connections
+    dsn = f"postgresql://{sql_user}:{encoded_password}@{sql_host}:{sql_port}/{sql_database}?sslmode=require"
     
     # Get AWS region
     region = region or os.environ.get('BEC_REGION', 'us-east-1')

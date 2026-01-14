@@ -1,7 +1,10 @@
 from __future__ import annotations
+import logging
 from typing import Callable
 
 from bec_orch.jobs.base import JobWorker
+
+logger = logging.getLogger(__name__)
 
 WorkerFactory = Callable[[], JobWorker]
 
@@ -59,10 +62,16 @@ def _auto_register() -> None:
     try:
         from bec_orch.jobs.ldv1.worker import LDV1JobWorker
         register_job_worker("ldv1", LDV1JobWorker)
-        register_job_worker("ld", LDV1JobWorker)  # Also register with "ld" prefix
-    except ImportError:
-        # ldv1 dependencies may not be installed
-        pass
+    except ImportError as e:
+        logger.warning(
+            f"Failed to auto-register ldv1 worker: {e}. "
+            f"Dependencies may not be installed. Worker will be lazy-loaded when needed."
+        )
+    except AttributeError as e:
+        logger.warning(
+            f"Failed to auto-register ldv1 worker: {e}. "
+            f"Worker class may not exist in module."
+        )
 
 
 # Run auto-registration on module import

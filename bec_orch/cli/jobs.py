@@ -13,6 +13,7 @@ import json
 import os
 import sys
 from pathlib import Path
+from urllib.parse import quote_plus
 
 import boto3
 import click
@@ -37,7 +38,10 @@ def get_db_connection():
         console.print("Required: BEC_SQL_HOST, BEC_SQL_USER, BEC_SQL_PASSWORD")
         sys.exit(1)
     
-    dsn = f"postgresql://{sql_user}:{sql_password}@{sql_host}:{sql_port}/{sql_database}"
+    # URL-encode password to handle special characters
+    encoded_password = quote_plus(sql_password)
+    # Add SSL requirement for secure connections
+    dsn = f"postgresql://{sql_user}:{encoded_password}@{sql_host}:{sql_port}/{sql_database}?sslmode=require"
     db = DBClient(dsn)
     return db.connect()
 
@@ -234,14 +238,20 @@ def list():
 
 
 @jobs.command()
-@click.argument('job_id', type=int)
-def show(job_id):
-    """Show job details."""
-    from bec_orch.orch.job_admin import get_job
+@click.argument('job_identifier')
+def show(job_identifier):
+    """Show job details by ID or name."""
+    from bec_orch.orch.job_admin import get_job, get_job_by_name
     
     conn = get_db_connection()
     try:
-        job = get_job(conn, job_id)
+        # Try to parse as integer (job ID), otherwise treat as job name
+        try:
+            job_id = int(job_identifier)
+            job = get_job(conn, job_id)
+        except ValueError:
+            # Not an integer, treat as job name
+            job = get_job_by_name(conn, job_identifier)
         
         console.print(f"\n[bold]Job {job.id}[/bold]")
         console.print(f"Name: [green]{job.name}[/green]")
@@ -265,12 +275,12 @@ def show(job_id):
 
 
 @jobs.command()
-@click.argument('job_id', type=int)
+@click.argument('job_identifier')
 @click.option('--config', type=click.Path(exists=True), help='Path to config file (JSON)')
 @click.option('--config-text', help='Config text directly (JSON string)')
-def update(job_id, config, config_text):
-    """Update job configuration."""
-    from bec_orch.orch.job_admin import update_job_config
+def update(job_identifier, config, config_text):
+    """Update job configuration by ID or name."""
+    from bec_orch.orch.job_admin import update_job_config, get_job, get_job_by_name
     
     if not config and not config_text:
         console.print("[red]Error:[/red] Must specify either --config or --config-text")
@@ -292,8 +302,17 @@ def update(job_id, config, config_text):
     
     conn = get_db_connection()
     try:
+        # Try to parse as integer (job ID), otherwise treat as job name
+        try:
+            job_id = int(job_identifier)
+            job = get_job(conn, job_id)
+        except ValueError:
+            # Not an integer, treat as job name
+            job = get_job_by_name(conn, job_identifier)
+            job_id = job.id
+        
         update_job_config(conn, job_id, config_text)
-        console.print(f"[green]✓[/green] Updated job {job_id}")
+        console.print(f"[green]✓[/green] Updated job {job_id} ({job.name})")
     except ValueError as e:
         console.print(f"[red]Error:[/red] {e}")
         sys.exit(1)
@@ -302,22 +321,31 @@ def update(job_id, config, config_text):
 
 
 @jobs.command()
-@click.argument('job_id', type=int)
+@click.argument('job_identifier')
 @click.option('--yes', is_flag=True, help='Skip confirmation')
-def delete(job_id, yes):
-    """Delete a job (and all its task executions)."""
-    from bec_orch.orch.job_admin import delete_job
-    
-    if not yes:
-        confirm = click.confirm(
-            f"Are you sure you want to delete job {job_id}? This will also delete all task executions.",
-            abort=True
-        )
+def delete(job_identifier, yes):
+    """Delete a job (and all its task executions) by ID or name."""
+    from bec_orch.orch.job_admin import delete_job, get_job, get_job_by_name
     
     conn = get_db_connection()
     try:
+        # Try to parse as integer (job ID), otherwise treat as job name
+        try:
+            job_id = int(job_identifier)
+            job = get_job(conn, job_id)
+        except ValueError:
+            # Not an integer, treat as job name
+            job = get_job_by_name(conn, job_identifier)
+            job_id = job.id
+        
+        if not yes:
+            confirm = click.confirm(
+                f"Are you sure you want to delete job {job_id} ({job.name})? This will also delete all task executions.",
+                abort=True
+            )
+        
         delete_job(conn, job_id)
-        console.print(f"[green]✓[/green] Deleted job {job_id}")
+        console.print(f"[green]✓[/green] Deleted job {job_id} ({job.name})")
     except ValueError as e:
         console.print(f"[red]Error:[/red] {e}")
         sys.exit(1)

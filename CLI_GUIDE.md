@@ -42,7 +42,6 @@ DLQ:    bec_{job_name}_dlq
 
 Examples:
 - ldv1 → bec_ldv1_tasks / bec_ldv1_dlq
-- ocr  → bec_ocr_tasks / bec_ocr_dlq
 ```
 
 **No manual queue management required!** The CLI creates queues automatically.

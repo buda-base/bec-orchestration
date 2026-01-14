@@ -179,7 +179,7 @@ async def ui_loop(
 async def run_one_volume(args):
     # Import model loading and volume worker only when needed (requires torch)
     from .model_utils import load_model
-    from .ld_volume_worker import LDVolumeWorker
+    from .worker import LDVolumeWorker
     
     # Build PipelineConfig first to get config values for model loading
     cfg = PipelineConfig(
@@ -310,7 +310,7 @@ async def run_one_volume(args):
         )
         
         # Create S3Context for S3 mode (lazy import to avoid requiring aiobotocore)
-        from .s3ctx import S3Context
+        from ..shared.s3ctx import S3Context
         global_sem = asyncio.Semaphore(cfg.s3_max_inflight_global)
         s3ctx = S3Context(cfg, global_sem)
         

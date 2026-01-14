@@ -1,7 +1,7 @@
 import asyncio
 import concurrent.futures as futures
 from collections import deque
-from .config import PipelineConfig
+from ..ldv1.config import PipelineConfig
 import io
 import logging
 import os
@@ -12,8 +12,8 @@ import cv2
 from functools import lru_cache
 import math
 
-from .types_common import ImageTask, DecodedFrame, FetchedBytesMsg, DecodedFrameMsg, FetchedBytes, DecodedFrame, PipelineError, EndOfStream
-from .debug_helpers import save_debug_bytes_sync, save_debug_image_sync
+from ..ldv1.types_common import ImageTask, DecodedFrame, FetchedBytesMsg, DecodedFrameMsg, FetchedBytes, PipelineError, EndOfStream
+from ..ldv1.debug_helpers import save_debug_bytes_sync, save_debug_image_sync
 
 # Pre-import PIL at module level (avoid repeated import overhead)
 try:

@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import List, Optional, Union
 from urllib.parse import urlparse, unquote
 
-from .types_common import *
+from ..ldv1.types_common import *
 
 logger = logging.getLogger(__name__)
 

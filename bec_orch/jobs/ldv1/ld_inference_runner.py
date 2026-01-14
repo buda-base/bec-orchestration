@@ -27,6 +27,8 @@ from .types_common import (
 )
 
 logger = logging.getLogger(__name__)
+# Separate logger for timing/performance warnings (ERROR by default)
+timings_logger = logging.getLogger("bec_timings")
 
 
 # -----------------------------------------------------------------------------
@@ -562,7 +564,7 @@ class LDInferenceRunner:
                 total_wait_time += wait_time
                 
                 if wait_time > 0.5:
-                    logger.warning(
+                    timings_logger.warning(
                         f"[InferenceRunner] Long wait for batch: {wait_time:.2f}s, "
                         f"queue_size={self.q_in.qsize()}"
                     )
@@ -590,29 +592,30 @@ class LDInferenceRunner:
                         run_total_time = time.perf_counter() - run_start_time
                         gpu_utilization = (total_infer_ms / 1000) / run_total_time * 100 if run_total_time > 0 else 0
                         
-                        logger.info(
+                        timings_logger.info(
                             f"[InferenceRunner] DONE - batches={batches_processed}, frames={total_frames}, tiles={total_tiles}"
                         )
-                        logger.info(
-                            f"[InferenceRunner] TIMING SUMMARY: "
-                            f"total={total_infer_ms:.0f}ms, "
-                            f"h2d={total_h2d_ms:.0f}ms ({100*total_h2d_ms/total_infer_ms:.1f}%), "
-                            f"forward={total_forward_ms:.0f}ms ({100*total_forward_ms/total_infer_ms:.1f}%), "
-                            f"stitch={total_stitch_ms:.0f}ms ({100*total_stitch_ms/total_infer_ms:.1f}%), "
-                            f"d2h={total_d2h_ms:.0f}ms ({100*total_d2h_ms/total_infer_ms:.1f}%)"
-                        ) if total_infer_ms > 0 else None
+                        if total_infer_ms > 0:
+                            timings_logger.info(
+                                f"[InferenceRunner] TIMING SUMMARY: "
+                                f"total={total_infer_ms:.0f}ms, "
+                                f"h2d={total_h2d_ms:.0f}ms ({100*total_h2d_ms/total_infer_ms:.1f}%), "
+                                f"forward={total_forward_ms:.0f}ms ({100*total_forward_ms/total_infer_ms:.1f}%), "
+                                f"stitch={total_stitch_ms:.0f}ms ({100*total_stitch_ms/total_infer_ms:.1f}%), "
+                                f"d2h={total_d2h_ms:.0f}ms ({100*total_d2h_ms/total_infer_ms:.1f}%)"
+                            )
                         
                         # Key insight: GPU utilization shows if GPU is the bottleneck
                         # - >80%: GPU is bottleneck (good!)
                         # - <50%: Pipeline is bottleneck (GPU starved)
-                        logger.info(
+                        timings_logger.info(
                             f"[InferenceRunner] GPU UTILIZATION: {gpu_utilization:.1f}% "
                             f"(run={run_total_time:.1f}s, gpu_work={total_infer_ms/1000:.1f}s, "
                             f"queue_wait={total_wait_time:.1f}s, emit={total_emit_time:.1f}s)"
                         )
                         
                         if total_infer_ms > 0:
-                            logger.info(
+                            timings_logger.info(
                                 f"[InferenceRunner] Throughput: {total_tiles/(total_infer_ms/1000):.1f} tiles/s, "
                                 f"{total_frames/(total_infer_ms/1000):.1f} frames/s"
                             )

@@ -218,6 +218,11 @@ class BECWorkerRuntime:
         start_time = time.time()
         volume = msg.volume
         
+        logger.info(
+            f"Starting volume processing: {volume.w_id}/{volume.i_id} "
+            f"(message_id={msg.message_id})"
+        )
+        
         # Get volume manifest from S3
         manifest = self._get_volume_manifest(volume)
         logger.info(f"Loaded manifest: {len(manifest.manifest)} files, etag={manifest.s3_etag}")
@@ -326,9 +331,13 @@ class BECWorkerRuntime:
                 artifacts_location=artifacts_location,
             )
             
-            logger.info("Running job worker")
+            logger.info(f"Running job worker for volume {volume.w_id}/{volume.i_id}")
             result = self.job_worker.run(ctx)
-            logger.info(f"Job worker completed: {result}")
+            logger.info(
+                f"Job worker completed for volume {volume.w_id}/{volume.i_id}: "
+                f"{result.total_images} images, {result.nb_errors} errors, "
+                f"avg {result.avg_duration_per_page_ms:.1f}ms/page"
+            )
             
             # Write success marker
             elapsed_ms = (time.time() - start_time) * 1000
@@ -361,7 +370,14 @@ class BECWorkerRuntime:
             
             # Delete SQS message
             self.sqs.delete(self.queue_url, msg.receipt_handle)
-            logger.info("Deleted SQS message")
+            
+            # Log volume completion
+            total_time = (time.time() - start_time)
+            logger.info(
+                f"Volume {volume.w_id}/{volume.i_id} completed successfully: "
+                f"{result.total_images} images, {result.nb_errors} errors, "
+                f"wall_clock={total_time:.1f}s, avg={result.avg_duration_per_page_ms:.1f}ms/page"
+            )
             
         except Exception as exc:
             # Classify exception

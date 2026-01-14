@@ -21,6 +21,8 @@ from .types_common import DecodedFrame, PipelineError, EndOfStream, TiledBatch
 from .img_helpers import adaptive_binarize
 
 logger = logging.getLogger(__name__)
+# Separate logger for timing/performance logs (ERROR by default)
+timings_logger = logging.getLogger("bec_timings")
 
 
 # -----------------------------------------------------------------------------
@@ -547,14 +549,14 @@ class TileBatcher:
                 no_pending = len(self._pending_tiles) == 0
                 
                 if all_done and no_pending:
-                    logger.info(
+                    timings_logger.info(
                         f"[TileBatcher] DONE - loops={loop_count}, frames_submitted={frames_submitted}, "
                         f"batches={batches_emitted}, total_wait={total_wait_time:.2f}s, "
                         f"total_tile={total_tile_time:.2f}s, total_emit={total_batch_emit_time:.2f}s"
                     )
                     # Log pass composition summary if any pass-2 frames were processed
                     if total_p2_frames > 0:
-                        logger.info(
+                        timings_logger.info(
                             f"[TileBatcher] COMPOSITION: p1_frames={total_p1_frames}, p2_frames={total_p2_frames}, "
                             f"p2_only_batches={p2_only_batches} (potential inefficiency if >0)"
                         )
@@ -586,7 +588,7 @@ class TileBatcher:
                     total_ready = len(self._buffer) + len(self._pending_tiles)
                     if total_ready >= warmup_frames or self._decoder_done:
                         warmup_complete = True
-                        logger.info(
+                        timings_logger.debug(
                             f"[TileBatcher] Warmup complete: {len(self._buffer)} frames ready, "
                             f"{len(self._pending_tiles)} pending"
                         )
@@ -626,7 +628,7 @@ class TileBatcher:
                     
                     # Only show composition if there are pass-2 frames
                     composition = f", p1={p1_count}/p2={p2_count}" if p2_count > 0 else ""
-                    logger.info(
+                    timings_logger.debug(
                         f"[TileBatcher] Emitted batch #{batches_emitted}: {n_frames} frames, {n_tiles} tiles{composition}, "
                         f"reason=full, prepare={emit_time-put_time:.3f}s, put_wait={put_time:.3f}s, "
                         f"pending={len(self._pending_tiles)}, buffer={len(self._buffer)}"
@@ -777,7 +779,7 @@ class TileBatcher:
                         else:
                             reason = "nearly_full"
                         composition = f", p1={p1_count}/p2={p2_count}" if p2_count > 0 else ""
-                        logger.info(
+                        timings_logger.debug(
                             f"[TileBatcher] Emitted batch #{batches_emitted}: {n_frames} frames, {n_tiles} tiles{composition}, "
                             f"reason={reason}, prepare={emit_time-put_time:.3f}s, put_wait={put_time:.3f}s"
                         )

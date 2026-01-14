@@ -11,6 +11,8 @@ from urllib.parse import urlparse, unquote
 from ..ldv1.types_common import *
 
 logger = logging.getLogger(__name__)
+# Separate logger for timing/performance warnings (ERROR by default)
+timings_logger = logging.getLogger("bec_timings")
 
 class BasePrefetcher:
     """
@@ -189,7 +191,7 @@ class BasePrefetcher:
                     
                     # Log slow fetches
                     if fetch_time > 1.0:
-                        logger.warning(
+                        timings_logger.warning(
                             f"[Prefetcher] Slow fetch: {task.img_filename} took {fetch_time:.2f}s"
                         )
 

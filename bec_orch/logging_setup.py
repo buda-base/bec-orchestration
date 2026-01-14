@@ -57,3 +57,10 @@ def setup_logging() -> None:
     app_logger = logging.getLogger("bec")
     app_logger.setLevel(app_level)
     app_logger.propagate = True  # still go to root handler
+    
+    # Timing/performance logger - ERROR by default (suppresses slow decode/wait warnings)
+    # Can be set to WARNING/INFO via BEC_TIMINGS_LOG_LEVEL env var if needed
+    timings_level = os.environ.get("BEC_TIMINGS_LOG_LEVEL", "ERROR").upper()
+    timings_logger = logging.getLogger("bec_timings")
+    timings_logger.setLevel(timings_level)
+    timings_logger.propagate = True  # still go to root handler

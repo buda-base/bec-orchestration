@@ -32,6 +32,8 @@ except ImportError:
     _VIPS_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
+# Separate logger for timing/performance warnings (ERROR by default)
+timings_logger = logging.getLogger("bec_timings")
 
 
 class ImageDecodeError(RuntimeError):
@@ -239,7 +241,7 @@ class Decoder:
                             decoded_count += 1
                             
                             if decode_time > 0.5:
-                                logger.warning(
+                                timings_logger.warning(
                                     f"[Decoder] Slow decode: {decoded.task.img_filename} took {decode_time:.2f}s"
                                 )
                             

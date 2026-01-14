@@ -3,6 +3,7 @@ import logging
 import os
 import contextlib
 import time
+from pathlib import Path
 from typing import Optional, Dict, Any
 
 from .config import PipelineConfig
@@ -198,11 +199,83 @@ class LDV1JobWorker:
     Synchronous adapter for LDVolumeWorker to integrate with BEC orchestration.
     
     Implements the JobWorker protocol expected by BECWorkerRuntime.
+    
+    The model is loaded once in __init__ and reused across all volumes to avoid
+    reloading overhead. The model stays on GPU between volumes.
     """
     
     def __init__(self):
-        """Initialize the job worker."""
-        pass
+        """Initialize the job worker and load the model."""
+        # Get model path from environment (required for ldv1)
+        model_path = os.environ.get('BEC_LD_MODEL_PATH')
+        if not model_path:
+            raise ValueError(
+                "BEC_LD_MODEL_PATH environment variable not set. "
+                "Set it to the path of the segmentation model checkpoint (.pth file)."
+            )
+        
+        # Strip quotes if present (common in .env files)
+        model_path = model_path.strip('"\'')
+        
+        # Validate model file exists early
+        model_path_obj = Path(model_path)
+        if not model_path_obj.exists():
+            raise FileNotFoundError(
+                f"Model checkpoint not found: {model_path}\n"
+                f"Please check that BEC_LD_MODEL_PATH is set correctly and the file exists."
+            )
+        
+        if not model_path_obj.is_file():
+            raise ValueError(
+                f"Model path is not a file: {model_path}\n"
+                f"BEC_LD_MODEL_PATH must point to a .pth checkpoint file."
+            )
+        
+        logger.info(f"Loading model from: {model_path}")
+        
+        # Determine device for model loading
+        import torch
+        device = None
+        if torch.cuda.is_available():
+            device = "cuda"
+            logger.info(f"Using GPU: {torch.cuda.get_device_name(0)}")
+        else:
+            logger.warning("CUDA not available, using CPU (this will be slow)")
+        
+        # Load model with proper error handling
+        try:
+            from .model_utils import load_model
+            
+            # Use default precision and settings (can be overridden per-volume if needed)
+            self.model = load_model(
+                model_path,
+                classes=1,
+                device=device,
+                precision="fp16" if device == "cuda" else "fp32",
+                compile_model=False,  # Can be enabled via config if needed
+            )
+            logger.info(f"Model loaded successfully on {device}")
+            
+        except FileNotFoundError as e:
+            raise FileNotFoundError(
+                f"Model checkpoint file not found: {model_path}\n"
+                f"Original error: {e}"
+            ) from e
+        except ValueError as e:
+            if "state_dict" in str(e).lower():
+                raise ValueError(
+                    f"Invalid model checkpoint format: {model_path}\n"
+                    f"Expected a checkpoint dict with a 'state_dict' key.\n"
+                    f"Original error: {e}"
+                ) from e
+            raise
+        except Exception as e:
+            raise RuntimeError(
+                f"Failed to load model from {model_path}.\n"
+                f"Error type: {type(e).__name__}\n"
+                f"Error message: {e}\n"
+                f"Please verify the checkpoint file is valid and dependencies are installed."
+            ) from e
     
     def run(self, ctx: 'JobContext') -> 'TaskResult':
         """
@@ -298,35 +371,34 @@ class LDV1JobWorker:
         Build PipelineConfig from job context.
         
         Starts with defaults and overrides with job config from DB.
-        Model path comes from environment variable BEC_LD_MODEL_PATH.
+        The model is already loaded in __init__ and will be attached to the config.
         """
-        # Get model path from environment (required for ldv1)
-        model_path = os.environ.get('BEC_LD_MODEL_PATH')
-        if not model_path:
-            raise ValueError(
-                "BEC_LD_MODEL_PATH environment variable not set. "
-                "Provide model path via --model-path argument or set environment variable."
-            )
+        # Get model path from environment (for reference, but model is already loaded)
+        model_path = os.environ.get('BEC_LD_MODEL_PATH', '').strip('"\'')
         
         # Start with default config
         defaults = {
             's3_bucket': ctx.artifacts_location.bucket,
             's3_region': os.environ.get('BEC_REGION', 'us-east-1'),
             'aws_profile': 'default',
-            'model_path': model_path,
+            'model_path': model_path,  # Keep for reference/debugging
             'use_gpu': True,
             'precision': 'fp16',
             'batch_size': 16,
             'debug_mode': False,
         }
         
-        # Merge with job config from DB (but model_path always comes from env)
+        # Merge with job config from DB
         config_dict = {**defaults, **ctx.job_config}
-        config_dict['model_path'] = model_path  # Ensure model_path is not overridden
         
         # Create PipelineConfig instance
-        # Handle any missing required fields with sensible defaults
-        return PipelineConfig(**config_dict)
+        cfg = PipelineConfig(**config_dict)
+        
+        # Attach the pre-loaded model to the config
+        # This model stays on GPU and is reused across all volumes
+        cfg.model = self.model
+        
+        return cfg
     
     def _build_volume_task(self, ctx: 'JobContext') -> VolumeTask:
         """

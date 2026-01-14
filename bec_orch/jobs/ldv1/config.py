@@ -1,6 +1,6 @@
 
-from dataclasses import dataclass
-from typing import Dict, Literal, Optional
+from dataclasses import dataclass, field
+from typing import Dict, Literal, Optional, Any
 
 Precision = Literal["fp32", "fp16", "bf16", "auto"]
 
@@ -40,6 +40,7 @@ class PipelineConfig:
     # GPU batching
     use_gpu: bool = True
     model_path: Optional[str] = None  # Path to model .pth file (required for inference)
+    model: Optional[Any] = None  # Loaded torch.nn.Module (set by worker, reused across volumes)
     compile_model: bool = False
     precision: Precision = "fp16" # bf16, fp16, fp32 or auto
     pin_tile_memory: bool = True  # Pin tiled tensors for faster async GPU transfer

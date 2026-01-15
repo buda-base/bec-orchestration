@@ -10,7 +10,10 @@ Reads a parquet file (local or S3) and generates debug images showing:
 """
 
 import argparse
+import gzip
+import hashlib
 import io
+import json
 import os
 import re
 import sys
@@ -18,10 +21,22 @@ from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 from urllib.parse import urlparse, unquote
 
-import cv2
-import numpy as np
-import pyarrow.parquet as pq
-import pyarrow.fs as pafs
+try:
+    import cv2
+except ImportError:
+    cv2 = None
+
+try:
+    import numpy as np
+except ImportError:
+    np = None
+
+try:
+    import pyarrow.parquet as pq
+    import pyarrow.fs as pafs
+except ImportError:
+    pq = None
+    pafs = None
 
 try:
     import boto3
@@ -35,9 +50,6 @@ try:
     # Try relative import first (when used as module)
     from .img_helpers import _apply_rotation_3, _apply_tps_3
     from .utils import (
-        get_s3_folder_prefix,
-        gets3blob,
-        get_image_list_and_version_s3,
         _normalize_uri,
         _join_uri,
         _get_local_image_tasks,
@@ -53,9 +65,6 @@ except ImportError:
         sys.path.insert(0, str(script_dir))
     from img_helpers import _apply_rotation_3, _apply_tps_3
     from utils import (
-        get_s3_folder_prefix,
-        gets3blob,
-        get_image_list_and_version_s3,
         _normalize_uri,
         _join_uri,
         _get_local_image_tasks,
@@ -104,6 +113,121 @@ def _parse_file_uri(uri: str) -> Path:
         raise ValueError(f"Not a file:// URI: {uri}")
     p = unquote(u.path)
     return Path(p)
+
+
+def _get_s3_folder_prefix(w_id: str, i_id: str) -> str:
+    """
+    Compute the S3 prefix (~folder) for a volume.
+    
+    Format: Works/{hash}/{w_id}/images/{w_id}-{suffix}/
+    
+    Example:
+       - w_id=W22084, i_id=I0886
+       - result = "Works/60/W22084/images/W22084-0886/"
+    """
+    md5_hash = hashlib.md5(w_id.encode()).hexdigest()[:2]
+    
+    # Compute suffix
+    if i_id.startswith('I') and i_id[1:].isdigit() and len(i_id) == 5:
+        suffix = i_id[1:]  # Remove 'I' prefix
+    else:
+        suffix = i_id
+    
+    return f"Works/{md5_hash}/{w_id}/images/{w_id}-{suffix}/"
+
+
+def _get_volume_manifest_etag(w_id: str, i_id: str, s3_source_bucket: str = "archive.tbrc.org") -> str:
+    """
+    Fetch volume manifest from S3 and return its etag.
+    
+    The manifest is stored at: Works/{hash}/{w_id}/images/{w_id}-{suffix}/dimensions.json
+    """
+    if boto3 is None:
+        raise RuntimeError("S3 support requires boto3")
+    
+    prefix = _get_s3_folder_prefix(w_id, i_id)
+    manifest_key = f"{prefix}dimensions.json"
+    
+    try:
+        s3 = boto3.client("s3")
+        response = s3.get_object(Bucket=s3_source_bucket, Key=manifest_key)
+        etag = response['ETag'].strip('"')
+        return etag
+    except botocore.exceptions.ClientError as e:
+        if e.response['Error']['Code'] == '404':
+            raise ValueError(f"Manifest not found: s3://{s3_source_bucket}/{manifest_key}")
+        raise
+
+
+def _compute_parquet_uri(w_id: str, i_id: str, etag: str, job_name: str, s3_dest_bucket: str) -> str:
+    """
+    Compute the parquet S3 URI based on job name, volume, and version.
+    
+    Format: s3://{bucket}/{job_name}/{w_id}/{i_id}/{version}/{w_id}-{i_id}-{version}.parquet
+    Where version is first 6 chars of etag.
+    """
+    version = etag.replace('"', '').split('-')[0][:6]
+    basename = f"{w_id}-{i_id}-{version}"
+    uri = f"s3://{s3_dest_bucket}/{job_name}/{w_id}/{i_id}/{version}/{basename}.parquet"
+    return uri
+
+
+def get_image_list_and_version_s3(w_id: str, i_id: str, s3_source_bucket: str = "archive.tbrc.org"):
+    """
+    Fetch image list from S3 manifest and construct ImageTask objects.
+    
+    Returns:
+        Tuple of (image_tasks, version) where:
+        - image_tasks: List[ImageTask] with img_filename and source_uri
+        - version: str (first 6 chars of etag)
+    """
+    if boto3 is None:
+        raise RuntimeError("S3 support requires boto3")
+    
+    prefix = _get_s3_folder_prefix(w_id, i_id)
+    manifest_key = f"{prefix}dimensions.json"
+    
+    try:
+        s3 = boto3.client("s3")
+        response = s3.get_object(Bucket=s3_source_bucket, Key=manifest_key)
+        etag = response['ETag'].strip('"')
+        
+        # Read and decompress manifest
+        body_bytes = response['Body'].read()
+        uncompressed = gzip.decompress(body_bytes)
+        data = json.loads(uncompressed.decode('utf-8'))
+        
+        # Filter to image files only and create ImageTask objects
+        image_tasks = []
+        IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.tif', '.tiff'}
+        
+        for item in data:
+            filename = item.get('filename')
+            if not filename:
+                continue
+            
+            ext = Path(filename).suffix.lower()
+            if ext in IMAGE_EXTENSIONS:
+                # Construct S3 URI for this image
+                image_key = f"{prefix}{filename}"
+                source_uri = f"s3://{s3_source_bucket}/{image_key}"
+                image_tasks.append(ImageTask(
+                    source_uri=source_uri,
+                    img_filename=filename
+                ))
+        
+        # Compute version from etag
+        version = etag.replace('"', '').split('-')[0][:6]
+        
+        return image_tasks, version
+        
+    except botocore.exceptions.ClientError as e:
+        if e.response['Error']['Code'] == '404':
+            return None, None
+        raise
+    except Exception as e:
+        print(f"Error fetching image list: {e}", file=sys.stderr)
+        return None, None
 
 
 def load_image_from_uri(uri: str) -> Optional[np.ndarray]:
@@ -384,8 +508,9 @@ def main():
     )
     parser.add_argument(
         "parquet_uri",
+        nargs="?",
         type=str,
-        help="URI or path to parquet file (local or s3://)"
+        help="URI or path to parquet file (local or s3://). Optional if --w and --i are provided."
     )
     parser.add_argument(
         "output_folder",
@@ -412,12 +537,35 @@ def main():
     )
     
     parser.add_argument(
+        "--job-name",
+        type=str,
+        default="ldv1",
+        help="Job name for computing parquet URI (default: ldv1-line-seg). Used when parquet_uri is not provided."
+    )
+    parser.add_argument(
+        "--s3-source-bucket",
+        type=str,
+        default="archive.tbrc.org",
+        help="S3 source bucket for images and manifests (default: archive.tbrc.org)"
+    )
+    parser.add_argument(
+        "--s3-dest-bucket",
+        type=str,
+        default="tests-bec.bdrc.io",
+        help="S3 destination bucket for parquet files (default: buda-task-output)"
+    )
+    parser.add_argument(
         "--tps-only",
         action="store_true",
         help="Only output images for rows that have non-null TPS data"
     )
     
     args = parser.parse_args()
+    
+    # Validate parquet_uri presence
+    if not args.parquet_uri:
+        if not (args.w and args.i):
+            parser.error("Either parquet_uri must be provided, or both --w and --i must be provided")
     
     # Validate input mode arguments
     if args.input_folder:
@@ -427,9 +575,23 @@ def main():
         if not (args.w and args.i):
             parser.error("Both --w and --i must be provided for S3 mode")
     
+    # Auto-compute parquet_uri if not provided
+    if not args.parquet_uri:
+        print(f"Fetching manifest for {args.w}/{args.i} to determine parquet URI...", file=sys.stderr)
+        try:
+            etag = _get_volume_manifest_etag(args.w, args.i, args.s3_source_bucket)
+            args.parquet_uri = _compute_parquet_uri(args.w, args.i, etag, args.job_name, args.s3_dest_bucket)
+            print(f"Computed parquet URI: {args.parquet_uri}", file=sys.stderr)
+        except Exception as e:
+            print(f"Error: Failed to compute parquet URI: {e}", file=sys.stderr)
+            sys.exit(1)
+    
     # Create output folder
     output_folder = Path(args.output_folder)
     output_folder.mkdir(parents=True, exist_ok=True)
+    
+    # Set parquet_uri for use in the rest of the function
+    parquet_uri = args.parquet_uri
     
     # Build image URI mapping if input arguments provided
     image_uri_map: Optional[Dict[str, str]] = None
@@ -440,15 +602,15 @@ def main():
         image_uri_map = {task.img_filename: task.source_uri for task in image_tasks}
         print(f"Using local input folder: {args.input_folder} ({len(image_uri_map)} images)", file=sys.stderr)
     elif args.w and args.i:
-        # S3 mode (explicit)
+        # S3 mode (explicit or auto-computed)
         image_tasks, i_version = get_image_list_and_version_s3(args.w, args.i)
         if image_tasks is None or i_version is None:
-            raise ValueError(f"Failed to fetch image list for W{args.w} I{args.i}")
+            raise ValueError(f"Failed to fetch image list for {args.w} {args.i}")
         image_uri_map = {task.img_filename: task.source_uri for task in image_tasks}
-        print(f"Using S3 mode: W{args.w} I{args.i} ({len(image_uri_map)} images)", file=sys.stderr)
+        print(f"Using S3 mode: {args.w} {args.i} ({len(image_uri_map)} images)", file=sys.stderr)
     else:
         # Try to infer from parquet filename
-        w_i = extract_w_i_from_parquet_filename(args.parquet_uri)
+        w_i = extract_w_i_from_parquet_filename(parquet_uri)
         if w_i:
             w_id, i_id = w_i
             print(f"Inferred {w_id} {i_id} from parquet filename. Fetching images from S3...", file=sys.stderr)
@@ -464,7 +626,6 @@ def main():
             image_uri_map = None
     
     # Read parquet file
-    parquet_uri = args.parquet_uri
     fs, path = _open_filesystem_and_path(parquet_uri)
     
     if fs is None:

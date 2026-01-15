@@ -45,12 +45,13 @@ def setup_logging() -> None:
 
     handler = logging.StreamHandler(sys.stdout)
     handler.setFormatter(JsonFormatter())
+    # Handler should not filter - let loggers control what gets through
+    handler.setLevel(logging.INFO)
 
     # Root logger: controls third-party libraries
     root = logging.getLogger()
     root.handlers.clear()
     root.setLevel(root_level)
-    handler.setLevel(root_level)
     root.addHandler(handler)
 
     # Your application logger namespace

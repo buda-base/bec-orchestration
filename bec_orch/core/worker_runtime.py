@@ -145,8 +145,12 @@ class BECWorkerRuntime:
     def run_forever(self) -> None:
         """
         Main loop: poll SQS, process messages, exit after N empty polls.
+        If shutdown_after_empty_polls <= 0, runs indefinitely (daemon mode for systemd).
         """
-        logger.info(f"Starting main loop (shutdown after {self.cfg.shutdown_after_empty_polls} empty polls)")
+        if self.cfg.shutdown_after_empty_polls > 0:
+            logger.info(f"Starting main loop (shutdown after {self.cfg.shutdown_after_empty_polls} empty polls)")
+        else:
+            logger.info("Starting main loop (running indefinitely in daemon mode)")
         
         while True:
             # Update heartbeat if needed
@@ -161,11 +165,18 @@ class BECWorkerRuntime:
             
             if msg is None:
                 self._empty_polls += 1
-                logger.info(f"No messages received ({self._empty_polls}/{self.cfg.shutdown_after_empty_polls})")
                 
-                if self._empty_polls >= self.cfg.shutdown_after_empty_polls:
-                    logger.info("Shutdown threshold reached, exiting")
-                    break
+                # Only check shutdown threshold if configured (> 0)
+                if self.cfg.shutdown_after_empty_polls > 0:
+                    logger.info(f"No messages received ({self._empty_polls}/{self.cfg.shutdown_after_empty_polls})")
+                    
+                    if self._empty_polls >= self.cfg.shutdown_after_empty_polls:
+                        logger.info("Shutdown threshold reached, exiting")
+                        break
+                else:
+                    # In daemon mode, log less frequently
+                    if self._empty_polls % 10 == 1:
+                        logger.debug(f"No messages, continuing to poll (daemon mode, {self._empty_polls} empty polls so far)")
                 
                 continue
             
@@ -426,7 +437,9 @@ class BECWorkerRuntime:
                 filename = item.get('filename')
                 if not filename:
                     continue
-                
+                if "." not in filename or "/" in filename:
+                    # should always have a dot and no /
+                    continue
                 ext = Path(filename).suffix.lower()
                 if ext in IMAGE_EXTENSIONS:
                     manifest.append(item)

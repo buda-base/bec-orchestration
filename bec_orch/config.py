@@ -13,4 +13,7 @@ class OrchestrationConfig:
     visibility_timeout_seconds: int = 300
     visibility_extend_every_seconds: int = 60
 
-    shutdown_after_empty_polls: int = 6   # e.g. 6 * 20s = 2 minutes
+    # Shutdown behavior:
+    # > 0: Exit after N empty polls (e.g., 6 * 20s = 2 minutes) - for batch jobs
+    # <= 0: Run indefinitely (daemon mode) - for systemd services
+    shutdown_after_empty_polls: int = 6

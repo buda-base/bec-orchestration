@@ -23,7 +23,8 @@ from dotenv import load_dotenv
 from rich.console import Console
 
 console = Console()
-logger = logging.getLogger(__name__)
+# Use "bec" namespace so logs appear at INFO level
+logger = logging.getLogger("bec.cli.worker")
 
 # Load environment variables from .env file if present
 load_dotenv()
@@ -53,8 +54,8 @@ def worker(
     Queue URLs are fetched from the job record in the database.
     """
     
-    # Setup logging: root=WARNING, bec namespace=INFO
-    # This overrides the CLI's setup_logging() which sets root to INFO
+    # Setup logging FIRST: root=WARNING, bec namespace=INFO
+    # This ensures all subsequent logging calls use JSON format
     from bec_orch.logging_setup import setup_logging
     setup_logging()
     
@@ -71,8 +72,7 @@ def worker(
     sql_database = os.environ.get('BEC_SQL_DATABASE', 'pipeline_v1')
     
     if not all([sql_host, sql_user, sql_password]):
-        console.print("[red]Error:[/red] Missing required SQL environment variables")
-        console.print("Required: BEC_SQL_HOST, BEC_SQL_USER, BEC_SQL_PASSWORD")
+        logger.error("Missing required SQL environment variables: BEC_SQL_HOST, BEC_SQL_USER, BEC_SQL_PASSWORD")
         sys.exit(1)
     
     # URL-encode password to handle special characters
@@ -86,8 +86,7 @@ def worker(
     # Get destination bucket
     s3_dest_bucket = s3_dest_bucket or os.environ.get('BEC_DEST_S3_BUCKET')
     if not s3_dest_bucket:
-        console.print("[red]Error:[/red] Missing destination S3 bucket")
-        console.print("Provide --s3-dest-bucket or set BEC_DEST_S3_BUCKET environment variable")
+        logger.error("Missing destination S3 bucket. Provide --s3-dest-bucket or set BEC_DEST_S3_BUCKET environment variable")
         sys.exit(1)
     
     # Set model path in environment if provided (for ldv1 worker)
@@ -107,11 +106,7 @@ def worker(
         shutdown_after_empty_polls=shutdown_after_empty,
     )
     
-    console.print(f"[bold green]Starting BEC Worker[/bold green]")
-    console.print(f"Job: {job_name}")
-    console.print(f"Region: {region}")
-    console.print(f"Source bucket: {s3_source_bucket}")
-    console.print(f"Dest bucket: {s3_dest_bucket}")
+    logger.info("Starting BEC Worker", extra={"job_name": job_name, "region": region, "s3_source_bucket": s3_source_bucket, "s3_dest_bucket": s3_dest_bucket})
     
     # Create clients
     db = DBClient(cfg.db_dsn)
@@ -128,19 +123,15 @@ def worker(
     
     try:
         runtime.initialize()
-        console.print(f"[green]Worker initialized:[/green] worker_id={runtime.worker_id}, job_id={runtime.job_record.id}")
-        console.print(f"Queue: {runtime.queue_url}")
-        if runtime.dlq_url:
-            console.print(f"DLQ: {runtime.dlq_url}")
+        logger.info("Worker initialized", extra={"worker_id": runtime.worker_id, "job_id": runtime.job_record.id, "queue_url": runtime.queue_url, "dlq_url": runtime.dlq_url})
         runtime.run_forever()
-        console.print("[green]Worker completed successfully[/green]")
+        logger.info("Worker completed successfully")
     except KeyboardInterrupt:
-        console.print("\n[yellow]Worker interrupted by user[/yellow]")
+        logger.info("Worker interrupted by user")
     except Exception as e:
-        console.print(f"[red]Worker failed:[/red] {e}")
-        logger.exception("Worker error")
+        logger.error(f"Worker failed: {e}", exc_info=True)
         raise
     finally:
         runtime.shutdown()
-        console.print("[dim]Worker shutdown complete[/dim]")
+        logger.info("Worker shutdown complete")
 

@@ -286,8 +286,9 @@ class BECWorkerRuntime:
         - Check success.json first (source of truth) - if exists, skip (unless force=True)
         - Try to claim task in DB
         - If claim fails:
-          - If force=True OR stale (any status, > 5 min old): claim task and proceed
-          - If not stale and not force: skip with warning (another worker likely active)
+          - If force=True: forcefully claim task (UPDATE) regardless of status/age
+          - If not force but stale (> 5 min old): claim stale task and proceed
+          - If not force and not stale: skip with warning (another worker likely active)
         - Run job worker
         - Write success.json
         - Update DB
@@ -295,7 +296,7 @@ class BECWorkerRuntime:
         
         Args:
             msg: SQS message (or fake message for direct processing)
-            force: If True, process even if success.json exists AND claim task even if not stale
+            force: If True, bypass success.json check AND forcefully claim task (no restrictions)
             is_direct: If True, this is direct processing (not from SQS)
         """
         start_time = time.time()
@@ -351,41 +352,19 @@ class BECWorkerRuntime:
         )
         
         if task_execution_id is None:
-            # Task already exists in database - check if it's stale or force=True
-            # success.json is the source of truth, so if it doesn't exist, the task is not done
-            # regardless of DB status. A task is considered stale if: started_at > 5 minutes ago OR force=True
-            is_stale = force  # force flag makes any task "stale" (claimable)
-            if not is_stale and existing_started_at is not None:
-                from datetime import datetime, timezone, timedelta
-                if isinstance(existing_started_at, str):
-                    # Parse ISO format string if needed
-                    existing_started_at = datetime.fromisoformat(existing_started_at.replace('Z', '+00:00'))
-                if existing_started_at.tzinfo is None:
-                    # Assume UTC if timezone-naive
-                    existing_started_at = existing_started_at.replace(tzinfo=timezone.utc)
-                
-                age = datetime.now(timezone.utc) - existing_started_at
-                is_stale = age > timedelta(minutes=5)
+            # Task already exists in database
+            status_msg = f"status='{existing_status}'" if existing_status else "unknown status"
             
-            if is_stale:
-                # Stale record - likely from a crashed worker, or force=True - claim it and proceed
-                status_msg = f"status='{existing_status}'" if existing_status else "unknown status"
-                if force:
-                    logger.warning(
-                        f"Task already exists in database with {status_msg} "
-                        f"(started_at={existing_started_at}) but force=True. "
-                        f"Claiming task and reprocessing. "
-                        f"job_id={self.job_record.id}, volume_id={volume_id}"
-                    )
-                else:
-                    logger.warning(
-                        f"Task already exists in database with stale {status_msg} "
-                        f"(started_at={existing_started_at}, age > 5 minutes) but no success.json found. "
-                        f"Assuming previous worker crashed. Claiming stale task and proceeding. "
-                        f"job_id={self.job_record.id}, volume_id={volume_id}"
-                    )
-                # Try to claim the stale task
-                task_execution_id = self.db.claim_stale_task_execution(
+            if force:
+                # Force mode: claim task regardless of status or age
+                logger.warning(
+                    f"Task already exists in database with {status_msg} "
+                    f"(started_at={existing_started_at}) but force=True. "
+                    f"Forcefully claiming task and reprocessing. "
+                    f"job_id={self.job_record.id}, volume_id={volume_id}"
+                )
+                # Use force claim which always succeeds
+                task_execution_id = self.db.force_claim_task_execution(
                     self.conn,
                     self.job_record.id,
                     volume_id,
@@ -393,28 +372,65 @@ class BECWorkerRuntime:
                     self.worker_id
                 )
                 if task_execution_id is None:
-                    # Race condition: another worker claimed it first, skip
-                    logger.warning(
-                        f"Failed to claim stale task (another worker may have claimed it). Skipping."
-                    )
+                    # Should never happen with force claim, but handle gracefully
+                    logger.error(f"Failed to force claim task - unexpected error")
                     if not is_direct and msg.receipt_handle:
                         self.sqs.delete(self.queue_url, msg.receipt_handle)
                     return
-                logger.info(f"Claimed stale task execution: {task_execution_id}")
+                logger.info(f"Force claimed task execution: {task_execution_id}")
             else:
-                # Not stale - another worker is likely active, skip with warning
-                status_msg = f"status='{existing_status}'" if existing_status else "unknown status"
-                etag_preview = manifest.s3_etag[:16] if len(manifest.s3_etag) > 16 else manifest.s3_etag
-                logger.warning(
-                    f"Task already exists in database ({status_msg}) but no success.json found. "
-                    f"job_id={self.job_record.id}, volume_id={volume_id}, etag={etag_preview}..., "
-                    f"started_at={existing_started_at}. "
-                    f"Assuming another worker is processing. Skipping."
-                )
-                # Still delete the message to avoid reprocessing (if not direct)
-                if not is_direct and msg.receipt_handle:
-                    self.sqs.delete(self.queue_url, msg.receipt_handle)
-                return
+                # Normal mode: check if task is stale (> 5 minutes old)
+                is_stale = False
+                if existing_started_at is not None:
+                    from datetime import datetime, timezone, timedelta
+                    if isinstance(existing_started_at, str):
+                        # Parse ISO format string if needed
+                        existing_started_at = datetime.fromisoformat(existing_started_at.replace('Z', '+00:00'))
+                    if existing_started_at.tzinfo is None:
+                        # Assume UTC if timezone-naive
+                        existing_started_at = existing_started_at.replace(tzinfo=timezone.utc)
+                    
+                    age = datetime.now(timezone.utc) - existing_started_at
+                    is_stale = age > timedelta(minutes=5)
+                
+                if is_stale:
+                    # Stale record - likely from a crashed worker, claim it and proceed
+                    logger.warning(
+                        f"Task already exists in database with stale {status_msg} "
+                        f"(started_at={existing_started_at}, age > 5 minutes) but no success.json found. "
+                        f"Assuming previous worker crashed. Claiming stale task and proceeding. "
+                        f"job_id={self.job_record.id}, volume_id={volume_id}"
+                    )
+                    # Try to claim the stale task
+                    task_execution_id = self.db.claim_stale_task_execution(
+                        self.conn,
+                        self.job_record.id,
+                        volume_id,
+                        etag_bytes,
+                        self.worker_id
+                    )
+                    if task_execution_id is None:
+                        # Race condition: another worker claimed it first, skip
+                        logger.warning(
+                            f"Failed to claim stale task (another worker may have claimed it). Skipping."
+                        )
+                        if not is_direct and msg.receipt_handle:
+                            self.sqs.delete(self.queue_url, msg.receipt_handle)
+                        return
+                    logger.info(f"Claimed stale task execution: {task_execution_id}")
+                else:
+                    # Not stale - another worker is likely active, skip with warning
+                    etag_preview = manifest.s3_etag[:16] if len(manifest.s3_etag) > 16 else manifest.s3_etag
+                    logger.warning(
+                        f"Task already exists in database ({status_msg}) but no success.json found. "
+                        f"job_id={self.job_record.id}, volume_id={volume_id}, etag={etag_preview}..., "
+                        f"started_at={existing_started_at}. "
+                        f"Assuming another worker is processing. Skipping."
+                    )
+                    # Still delete the message to avoid reprocessing (if not direct)
+                    if not is_direct and msg.receipt_handle:
+                        self.sqs.delete(self.queue_url, msg.receipt_handle)
+                    return
         else:
             # Successfully claimed new task
             logger.info(f"Claimed new task execution: {task_execution_id}")

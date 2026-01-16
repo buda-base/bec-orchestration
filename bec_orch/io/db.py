@@ -396,6 +396,81 @@ class DBClient:
             conn.rollback()
             return None
 
+    def force_claim_task_execution(
+        self,
+        conn: psycopg.Connection,
+        job_id: int,
+        volume_id: int,
+        s3_etag_bytes: bytes,
+        worker_id: int,
+    ) -> Optional[int]:
+        """
+        Forcefully claim a task execution regardless of status or age.
+        Updates the existing record to claim it for this worker, or creates new if doesn't exist.
+        This is used when --force flag is specified.
+        
+        Args:
+            conn: Database connection
+            job_id: Job ID
+            volume_id: Volume ID
+            s3_etag_bytes: S3 etag as bytes (16 bytes MD5)
+            worker_id: Worker ID
+            
+        Returns:
+            task_execution_id (always succeeds)
+        """
+        with conn.cursor() as cur:
+            # Try to update existing task (any status, any age)
+            cur.execute(
+                """
+                UPDATE task_executions
+                SET worker_id = %s, started_at = now(), attempt = attempt + 1, status = 'running'
+                WHERE job_id = %s AND volume_id = %s AND s3_etag = %s
+                RETURNING id
+                """,
+                (worker_id, job_id, volume_id, s3_etag_bytes)
+            )
+            row = cur.fetchone()
+            
+            if row is not None:
+                # Successfully updated existing task
+                conn.commit()
+                return row['id']
+            
+            # No existing task, create new one
+            try:
+                cur.execute(
+                    """
+                    INSERT INTO task_executions (job_id, volume_id, s3_etag, status, worker_id, started_at, attempt)
+                    VALUES (%s, %s, %s, 'running', %s, now(), 1)
+                    RETURNING id
+                    """,
+                    (job_id, volume_id, s3_etag_bytes, worker_id)
+                )
+                result = cur.fetchone()
+                conn.commit()
+                return result['id']
+            except psycopg.errors.UniqueViolation:
+                # Race condition: task was created between UPDATE and INSERT
+                # Roll back and try UPDATE again
+                conn.rollback()
+                cur.execute(
+                    """
+                    UPDATE task_executions
+                    SET worker_id = %s, started_at = now(), attempt = attempt + 1, status = 'running'
+                    WHERE job_id = %s AND volume_id = %s AND s3_etag = %s
+                    RETURNING id
+                    """,
+                    (worker_id, job_id, volume_id, s3_etag_bytes)
+                )
+                row = cur.fetchone()
+                if row is not None:
+                    conn.commit()
+                    return row['id']
+                # Should never happen, but handle gracefully
+                conn.rollback()
+                return None
+
     def mark_task_done(
         self,
         conn: psycopg.Connection,

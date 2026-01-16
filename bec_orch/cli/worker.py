@@ -131,7 +131,7 @@ def worker(
 @click.option('--job-name', type=str, required=True, help='Job name from database (e.g., ldv1, ocr)')
 @click.option('--w', 'w_id', type=str, required=True, help='Work ID (e.g., W22084)')
 @click.option('--i', 'i_id', type=str, required=True, help='Image group ID (e.g., I0886)')
-@click.option('-f', '--force', is_flag=True, help='Process even if already completed (success.json exists)')
+@click.option('-f', '--force', is_flag=True, help='Force processing: bypass success.json check and claim task regardless of status')
 @click.option('-v', '--verbose', is_flag=True, help='Enable verbose logging (DEBUG for bec, INFO for other loggers)')
 @click.option('--s3-source-bucket', type=str, default='archive.tbrc.org', help='Source S3 bucket for images')
 @click.option('--s3-dest-bucket', type=str, help='Destination S3 bucket (default: from BEC_DEST_S3_BUCKET env)')

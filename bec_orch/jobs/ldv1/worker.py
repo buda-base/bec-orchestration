@@ -173,17 +173,34 @@ class LDVolumeWorker:
             # Wait for all tasks, but handle exceptions per-task to avoid cascading failures
             results = await asyncio.gather(*tasks, return_exceptions=True)
             
-            # Log any exceptions
+            # Collect all stage failures
             stage_names = ["prefetcher", "decoder", "tilebatcher", "inference_runner", "postprocessor", "writer"]
+            failed_stages = []
+            
             for name, result in zip(stage_names, results):
                 if isinstance(result, Exception):
-                    logger.error(f"Stage {name} failed: {result}", exc_info=result)
+                    logger.error(f"Pipeline stage '{name}' failed with {type(result).__name__}: {result}", exc_info=result)
                     self._is_healthy = False
                     self._last_error_time = time.time()
+                    failed_stages.append((name, result))
+                else:
+                    logger.debug(f"Pipeline stage '{name}' completed successfully")
             
-            # Re-raise writer failure as it's critical (data loss risk)
-            if isinstance(results[5], Exception):
-                raise RuntimeError(f"Writer stage failed: {results[5]}") from results[5]
+            # If any stage failed, raise a consolidated error with all failures
+            if failed_stages:
+                if len(failed_stages) == 1:
+                    name, exc = failed_stages[0]
+                    raise RuntimeError(f"Pipeline stage '{name}' failed: {exc}") from exc
+                else:
+                    # Multiple stages failed - report all
+                    failure_summary = ", ".join([f"{name}({type(exc).__name__})" for name, exc in failed_stages])
+                    logger.error(f"Multiple pipeline stages failed: {failure_summary}")
+                    # Raise from the first failure
+                    first_name, first_exc = failed_stages[0]
+                    raise RuntimeError(
+                        f"Multiple pipeline stages failed: {failure_summary}. "
+                        f"First failure in '{first_name}': {first_exc}"
+                    ) from first_exc
         finally:
             # If we're being cancelled or a stage failed unexpectedly, ensure no background tasks linger.
             await self.aclose()
@@ -327,18 +344,31 @@ class LDV1JobWorker:
             asyncio.run(run_pipeline())
             
         except Exception as e:
-            logger.error(f"Pipeline failed: {e}", exc_info=True)
+            # Log detailed error information
+            error_type = type(e).__name__
+            logger.error(
+                f"LDV1 pipeline failed for volume {ctx.volume.w_id}/{ctx.volume.i_id}: "
+                f"{error_type}: {e}",
+                exc_info=True
+            )
+            
             # Re-classify exceptions for orchestration layer
             from bec_orch.errors import RetryableTaskError, TerminalTaskError
             
             # Classify based on error type
             if 'CUDA out of memory' in str(e) or 'OOM' in str(e):
-                raise RetryableTaskError(f"GPU OOM error: {e}")
-            elif 'NotFound' in str(type(e).__name__) or '404' in str(e):
-                raise TerminalTaskError(f"Resource not found: {e}")
+                logger.error("GPU out of memory error detected - task will be retried")
+                raise RetryableTaskError(f"GPU OOM error: {e}") from e
+            elif 'NotFound' in error_type or '404' in str(e):
+                logger.error("Resource not found - task is terminal")
+                raise TerminalTaskError(f"Resource not found: {e}") from e
+            elif 'FileNotFoundError' == error_type:
+                logger.error("File not found - task is terminal")
+                raise TerminalTaskError(f"File not found: {e}") from e
             else:
                 # Default: retryable
-                raise RetryableTaskError(f"Pipeline error: {e}")
+                logger.warning(f"Unclassified error ({error_type}) - task will be retried")
+                raise RetryableTaskError(f"Pipeline error ({error_type}): {e}") from e
         
         # Calculate metrics
         elapsed_ms = (time.time() - start_time) * 1000

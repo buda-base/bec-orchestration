@@ -27,6 +27,14 @@ except ImportError:
 try:
     import pyvips  # type: ignore
     _VIPS_AVAILABLE = True
+    # Suppress vips warnings about missing TIFF tags
+    # Set both Python logger and libvips internal log level to ERROR
+    vips_logger = logging.getLogger('pyvips')
+    vips_logger.setLevel(logging.ERROR)
+    # libvips uses GLib logging - this disables WARNING and INFO messages
+    import os as _os_vips
+    if 'VIPS_WARNING' not in _os_vips.environ:
+        _os_vips.environ['VIPS_WARNING'] = '0'
 except ImportError:
     pyvips = None
     _VIPS_AVAILABLE = False

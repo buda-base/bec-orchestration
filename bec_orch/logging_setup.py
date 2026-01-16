@@ -3,6 +3,7 @@ import logging
 import os
 import sys
 import time
+import warnings
 from typing import Any, Dict
 
 # CloudWatch-ready logs (to stdout/stderr, appended by systemd to /var/log/bec/worker.log)
@@ -65,3 +66,11 @@ def setup_logging() -> None:
     timings_logger = logging.getLogger("bec_timings")
     timings_logger.setLevel(timings_level)
     timings_logger.propagate = True  # still go to root handler
+    
+    # Suppress third-party deprecation warnings we can't control
+    # PyTorch's pynvml deprecation warning
+    warnings.filterwarnings(
+        "ignore",
+        category=FutureWarning,
+        message=".*pynvml package is deprecated.*",
+    )

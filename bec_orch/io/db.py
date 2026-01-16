@@ -1,10 +1,49 @@
 from __future__ import annotations
 import json
+import os
 from typing import Any, Dict, Optional
+from urllib.parse import quote_plus
 import psycopg
 from psycopg.rows import dict_row
 
 from bec_orch.core.models import JobRecord
+
+
+def build_dsn_from_env() -> str:
+    """
+    Build PostgreSQL DSN from environment variables.
+    
+    Required environment variables:
+    - BEC_SQL_HOST: PostgreSQL host
+    - BEC_SQL_USER: PostgreSQL user
+    - BEC_SQL_PASSWORD: PostgreSQL password
+    
+    Optional environment variables:
+    - BEC_SQL_PORT: PostgreSQL port (default: 5432)
+    - BEC_SQL_DATABASE: Database name (default: pipeline_v1)
+    
+    Returns:
+        PostgreSQL DSN string
+        
+    Raises:
+        ValueError: If required environment variables are missing
+    """
+    sql_host = os.environ.get('BEC_SQL_HOST')
+    sql_port = os.environ.get('BEC_SQL_PORT', '5432')
+    sql_user = os.environ.get('BEC_SQL_USER')
+    sql_password = os.environ.get('BEC_SQL_PASSWORD')
+    sql_database = os.environ.get('BEC_SQL_DATABASE', 'pipeline_v1')
+    
+    if not all([sql_host, sql_user, sql_password]):
+        raise ValueError(
+            "Missing required SQL environment variables. "
+            "Required: BEC_SQL_HOST, BEC_SQL_USER, BEC_SQL_PASSWORD"
+        )
+    
+    # URL-encode password to handle special characters
+    encoded_password = quote_plus(sql_password)
+    # Add SSL requirement for secure connections
+    return f"postgresql://{sql_user}:{encoded_password}@{sql_host}:{sql_port}/{sql_database}?sslmode=require"
 
 
 class DBClient:
@@ -426,6 +465,82 @@ class DBClient:
                 (status, task_execution_id)
             )
             conn.commit()
+
+    def is_volume_done_on_latest_version(
+        self,
+        conn: psycopg.Connection,
+        job_id: int,
+        w_id: str,
+        i_id: str,
+    ) -> bool:
+        """
+        Check if a volume has been successfully processed on its latest version.
+        
+        Returns True if:
+        - The volume exists in the database
+        - There's a task execution with status='done' for this job and volume
+        - The s3_etag of the done task matches the latest s3_etag in volumes table
+        
+        Args:
+            conn: Database connection
+            job_id: Job ID
+            w_id: Work ID
+            i_id: Image group ID
+            
+        Returns:
+            True if volume is done on latest version, False otherwise
+        """
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT EXISTS (
+                    SELECT 1
+                    FROM task_executions te
+                    JOIN volumes v ON te.volume_id = v.id
+                    WHERE v.bdrc_w_id = %s
+                      AND v.bdrc_i_id = %s
+                      AND te.job_id = %s
+                      AND te.status = 'done'
+                      AND te.s3_etag = v.last_s3_etag
+                ) AS is_done
+                """,
+                (w_id, i_id, job_id)
+            )
+            row = cur.fetchone()
+            return row['is_done'] if row else False
+
+    def get_volumes_done_on_latest_version(
+        self,
+        conn: psycopg.Connection,
+        job_id: int,
+    ) -> set[tuple[str, str]]:
+        """
+        Get all volumes that have been successfully processed on their latest version for a job.
+        
+        This is optimized for bulk checking - fetch all done volumes at once rather than
+        querying one by one.
+        
+        Args:
+            conn: Database connection
+            job_id: Job ID
+            
+        Returns:
+            Set of (w_id, i_id) tuples for volumes that are done on latest version
+        """
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT v.bdrc_w_id, v.bdrc_i_id
+                FROM task_executions te
+                JOIN volumes v ON te.volume_id = v.id
+                WHERE te.job_id = %s
+                  AND te.status = 'done'
+                  AND te.s3_etag = v.last_s3_etag
+                """,
+                (job_id,)
+            )
+            rows = cur.fetchall()
+            return {(row['bdrc_w_id'], row['bdrc_i_id']) for row in rows}
 
 
 def etag_to_bytes(etag: str) -> bytes:

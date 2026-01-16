@@ -33,24 +33,14 @@ def get_sqs_client():
 
 def get_queue_url_from_job_name(job_name: str) -> str:
     """Get queue URL from job name by querying the database."""
-    from bec_orch.io.db import DBClient
+    from bec_orch.io.db import DBClient, build_dsn_from_env
     from bec_orch.orch.job_admin import get_job_by_name
     
-    sql_host = os.environ.get('BEC_SQL_HOST')
-    sql_port = os.environ.get('BEC_SQL_PORT', '5432')
-    sql_user = os.environ.get('BEC_SQL_USER')
-    sql_password = os.environ.get('BEC_SQL_PASSWORD')
-    sql_database = os.environ.get('BEC_SQL_DATABASE', 'pipeline_v1')
-    
-    if not all([sql_host, sql_user, sql_password]):
-        console.print("[red]Error:[/red] Missing required SQL environment variables")
-        console.print("Required: BEC_SQL_HOST, BEC_SQL_USER, BEC_SQL_PASSWORD")
+    try:
+        dsn = build_dsn_from_env()
+    except ValueError as e:
+        console.print(f"[red]Error:[/red] {e}")
         sys.exit(1)
-    
-    # URL-encode password to handle special characters
-    encoded_password = quote_plus(sql_password)
-    # Add SSL requirement for secure connections
-    dsn = f"postgresql://{sql_user}:{encoded_password}@{sql_host}:{sql_port}/{sql_database}?sslmode=require"
     
     db = DBClient(dsn)
     conn = db.connect()
@@ -73,18 +63,40 @@ def queue():
 @click.option('--file', type=click.Path(exists=True), help='File with volume list (one per line: W12345,I0123)')
 @click.option('--volume', multiple=True, help='Single volume (format: W12345,I0123). Can be specified multiple times.')
 @click.option('--region', help='AWS region (default: from BEC_REGION env or us-east-1)')
-def enqueue(queue_url, job_name, file, volume, region):
+@click.option('-n', '--limit', type=int, help='Limit number of volumes to enqueue (after filtering)')
+@click.option('-f', '--force', is_flag=True, help='Force enqueue all volumes, ignoring done status in DB')
+def enqueue(queue_url, job_name, file, volume, region, limit, force):
     """Enqueue volumes to task queue."""
     from bec_orch.core.models import VolumeRef
     from bec_orch.orch.enqueue import enqueue_volumes, enqueue_volume_list_from_file
+    from bec_orch.io.db import DBClient, build_dsn_from_env
+    from bec_orch.orch.job_admin import get_job_by_name
     
     # Get queue URL from job name if provided
+    job_id = None
     if job_name:
         if queue_url:
             console.print("[red]Error:[/red] Cannot specify both --queue-url and --job-name")
             sys.exit(1)
         queue_url = get_queue_url_from_job_name(job_name)
         console.print(f"[dim]Using queue URL from job '{job_name}': {queue_url}[/dim]")
+        
+        # Get job_id for filtering (if not forcing)
+        if not force:
+            try:
+                dsn = build_dsn_from_env()
+            except ValueError as e:
+                console.print(f"[red]Error:[/red] {e}")
+                console.print("Or use --force to skip filtering")
+                sys.exit(1)
+            
+            db = DBClient(dsn)
+            conn = db.connect()
+            try:
+                job = get_job_by_name(conn, job_name)
+                job_id = job.id
+            finally:
+                conn.close()
     elif not queue_url:
         console.print("[red]Error:[/red] Must specify either --queue-url or --job-name")
         sys.exit(1)
@@ -97,6 +109,11 @@ def enqueue(queue_url, job_name, file, volume, region):
         console.print("[red]Error:[/red] Cannot specify both --file and --volume")
         sys.exit(1)
     
+    # Validate limit
+    if limit is not None and limit <= 0:
+        console.print("[red]Error:[/red] Limit must be a positive integer")
+        sys.exit(1)
+    
     # Override region if provided
     if region:
         os.environ['BEC_REGION'] = region
@@ -106,7 +123,44 @@ def enqueue(queue_url, job_name, file, volume, region):
     try:
         if file:
             console.print(f"Enqueueing volumes from file: [cyan]{file}[/cyan]")
-            count = enqueue_volume_list_from_file(sqs, queue_url, file)
+            
+            # Set up filtering if not forcing and job_id is available
+            filter_func = None
+            conn = None
+            if not force and job_id is not None:
+                console.print("[dim]Fetching volumes already done on latest version...[/dim]")
+                
+                try:
+                    dsn = build_dsn_from_env()
+                except ValueError as e:
+                    console.print(f"[red]Error:[/red] {e}")
+                    sys.exit(1)
+                
+                db = DBClient(dsn)
+                conn = db.connect()
+                
+                # Fetch all done volumes in one query (efficient for large lists)
+                done_volumes = db.get_volumes_done_on_latest_version(conn, job_id)
+                console.print(f"[dim]Found {len(done_volumes)} volume(s) already done on latest version[/dim]")
+                
+                def should_enqueue(vol: VolumeRef) -> bool:
+                    """Return True if volume should be enqueued, False if already done on latest version."""
+                    return (vol.w_id, vol.i_id) not in done_volumes
+                
+                filter_func = should_enqueue
+            
+            try:
+                enqueued_count, skipped_count = enqueue_volume_list_from_file(
+                    sqs, queue_url, file, filter_func=filter_func, limit=limit
+                )
+                
+                if filter_func is not None:
+                    console.print(f"[green]✓[/green] Enqueued {enqueued_count} volume(s), skipped {skipped_count} already done")
+                else:
+                    console.print(f"[green]✓[/green] Enqueued {enqueued_count} volume(s)")
+            finally:
+                if conn is not None:
+                    conn.close()
         else:
             # Parse volume arguments
             volumes = []
@@ -119,11 +173,12 @@ def enqueue(queue_url, job_name, file, volume, region):
             
             console.print(f"Enqueueing {len(volumes)} volume(s)...")
             count = enqueue_volumes(sqs, queue_url, volumes)
-        
-        console.print(f"[green]✓[/green] Enqueued {count} volume(s)")
+            console.print(f"[green]✓[/green] Enqueued {count} volume(s)")
         
     except Exception as e:
         console.print(f"[red]Error:[/red] {e}")
+        import traceback
+        traceback.print_exc()
         sys.exit(1)
 
 

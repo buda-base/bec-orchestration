@@ -1,7 +1,7 @@
 from __future__ import annotations
 import json
 import logging
-from typing import Iterable, List
+from typing import Iterable, List, Optional, Callable
 
 from bec_orch.core.models import VolumeRef
 from bec_orch.io.sqs import SQSClient
@@ -50,7 +50,9 @@ def enqueue_volume_list_from_file(
     sqs: SQSClient,
     queue_url: str,
     file_path: str,
-) -> int:
+    filter_func: Optional[Callable[[VolumeRef], bool]] = None,
+    limit: Optional[int] = None,
+) -> tuple[int, int]:
     """
     Enqueue volumes from a file.
     
@@ -61,11 +63,14 @@ def enqueue_volume_list_from_file(
         sqs: SQS client
         queue_url: Queue URL
         file_path: Path to file
+        filter_func: Optional function to filter volumes (return True to include, False to skip)
+        limit: Optional limit on number of volumes to enqueue (after filtering)
         
     Returns:
-        Count of volumes enqueued
+        Tuple of (count of volumes enqueued, count of volumes skipped by filter)
     """
     volumes = []
+    skipped_count = 0
     
     with open(file_path, 'r') as f:
         for line_num, line in enumerate(f, 1):
@@ -82,9 +87,24 @@ def enqueue_volume_list_from_file(
                 continue
             
             w_id, i_id = parts
-            volumes.append(VolumeRef(w_id=w_id, i_id=i_id))
+            volume = VolumeRef(w_id=w_id, i_id=i_id)
+            
+            # Apply filter if provided
+            if filter_func is not None:
+                if not filter_func(volume):
+                    skipped_count += 1
+                    logger.debug(f"Skipped volume {w_id}/{i_id} (already done on latest version)")
+                    continue
+            
+            volumes.append(volume)
+            
+            # Apply limit if provided
+            if limit is not None and len(volumes) >= limit:
+                logger.info(f"Reached limit of {limit} volumes")
+                break
     
-    return enqueue_volumes(sqs, queue_url, volumes)
+    enqueued_count = enqueue_volumes(sqs, queue_url, volumes)
+    return enqueued_count, skipped_count
 
 
 def get_queue_stats(sqs: SQSClient, queue_url: str) -> dict:

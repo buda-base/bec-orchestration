@@ -13,7 +13,6 @@ import json
 import os
 import sys
 from pathlib import Path
-from urllib.parse import quote_plus
 
 import boto3
 import click
@@ -25,23 +24,14 @@ console = Console()
 
 def get_db_connection():
     """Get database connection from environment."""
-    from bec_orch.io.db import DBClient
+    from bec_orch.io.db import DBClient, build_dsn_from_env
     
-    sql_host = os.environ.get('BEC_SQL_HOST')
-    sql_port = os.environ.get('BEC_SQL_PORT', '5432')
-    sql_user = os.environ.get('BEC_SQL_USER')
-    sql_password = os.environ.get('BEC_SQL_PASSWORD')
-    sql_database = os.environ.get('BEC_SQL_DATABASE', 'pipeline_v1')
-    
-    if not all([sql_host, sql_user, sql_password]):
-        console.print("[red]Error:[/red] Missing required SQL environment variables")
-        console.print("Required: BEC_SQL_HOST, BEC_SQL_USER, BEC_SQL_PASSWORD")
+    try:
+        dsn = build_dsn_from_env()
+    except ValueError as e:
+        console.print(f"[red]Error:[/red] {e}")
         sys.exit(1)
     
-    # URL-encode password to handle special characters
-    encoded_password = quote_plus(sql_password)
-    # Add SSL requirement for secure connections
-    dsn = f"postgresql://{sql_user}:{encoded_password}@{sql_host}:{sql_port}/{sql_database}?sslmode=require"
     db = DBClient(dsn)
     return db.connect()
 

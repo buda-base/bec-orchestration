@@ -4,9 +4,9 @@
       "files": {
         "collect_list": [
           {
-            "file_path": "/var/log/bec/worker-*.log",
-            "log_group_name": "/bec/workers",
-            "log_stream_name": "{instance_id}/{filename}",
+            "file_path": "/var/log/bec/worker-ldv1.log",
+            "log_group_name": "/bec/workers/ldv1",
+            "log_stream_name": "{instance_id}",
             "timezone": "UTC",
             "timestamp_format": "%Y-%m-%dT%H:%M:%S.%f"
           }

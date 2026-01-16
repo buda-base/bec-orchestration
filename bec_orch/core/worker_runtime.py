@@ -191,7 +191,6 @@ class BECWorkerRuntime:
             # Process message
             try:
                 self._process_message(msg)
-                logger.info(f"Successfully processed message: {msg.message_id}")
             except Exception as e:
                 logger.error(f"Failed to process message: {e}", exc_info=True)
                 # Don't delete message - let it go back to queue or DLQ
@@ -213,15 +212,77 @@ class BECWorkerRuntime:
             except Exception as e:
                 logger.error(f"Failed to close DB connection: {e}")
 
+    def process_volume_directly(self, w_id: str, i_id: str, force: bool = False) -> None:
+        """
+        Process a single volume directly without pulling from SQS.
+        
+        This simulates receiving an SQS message but operates directly on the volume.
+        Useful for manual processing, testing, or reprocessing failed volumes.
+        
+        Args:
+            w_id: Work ID (e.g., "W22084")
+            i_id: Image group ID (e.g., "I0886")
+            force: If True, process even if success.json exists
+        
+        Raises:
+            KeyboardInterrupt: If user cancels, re-raised with message about --force
+        """
+        volume = VolumeRef(w_id=w_id, i_id=i_id)
+        
+        logger.info(f"Processing volume directly: {w_id}/{i_id} (force={force})")
+        
+        # Create a fake SQS message for compatibility with existing flow
+        fake_msg = SqsTaskMessage(
+            message_id=f"direct-{w_id}-{i_id}",
+            receipt_handle="",  # No receipt handle for direct processing
+            body="",
+            volume=volume
+        )
+        
+        try:
+            self._process_volume(fake_msg, force=force, is_direct=True)
+            logger.info(f"Volume {w_id}/{i_id} processed successfully")
+        except KeyboardInterrupt:
+            logger.warning(f"Volume processing cancelled by user: {w_id}/{i_id}")
+            # Check if success.json exists to guide user
+            try:
+                manifest = self._get_volume_manifest(volume)
+                artifacts = self._get_artifact_location(volume, manifest.s3_etag)
+                has_success = self._check_success_marker(artifacts)
+                
+                if has_success and not force:
+                    logger.info(
+                        f"Volume {w_id}/{i_id} was already completed. "
+                        "To reprocess, run again with --force flag."
+                    )
+            except Exception:
+                pass  # Ignore errors during cleanup
+            
+            raise
+
     # ---- internals ----
     
     def _process_message(self, msg: SqsTaskMessage) -> None:
         """
+        High-level flow for SQS message processing.
+        Wraps _process_volume and handles SQS-specific logic (message deletion).
+        """
+        try:
+            self._process_volume(msg, force=False, is_direct=False)
+            logger.info(f"Successfully processed message: {msg.message_id}")
+        except Exception:
+            # Don't delete message - let it go back to queue or DLQ
+            raise
+    
+    def _process_volume(self, msg: SqsTaskMessage, force: bool = False, is_direct: bool = False) -> None:
+        """
+        Core volume processing logic.
+        
         High-level flow:
         - Resolve manifest info + etag
         - Ensure volume exists in DB
         - Compute artifact location
-        - Check success.json first (source of truth) - if exists, skip
+        - Check success.json first (source of truth) - if exists, skip (unless force=True)
         - Try to claim task in DB
         - If claim fails:
           - If stale (any status, > 5 min old): claim stale task and proceed
@@ -229,14 +290,19 @@ class BECWorkerRuntime:
         - Run job worker
         - Write success.json
         - Update DB
-        - Delete SQS message when safe
+        - Delete SQS message when safe (if not direct)
+        
+        Args:
+            msg: SQS message (or fake message for direct processing)
+            force: If True, process even if success.json exists
+            is_direct: If True, this is direct processing (not from SQS)
         """
         start_time = time.time()
         volume = msg.volume
         
         logger.info(
             f"Starting volume processing: {volume.w_id}/{volume.i_id} "
-            f"(message_id={msg.message_id})"
+            f"(message_id={msg.message_id}, force={force}, direct={is_direct})"
         )
         
         # Get volume manifest from S3
@@ -262,10 +328,17 @@ class BECWorkerRuntime:
         
         # Check success.json first (source of truth)
         if self._check_success_marker(artifacts_location):
-            logger.info("Success marker (success.json) already exists, task already completed, skipping")
-            # Still delete the message to avoid reprocessing
-            self.sqs.delete(self.queue_url, msg.receipt_handle)
-            return
+            if force:
+                logger.warning(
+                    f"Success marker (success.json) already exists for {volume.w_id}/{volume.i_id}, "
+                    "but force=True, so reprocessing anyway"
+                )
+            else:
+                logger.info("Success marker (success.json) already exists, task already completed, skipping")
+                # Still delete the message to avoid reprocessing (if not direct)
+                if not is_direct and msg.receipt_handle:
+                    self.sqs.delete(self.queue_url, msg.receipt_handle)
+                return
         
         # Try to claim task execution in DB
         task_execution_id, existing_status, existing_started_at = self.db.claim_task_execution(
@@ -315,7 +388,8 @@ class BECWorkerRuntime:
                     logger.warning(
                         f"Failed to claim stale task (another worker may have claimed it). Skipping."
                     )
-                    self.sqs.delete(self.queue_url, msg.receipt_handle)
+                    if not is_direct and msg.receipt_handle:
+                        self.sqs.delete(self.queue_url, msg.receipt_handle)
                     return
                 logger.info(f"Claimed stale task execution: {task_execution_id}")
             else:
@@ -328,8 +402,9 @@ class BECWorkerRuntime:
                     f"started_at={existing_started_at}. "
                     f"Assuming another worker is processing. Skipping."
                 )
-                # Still delete the message to avoid reprocessing
-                self.sqs.delete(self.queue_url, msg.receipt_handle)
+                # Still delete the message to avoid reprocessing (if not direct)
+                if not is_direct and msg.receipt_handle:
+                    self.sqs.delete(self.queue_url, msg.receipt_handle)
                 return
         else:
             # Successfully claimed new task
@@ -384,8 +459,9 @@ class BECWorkerRuntime:
             )
             logger.info("Updated DB with task completion")
             
-            # Delete SQS message
-            self.sqs.delete(self.queue_url, msg.receipt_handle)
+            # Delete SQS message (if not direct)
+            if not is_direct and msg.receipt_handle:
+                self.sqs.delete(self.queue_url, msg.receipt_handle)
             
             # Log volume completion
             total_time = (time.time() - start_time)
@@ -403,8 +479,8 @@ class BECWorkerRuntime:
             # Update DB
             self.db.mark_task_failed(self.conn, task_execution_id, retryable)
             
-            # If terminal error, delete message to avoid reprocessing
-            if not retryable:
+            # If terminal error, delete message to avoid reprocessing (if not direct)
+            if not retryable and not is_direct and msg.receipt_handle:
                 self.sqs.delete(self.queue_url, msg.receipt_handle)
             
             # Re-raise to let caller handle

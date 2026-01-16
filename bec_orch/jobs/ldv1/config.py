@@ -92,6 +92,11 @@ class PipelineConfig:
     
     # Max tiles per batch to prevent CUDA OOM (images have variable tile counts)
     max_tiles_per_batch: int = 80  # ~80 tiles = ~400MB GPU memory for forward pass
+    
+    # TileBatcher buffer limit to prevent memory accumulation
+    # Each buffered frame holds ~41MB (8MB gray + 8MB orig frame + 25MB pinned tiles)
+    # Set to 0 to disable limit (not recommended for large volumes)
+    max_tilebatcher_buffer: int = 64  # ~2.6GB max in TileBatcher buffer
     tps_add_corners: bool = True
     tps_alpha: float = 0.5
     legacy_tps_detect: bool = False

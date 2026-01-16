@@ -198,13 +198,15 @@ class TileBatcher:
             self._tile_executor = ThreadPoolExecutor(max_workers=self.tile_workers)
             logger.info(
                 f"[TileBatcher] Initialized with parallel tiling ({self.tile_workers} workers), "
-                f"batch_size={self.batch_size}, patch_size={self.patch_size}, dtype={self.tile_dtype}"
+                f"batch_size={self.batch_size}, patch_size={self.patch_size}, dtype={self.tile_dtype}, "
+                f"max_buffer={self._max_buffer_size}"
             )
         else:
             self._tile_executor = None
             logger.info(
                 f"[TileBatcher] Initialized with sequential tiling, "
-                f"batch_size={self.batch_size}, patch_size={self.patch_size}, dtype={self.tile_dtype}"
+                f"batch_size={self.batch_size}, patch_size={self.patch_size}, dtype={self.tile_dtype}, "
+                f"max_buffer={self._max_buffer_size}"
             )
 
         # Buffer for accumulating tiled frames before emitting a batch
@@ -213,6 +215,11 @@ class TileBatcher:
         
         # Pending tiling tasks (for parallel tiling)
         self._pending_tiles: List[asyncio.Task] = []
+        
+        # Buffer size limit to prevent memory accumulation
+        # Each buffered frame holds ~25MB (tiles tensor) + metadata
+        # Set to 0 to disable limit
+        self._max_buffer_size: int = getattr(cfg, "max_tilebatcher_buffer", 64)
 
     # -------------------------------------------------------------------------
     # Error handling
@@ -311,9 +318,10 @@ class TileBatcher:
         
         tile_time = time.perf_counter() - t0
         
+        # Note: 'gray' (binarized image) is NOT stored here - it was only needed for tiling.
+        # Downstream uses dec_frame.frame (original grayscale) for pass-2 transforms.
         return {
             "dec_frame": dec_frame,
-            "gray": gray,
             "second_pass": is_pass2,
             "tiles": tiles,
             "x_steps": x_steps,
@@ -420,9 +428,9 @@ class TileBatcher:
             else:
                 p1_count += 1
             
+            # Note: 'gray' is not stored in entry - downstream uses dec_frame.frame
             metas.append({
                 "dec_frame": entry["dec_frame"],
-                "gray": entry["gray"],
                 "second_pass": entry["second_pass"],
                 "x_steps": entry["x_steps"],
                 "y_steps": entry["y_steps"],
@@ -434,6 +442,13 @@ class TileBatcher:
 
         # Stack all tiles into single tensor
         all_tiles_tensor = torch.cat(all_tiles, dim=0)
+        
+        # Explicitly delete individual tiles tensors to help GC
+        # (they've been concatenated into all_tiles_tensor)
+        del all_tiles
+        for entry in self._buffer[:frames_to_take]:
+            if "tiles" in entry:
+                del entry["tiles"]
         
         # Pin the concatenated tensor for faster H2D transfer
         # (torch.cat creates a new tensor, so we need to re-pin)
@@ -636,11 +651,17 @@ class TileBatcher:
 
                 # --- Fetch more frames if we have capacity ---
                 # Keep fetching while we have room for more in-flight tasks
+                # Also respect buffer size limit to prevent memory accumulation
                 frames_fetched_this_loop = 0
                 max_fetch_per_loop = max_inflight  # Don't spin forever
                 
+                # Check buffer capacity (buffer + pending tiles)
+                total_in_flight = len(self._buffer) + len(self._pending_tiles)
+                buffer_has_space = (self._max_buffer_size == 0 or total_in_flight < self._max_buffer_size)
+                
                 while (len(self._pending_tiles) < max_inflight and 
-                       frames_fetched_this_loop < max_fetch_per_loop):
+                       frames_fetched_this_loop < max_fetch_per_loop and
+                       buffer_has_space):
                     
                     msg = None
                     is_pass2 = False
@@ -706,6 +727,10 @@ class TileBatcher:
                         )
                         self._pending_tiles.append(task)
                         frames_submitted += 1
+                        
+                        # Update buffer capacity check for next iteration
+                        total_in_flight = len(self._buffer) + len(self._pending_tiles)
+                        buffer_has_space = (self._max_buffer_size == 0 or total_in_flight < self._max_buffer_size)
 
                 # --- Timeout flush: emit partial batch if nothing is coming ---
                 # Only flush if:
@@ -786,22 +811,28 @@ class TileBatcher:
                     else:
                         # Wait for more frames with blocking timeout (avoid busy-spin)
                         # This gives decoder/prefetcher time to provide more data
-                        wait_start = time.perf_counter()
-                        msg = await self._pop_one(self.q_from_decoder, self.batch_timeout_s * 4)  # 100ms wait
-                        total_wait_time += time.perf_counter() - wait_start
-                        
-                        if msg is not None:
-                            if isinstance(msg, EndOfStream) and msg.stream == "prefetched":
-                                self._decoder_done = True
-                            elif isinstance(msg, PipelineError):
-                                await self.q_to_inference.put(msg)
-                            elif isinstance(msg, DecodedFrame):
-                                # Fire off async task that does BOTH binarization and tiling
-                                task = asyncio.create_task(
-                                    self._tile_frame_async(msg, False)
-                                )
-                                self._pending_tiles.append(task)
-                                frames_submitted += 1
+                        # But only if we have buffer capacity
+                        total_in_flight = len(self._buffer) + len(self._pending_tiles)
+                        if self._max_buffer_size > 0 and total_in_flight >= self._max_buffer_size:
+                            # Buffer is full, don't fetch more - just yield
+                            await asyncio.sleep(0.01)
+                        else:
+                            wait_start = time.perf_counter()
+                            msg = await self._pop_one(self.q_from_decoder, self.batch_timeout_s * 4)  # 100ms wait
+                            total_wait_time += time.perf_counter() - wait_start
+                            
+                            if msg is not None:
+                                if isinstance(msg, EndOfStream) and msg.stream == "prefetched":
+                                    self._decoder_done = True
+                                elif isinstance(msg, PipelineError):
+                                    await self.q_to_inference.put(msg)
+                                elif isinstance(msg, DecodedFrame):
+                                    # Fire off async task that does BOTH binarization and tiling
+                                    task = asyncio.create_task(
+                                        self._tile_frame_async(msg, False)
+                                    )
+                                    self._pending_tiles.append(task)
+                                    frames_submitted += 1
 
                 # --- Check if we should send pass-1 EOS ---
                 await self._maybe_emit_pass1_eos()

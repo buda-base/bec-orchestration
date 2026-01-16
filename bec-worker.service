@@ -1,5 +1,5 @@
 [Unit]
-Description=BEC Worker
+Description=BEC Worker - %i
 After=network-online.target
 Wants=network-online.target
 
@@ -9,22 +9,39 @@ Type=simple
 User=ec2-user
 Group=ec2-user
 
+# Load environment variables (DB credentials, AWS config, etc.)
 EnvironmentFile=/etc/bec/worker.env
-WorkingDirectory=/home/ec2-user/ocr-inference/
 
-# If you use a venv:
-ExecStart=/opt/pytorch/bin/python -m BDRC.orchestration.cli_worker
+# Working directory should be where the code is checked out
+WorkingDirectory=/home/ec2-user/bec-orchestration
 
+# Execute the worker using the installed CLI
+# The %i specifier is the job name (e.g., ldv1) when using templated service
+# For non-templated service, replace %i with your job name (e.g., ldv1)
+ExecStart=/opt/pytorch/bin/bec worker --job-name %i
+
+# Graceful shutdown handling
+KillMode=mixed
+KillSignal=SIGTERM
+TimeoutStopSec=60
+
+# Restart policy
 Restart=always
 RestartSec=5
 
-# Send stdout/stderr to a log file (simple for CloudWatch Agent)
-StandardOutput=append:/var/log/bec/worker.log
-StandardError=append:/var/log/bec/worker.log
+# Send stdout/stderr to a log file (for CloudWatch Agent)
+StandardOutput=append:/var/log/bec/worker-%i.log
+StandardError=append:/var/log/bec/worker-%i.log
 
-# Useful hardening
+# Resource limits
+LimitNOFILE=65536
+
+# Security hardening
 NoNewPrivileges=true
 PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/var/log/bec /tmp
 
 [Install]
 WantedBy=multi-user.target

@@ -40,14 +40,27 @@ class JsonFormatter(logging.Formatter):
 
         return json.dumps(payload, ensure_ascii=False)
 
-def setup_logging() -> None:
-    root_level = os.environ.get("BEC_ROOT_LOG_LEVEL", "WARNING").upper()
-    app_level = os.environ.get("BEC_APP_LOG_LEVEL", "INFO").upper()
+def setup_logging(verbose: bool = False) -> None:
+    """
+    Setup logging with JSON formatting for CloudWatch.
+    
+    Args:
+        verbose: If True, sets bec logger to DEBUG and root logger to INFO.
+                 If False, uses environment variables or defaults (WARNING for root, INFO for bec).
+    """
+    if verbose:
+        # Verbose mode: bec namespace at DEBUG, other loggers at INFO
+        root_level = "INFO"
+        app_level = "DEBUG"
+    else:
+        # Normal mode: use environment variables or defaults
+        root_level = os.environ.get("BEC_ROOT_LOG_LEVEL", "WARNING").upper()
+        app_level = os.environ.get("BEC_APP_LOG_LEVEL", "INFO").upper()
 
     handler = logging.StreamHandler(sys.stdout)
     handler.setFormatter(JsonFormatter())
     # Handler should not filter - let loggers control what gets through
-    handler.setLevel(logging.INFO)
+    handler.setLevel(logging.DEBUG if verbose else logging.INFO)
 
     # Root logger: controls third-party libraries
     root = logging.getLogger()

@@ -132,6 +132,7 @@ def worker(
 @click.option('--w', 'w_id', type=str, required=True, help='Work ID (e.g., W22084)')
 @click.option('--i', 'i_id', type=str, required=True, help='Image group ID (e.g., I0886)')
 @click.option('-f', '--force', is_flag=True, help='Process even if already completed (success.json exists)')
+@click.option('-v', '--verbose', is_flag=True, help='Enable verbose logging (DEBUG for bec, INFO for other loggers)')
 @click.option('--s3-source-bucket', type=str, default='archive.tbrc.org', help='Source S3 bucket for images')
 @click.option('--s3-dest-bucket', type=str, help='Destination S3 bucket (default: from BEC_DEST_S3_BUCKET env)')
 @click.option('--region', type=str, help='AWS region (default: from BEC_REGION env or us-east-1)')
@@ -141,6 +142,7 @@ def run_volume(
     w_id,
     i_id,
     force,
+    verbose,
     s3_source_bucket,
     s3_dest_bucket,
     region,
@@ -152,15 +154,17 @@ def run_volume(
     and processes it using the full worker pipeline (DB updates, S3 artifacts, etc.).
     
     Use --force to reprocess a volume that has already been completed.
+    Use --verbose to enable DEBUG logging for the bec namespace.
     
     Examples:
-      bec worker run-volume --job-name ldv1 --w W22084 --i I0886
-      bec worker run-volume --job-name ldv1 --w W22084 --i I0886 --force
+      bec run-volume --job-name ldv1 --w W22084 --i I0886
+      bec run-volume --job-name ldv1 --w W22084 --i I0886 --force
+      bec run-volume --job-name ldv1 --w W22084 --i I0886 --verbose
     """
     
-    # Setup logging FIRST: root=WARNING, bec namespace=INFO
+    # Setup logging FIRST with verbose flag
     from bec_orch.logging_setup import setup_logging
-    setup_logging()
+    setup_logging(verbose=verbose)
     
     from bec_orch.config import OrchestrationConfig
     from bec_orch.core.worker_runtime import BECWorkerRuntime
@@ -208,6 +212,7 @@ def run_volume(
             "w_id": w_id,
             "i_id": i_id,
             "force": force,
+            "verbose": verbose,
             "region": region,
             "s3_source_bucket": s3_source_bucket,
             "s3_dest_bucket": s3_dest_bucket

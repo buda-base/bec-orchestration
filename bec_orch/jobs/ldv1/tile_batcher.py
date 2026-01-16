@@ -192,6 +192,18 @@ class TileBatcher:
         self._postprocessor_done = False
         self._pass1_eos_sent = False  # Track if we've sent pass-1 EOS
 
+        # Buffer for accumulating tiled frames before emitting a batch
+        # Each entry: dict with tiles, metadata, etc.
+        self._buffer: List[Dict[str, Any]] = []
+        
+        # Pending tiling tasks (for parallel tiling)
+        self._pending_tiles: List[asyncio.Task] = []
+        
+        # Buffer size limit to prevent memory accumulation
+        # Each buffered frame holds ~25MB (tiles tensor) + metadata
+        # Set to 0 to disable limit
+        self._max_buffer_size: int = getattr(cfg, "max_tilebatcher_buffer", 64)
+
         # Thread pool for parallel tiling (optional, can be disabled)
         self._use_parallel_tiling = getattr(cfg, "parallel_tiling", True)
         if self._use_parallel_tiling:
@@ -208,18 +220,6 @@ class TileBatcher:
                 f"batch_size={self.batch_size}, patch_size={self.patch_size}, dtype={self.tile_dtype}, "
                 f"max_buffer={self._max_buffer_size}"
             )
-
-        # Buffer for accumulating tiled frames before emitting a batch
-        # Each entry: dict with tiles, metadata, etc.
-        self._buffer: List[Dict[str, Any]] = []
-        
-        # Pending tiling tasks (for parallel tiling)
-        self._pending_tiles: List[asyncio.Task] = []
-        
-        # Buffer size limit to prevent memory accumulation
-        # Each buffered frame holds ~25MB (tiles tensor) + metadata
-        # Set to 0 to disable limit
-        self._max_buffer_size: int = getattr(cfg, "max_tilebatcher_buffer", 64)
 
     # -------------------------------------------------------------------------
     # Error handling

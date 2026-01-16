@@ -222,7 +222,8 @@ class BECWorkerRuntime:
         Args:
             w_id: Work ID (e.g., "W22084")
             i_id: Image group ID (e.g., "I0886")
-            force: If True, process even if success.json exists
+            force: If True, bypass success.json check AND claim task even if another
+                   worker has it (useful for reprocessing or recovering from stuck tasks)
         
         Raises:
             KeyboardInterrupt: If user cancels, re-raised with message about --force
@@ -285,8 +286,8 @@ class BECWorkerRuntime:
         - Check success.json first (source of truth) - if exists, skip (unless force=True)
         - Try to claim task in DB
         - If claim fails:
-          - If stale (any status, > 5 min old): claim stale task and proceed
-          - If not stale: skip with warning (another worker likely active)
+          - If force=True OR stale (any status, > 5 min old): claim task and proceed
+          - If not stale and not force: skip with warning (another worker likely active)
         - Run job worker
         - Write success.json
         - Update DB
@@ -294,7 +295,7 @@ class BECWorkerRuntime:
         
         Args:
             msg: SQS message (or fake message for direct processing)
-            force: If True, process even if success.json exists
+            force: If True, process even if success.json exists AND claim task even if not stale
             is_direct: If True, this is direct processing (not from SQS)
         """
         start_time = time.time()
@@ -350,11 +351,11 @@ class BECWorkerRuntime:
         )
         
         if task_execution_id is None:
-            # Task already exists in database - check if it's stale
+            # Task already exists in database - check if it's stale or force=True
             # success.json is the source of truth, so if it doesn't exist, the task is not done
-            # regardless of DB status. A task is considered stale if: started_at > 5 minutes ago
-            is_stale = False
-            if existing_started_at is not None:
+            # regardless of DB status. A task is considered stale if: started_at > 5 minutes ago OR force=True
+            is_stale = force  # force flag makes any task "stale" (claimable)
+            if not is_stale and existing_started_at is not None:
                 from datetime import datetime, timezone, timedelta
                 if isinstance(existing_started_at, str):
                     # Parse ISO format string if needed
@@ -367,14 +368,22 @@ class BECWorkerRuntime:
                 is_stale = age > timedelta(minutes=5)
             
             if is_stale:
-                # Stale record - likely from a crashed worker, claim it and proceed
+                # Stale record - likely from a crashed worker, or force=True - claim it and proceed
                 status_msg = f"status='{existing_status}'" if existing_status else "unknown status"
-                logger.warning(
-                    f"Task already exists in database with stale {status_msg} "
-                    f"(started_at={existing_started_at}, age > 5 minutes) but no success.json found. "
-                    f"Assuming previous worker crashed. Claiming stale task and proceeding. "
-                    f"job_id={self.job_record.id}, volume_id={volume_id}"
-                )
+                if force:
+                    logger.warning(
+                        f"Task already exists in database with {status_msg} "
+                        f"(started_at={existing_started_at}) but force=True. "
+                        f"Claiming task and reprocessing. "
+                        f"job_id={self.job_record.id}, volume_id={volume_id}"
+                    )
+                else:
+                    logger.warning(
+                        f"Task already exists in database with stale {status_msg} "
+                        f"(started_at={existing_started_at}, age > 5 minutes) but no success.json found. "
+                        f"Assuming previous worker crashed. Claiming stale task and proceeding. "
+                        f"job_id={self.job_record.id}, volume_id={volume_id}"
+                    )
                 # Try to claim the stale task
                 task_execution_id = self.db.claim_stale_task_execution(
                     self.conn,

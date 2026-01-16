@@ -48,6 +48,9 @@ ldv1 = [
     # Data output
     "pyarrow>=14.0.0",
     
+    # Monitoring
+    "psutil>=5.9.0",
+    
     # Note: torch/torchvision should be installed separately
     # based on your CUDA version or use the pre-installed
     # versions from AWS DLAMI

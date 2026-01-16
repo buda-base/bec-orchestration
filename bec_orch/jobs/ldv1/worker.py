@@ -10,6 +10,7 @@ from .config import PipelineConfig
 from .types_common import *
 from ..shared.prefetch import BasePrefetcher, LocalPrefetcher, S3Prefetcher
 from ..shared.decoder import Decoder
+from ..shared.memory_monitor import MemoryMonitor, log_memory_snapshot
 from .ld_postprocessor import LDPostProcessor
 from .tile_batcher import TileBatcher
 from .ld_inference_runner import LDInferenceRunner
@@ -159,7 +160,24 @@ class LDVolumeWorker:
         self._is_running = True
         self._is_healthy = True
         
+        # Create memory monitor with all pipeline queues
+        memory_monitor = MemoryMonitor(
+            interval_s=5.0,
+            queues={
+                "prefetch": self.q_prefetcher_to_decoder,
+                "decode": self.q_decoder_to_tilebatcher,
+                "tiles": self.q_tilebatcher_to_inference,
+                "gpu_p1": self.q_gpu_pass_1_to_post_processor,
+                "gpu_p2": self.q_gpu_pass_2_to_post_processor,
+                "writer": self.q_post_processor_to_writer,
+            },
+        )
+        monitor_task: Optional[asyncio.Task[Any]] = None
+        
         try:
+            # Start memory monitor as background task
+            monitor_task = asyncio.create_task(memory_monitor.run(), name="memory_monitor")
+            
             tasks: list[asyncio.Task[Any]] = [
                 asyncio.create_task(self.prefetcher.run(), name="prefetcher"),
                 asyncio.create_task(self.decoder.run(), name="decoder"),
@@ -202,6 +220,12 @@ class LDVolumeWorker:
                         f"First failure in '{first_name}': {first_exc}"
                     ) from first_exc
         finally:
+            # Stop memory monitor
+            if monitor_task is not None and not monitor_task.done():
+                monitor_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await monitor_task
+            
             # If we're being cancelled or a stage failed unexpectedly, ensure no background tasks linger.
             await self.aclose()
             self._is_running = False
@@ -310,6 +334,9 @@ class LDV1JobWorker:
         logger.info(f"Starting LDV1 job for volume {ctx.volume.w_id}/{ctx.volume.i_id}")
         start_time = time.time()
         
+        # Log memory at start of volume processing
+        log_memory_snapshot(f"[LDV1] Start volume {ctx.volume.w_id}/{ctx.volume.i_id}")
+        
         # Build PipelineConfig from job config with defaults
         pipeline_cfg = self._build_pipeline_config(ctx)
         
@@ -344,6 +371,9 @@ class LDV1JobWorker:
             asyncio.run(run_pipeline())
             
         except Exception as e:
+            # Log memory state at failure (helps diagnose OOM)
+            log_memory_snapshot(f"[LDV1] FAILED volume {ctx.volume.w_id}/{ctx.volume.i_id}", level=logging.ERROR)
+            
             # Log detailed error information
             error_type = type(e).__name__
             logger.error(
@@ -383,6 +413,9 @@ class LDV1JobWorker:
             # Fallback: use wall clock time
             total_duration_ms = elapsed_ms
             avg_duration_per_page_ms = elapsed_ms / max(1, total_images)
+        
+        # Log memory at end of volume processing
+        log_memory_snapshot(f"[LDV1] End volume {ctx.volume.w_id}/{ctx.volume.i_id}")
         
         logger.info(
             f"LDV1 job completed: {total_images} images, {nb_errors} errors, "

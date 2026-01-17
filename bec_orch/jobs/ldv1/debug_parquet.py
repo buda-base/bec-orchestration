@@ -7,6 +7,23 @@ Reads a parquet file (local or S3) and generates debug images showing:
 - Rotated image (if rotation_angle exists)
 - Rotated + TPS image (if TPS exists)
 - Contours overlay on final processed image
+
+CLI Usage:
+
+  # S3 mode: auto-compute parquet URI from volume IDs
+  python -m bec_orch.jobs.ldv1.debug_parquet ./debug_output --w W22084 --i I0886
+
+  # S3 mode: with explicit parquet S3 URI and volume IDs for image lookup
+  python -m bec_orch.jobs.ldv1.debug_parquet s3://bucket/path/file.parquet ./debug_output --w W22084 --i I0886
+
+  # Only output images with TPS transformations (skip images without TPS)
+  python -m bec_orch.jobs.ldv1.debug_parquet ./debug_output --w W22084 --i I0886 --tps-only
+
+  # Custom S3 buckets
+  python -m bec_orch.jobs.ldv1.debug_parquet ./debug_output --w W22084 --i I0886 \
+    --s3-source-bucket archive.tbrc.org \
+    --s3-dest-bucket my-results-bucket \
+    --job-name ldv1
 """
 
 import argparse

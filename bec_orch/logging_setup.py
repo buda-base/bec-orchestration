@@ -80,6 +80,15 @@ def setup_logging(verbose: bool = False) -> None:
     timings_logger.setLevel(timings_level)
     timings_logger.propagate = True  # still go to root handler
     
+    # Memory monitor logger - ERROR by default (suppresses periodic memory snapshots)
+    # Can be set to INFO via BEC_MEMORY_LOG_LEVEL env var or --verbose flag for OOM debugging
+    memory_level = os.environ.get("BEC_MEMORY_LOG_LEVEL", "ERROR").upper()
+    if verbose:
+        memory_level = "INFO"  # Enable memory logging in verbose mode
+    memory_logger = logging.getLogger("bec_memory")
+    memory_logger.setLevel(memory_level)
+    memory_logger.propagate = True  # still go to root handler
+    
     # Suppress third-party deprecation warnings we can't control
     # PyTorch's pynvml deprecation warning
     warnings.filterwarnings(

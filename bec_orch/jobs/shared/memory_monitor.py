@@ -10,7 +10,9 @@ import logging
 import time
 from typing import Any, Dict, Optional
 
-logger = logging.getLogger("bec.memory")
+# Use separate namespace (like bec_timings) so it can be suppressed by default
+# Enable with BEC_MEMORY_LOG_LEVEL=INFO or --verbose flag
+logger = logging.getLogger("bec_memory")
 
 
 def _get_process_memory() -> Dict[str, float]:

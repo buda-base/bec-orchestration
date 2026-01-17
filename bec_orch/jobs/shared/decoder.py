@@ -462,6 +462,17 @@ def _compute_downscale(
     stride_y = patch_size - patch_vertical_overlap_px  # vertical step between rows
 
     # -----------------------------
+    # Special case: very wide images (width > 2*height) -> fit exactly one patch row
+    # -----------------------------
+    if w > 2.5 * h:
+        # Target: final height = patch_size (one row of patches)
+        scale_for_height = patch_size / float(h)
+        # But also respect max_w constraint
+        scale_for_width = max_w / float(w)
+        s = min(scale_for_height, scale_for_width)
+        return s
+
+    # -----------------------------
     # Step 1) Fit within max box (no upscaling)
     # -----------------------------
     scale_to_max_w = max_w / float(w)

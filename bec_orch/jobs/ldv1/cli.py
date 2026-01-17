@@ -279,7 +279,7 @@ async def run_one_volume(args):
             output_base_uri = f"s3://tests-bec.bdrc.io/artefacts/line_detection_v1/{w_id}-{i_id}-{i_version}"
         
         parquet_filename = f"{w_id}-{i_id}-{i_version}.parquet"
-        jsonl_filename = f"{w_id}-{i_id}-{i_version}.jsonl"
+        jsonl_filename = f"{w_id}-{i_id}-{i_version}-errors.jsonl"
         
         parquet_uri = _join_uri(output_base_uri, parquet_filename)
         jsonl_uri = _join_uri(output_base_uri, jsonl_filename)

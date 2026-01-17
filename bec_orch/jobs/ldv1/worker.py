@@ -492,7 +492,7 @@ class LDV1JobWorker:
         basename = ctx.artifacts_location.basename
         
         output_parquet_uri = f"s3://{ctx.artifacts_location.bucket}/{prefix}/{basename}.parquet"
-        output_jsonl_uri = f"s3://{ctx.artifacts_location.bucket}/{prefix}/{basename}.jsonl"
+        output_jsonl_uri = f"s3://{ctx.artifacts_location.bucket}/{prefix}/{basename}-errors.jsonl"
         
         # Debug folder (local only, not used in production)
         debug_folder_path = os.environ.get('BEC_DEBUG_FOLDER', '/tmp/bec_debug')

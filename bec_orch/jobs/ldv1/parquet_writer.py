@@ -115,13 +115,12 @@ class ParquetWriter:
             pass
 
     def _ensure_open(self) -> None:
-        """Open Parquet writer + error sidecar output stream."""
+        """Open Parquet writer (error sidecar is opened lazily on first error)."""
         if self._writer is not None:
             return
 
         try:
             self._fs, self._parquet_path = _open_filesystem_and_path(self.parquet_uri, self.cfg)
-            self._err_fs, self._errors_path = _open_filesystem_and_path(self.errors_jsonl_uri, self.cfg)
 
             # Open output streams (direct write; no tmp)
             parquet_sink = self._fs.open_output_stream(self._parquet_path)
@@ -133,12 +132,8 @@ class ParquetWriter:
                 data_page_size=getattr(self.cfg, "parquet_data_page_size", 65536),
             )
 
-            # Error sidecar (JSONL)
-            self._error_fh = self._err_fs.open_output_stream(self._errors_path)
-            
-            # Log file URLs when successfully opened
+            # Log file URL when successfully opened
             logger.info(f"Opened parquet file for writing: {self.parquet_uri}")
-            logger.info(f"Opened JSONL error file for writing: {self.errors_jsonl_uri}")
         except Exception as e:
             # Surface the problem to the UI immediately; this is the #1 source of "0 persisted".
             hint = None
@@ -197,8 +192,35 @@ class ParquetWriter:
         }
         return row
 
+    def _ensure_error_file_open(self) -> None:
+        """Lazily open the error JSONL file on first error."""
+        if self._error_fh is not None:
+            return
+        try:
+            self._err_fs, self._errors_path = _open_filesystem_and_path(self.errors_jsonl_uri, self.cfg)
+            self._error_fh = self._err_fs.open_output_stream(self._errors_path)
+            logger.info(f"Opened JSONL error file for writing: {self.errors_jsonl_uri}")
+        except Exception as e:
+            hint = None
+            if str(self.errors_jsonl_uri).startswith("s3://"):
+                hint = (
+                    "Output is on S3. Check AWS credentials and that you have write permission "
+                    "to the destination bucket/prefix."
+                )
+            self._emit_progress(
+                {
+                    "type": "fatal",
+                    "stage": "ParquetWriter._ensure_error_file_open",
+                    "error": f"{type(e).__name__}: {e}",
+                    "errors_jsonl_uri": self.errors_jsonl_uri,
+                    "hint": hint,
+                }
+            )
+            raise
+
     def _write_error_jsonl(self, err: PipelineError) -> None:
         """Write full error details as a JSONL line."""
+        self._ensure_error_file_open()
         # Prefer a stable schema: explicit keys + safe string fields.
         task = err.task
         payload = {
@@ -263,18 +285,19 @@ class ParquetWriter:
         if self._error_fh is not None:
             self._error_fh.close()
             self._error_fh = None
-        # If the run had no errors, remove the (possibly empty) errors JSONL sidecar.
-        # This keeps downstream consumers simpler and avoids leaving stale empty files around.
-        if self._error_count == 0 and self._err_fs is not None and self._errors_path is not None:
+            logger.info(f"Closed JSONL error file (contained {self._error_count} errors): {self.errors_jsonl_uri}")
+        elif self._error_count == 0:
+            # No errors in this run and no file was opened - delete any stale file from a previous run
             try:
-                self._err_fs.delete_file(self._errors_path)
-                logger.info(f"Removed empty JSONL error file: {self.errors_jsonl_uri}")
+                err_fs, errors_path = _open_filesystem_and_path(self.errors_jsonl_uri, self.cfg)
+                err_fs.delete_file(errors_path)
+                logger.info(f"Deleted stale JSONL error file from previous run: {self.errors_jsonl_uri}")
+            except FileNotFoundError:
+                # No previous file exists, nothing to do
+                pass
             except Exception:
                 # Best-effort: ignore deletion failures (permissions / eventual consistency / etc.)
                 pass
-        elif self._error_count > 0:
-            # Log JSONL file URL if errors were written
-            logger.info(f"Closed JSONL error file (contained {self._error_count} errors): {self.errors_jsonl_uri}")
 
     async def run(self) -> None:
         """

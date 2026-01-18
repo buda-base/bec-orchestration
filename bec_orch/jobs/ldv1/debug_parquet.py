@@ -568,7 +568,7 @@ def main():
     parser.add_argument(
         "--s3-dest-bucket",
         type=str,
-        default="tests-bec.bdrc.io",
+        default="bec.bdrc.io",
         help="S3 destination bucket for parquet files (default: buda-task-output)"
     )
     parser.add_argument(

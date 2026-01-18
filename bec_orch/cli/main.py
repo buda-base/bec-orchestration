@@ -48,11 +48,13 @@ def cli(ctx, verbose):
 from bec_orch.cli.worker import worker, run_volume
 from bec_orch.cli.jobs import jobs
 from bec_orch.cli.queue import queue
+from bec_orch.cli.errors import errors
 
 cli.add_command(worker)
 cli.add_command(run_volume)
 cli.add_command(jobs)
 cli.add_command(queue)
+cli.add_command(errors)
 
 
 def main():

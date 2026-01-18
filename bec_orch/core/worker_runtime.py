@@ -618,8 +618,12 @@ class BECWorkerRuntime:
         elif isinstance(exc, RetryableTaskError):
             return True, str(exc)
         else:
+            # Check for VolumeTimeoutError by name (avoid circular import)
+            exc_type = type(exc).__name__
+            if exc_type == 'VolumeTimeoutError':
+                return True, f"Volume timeout: {exc}"
             # Default: treat as retryable
-            return True, f"{type(exc).__name__}: {exc}"
+            return True, f"{exc_type}: {exc}"
 
     def _maybe_heartbeat(self) -> None:
         """Update heartbeat if enough time has passed."""

@@ -19,6 +19,15 @@ from ..shared.s3ctx import S3Context
 
 logger = logging.getLogger(__name__)
 
+
+class VolumeTimeoutError(Exception):
+    """Raised when volume processing exceeds the configured timeout."""
+    
+    def __init__(self, message: str, diagnostic_state: Optional[Dict[str, Any]] = None):
+        super().__init__(message)
+        self.diagnostic_state = diagnostic_state
+
+
 class LDVolumeWorker:
     """Owns a single volume and runs all stages concurrently.
 
@@ -65,7 +74,16 @@ class LDVolumeWorker:
             self.q_postprocessor_to_tilebatcher,  # Pass-2 frames go back to TileBatcher
             self.q_post_processor_to_writer,
         )
-        self.writer = ParquetWriter(cfg, self.q_post_processor_to_writer, volume_task.output_parquet_uri, volume_task.output_jsonl_uri, progress=progress)
+        # Build list of expected filenames for missing records tracking
+        expected_filenames = [t.img_filename for t in volume_task.image_tasks]
+        self.writer = ParquetWriter(
+            cfg,
+            self.q_post_processor_to_writer,
+            volume_task.output_parquet_uri,
+            volume_task.output_jsonl_uri,
+            progress=progress,
+            expected_filenames=expected_filenames,
+        )
         
         # Health check state
         self._is_running = False
@@ -151,7 +169,115 @@ class LDVolumeWorker:
         
         return result
 
+    def get_diagnostic_state(self) -> Dict[str, Any]:
+        """
+        Return detailed diagnostic state for debugging hangs.
+        
+        Called when volume timeout occurs to help identify where the pipeline is stuck.
+        """
+        state: Dict[str, Any] = {
+            "queues": {
+                "prefetcher_to_decoder": f"{self.q_prefetcher_to_decoder.qsize()}/{self.cfg.max_q_prefetcher_to_decoder}",
+                "decoder_to_tilebatcher": f"{self.q_decoder_to_tilebatcher.qsize()}/{self.cfg.max_q_decoder_to_tilebatcher}",
+                "tilebatcher_to_inference": f"{self.q_tilebatcher_to_inference.qsize()}/{self.cfg.max_q_tilebatcher_to_inference}",
+                "gpu_pass_1": f"{self.q_gpu_pass_1_to_post_processor.qsize()}/{self.cfg.max_q_gpu_pass_1_to_post_processor}",
+                "gpu_pass_2": f"{self.q_gpu_pass_2_to_post_processor.qsize()}/{self.cfg.max_q_gpu_pass_2_to_post_processor}",
+                "postprocessor_to_tilebatcher": f"{self.q_postprocessor_to_tilebatcher.qsize()}/{self.cfg.max_q_post_processor_to_tilebatcher}",
+                "postprocessor_to_writer": f"{self.q_post_processor_to_writer.qsize()}/{self.cfg.max_q_post_processor_to_writer}",
+            },
+        }
+        
+        # PostProcessor state
+        try:
+            state["postprocessor"] = {
+                "pending_transforms": len(self.postprocessor._pending_transforms),
+                "p1_done": self.postprocessor._p1_done,
+                "p2_done": self.postprocessor._p2_done,
+            }
+        except Exception:
+            state["postprocessor"] = {"error": "could not read state"}
+        
+        # Writer state
+        try:
+            state["writer"] = {
+                "success_count": self.writer._success_count,
+                "error_count": self.writer._error_count,
+                "buffer_size": len(self.writer._buffer),
+                "expected_count": len(self.writer._expected_filenames) if hasattr(self.writer, '_expected_filenames') else 0,
+                "received_count": len(self.writer._received_filenames) if hasattr(self.writer, '_received_filenames') else 0,
+            }
+        except Exception:
+            state["writer"] = {"error": "could not read state"}
+        
+        # TileBatcher state
+        try:
+            state["tilebatcher"] = {
+                "decoder_done": self.tilebatcher._decoder_done,
+                "postprocessor_done": self.tilebatcher._postprocessor_done,
+                "buffer_size": len(self.tilebatcher._buffer),
+                "pending_tiles": len(self.tilebatcher._pending_tiles),
+            }
+        except Exception:
+            state["tilebatcher"] = {"error": "could not read state"}
+        
+        return state
+
+    def get_error_stats(self) -> Dict[str, Any]:
+        """
+        Get error statistics from the writer after pipeline completion.
+        
+        Returns:
+            Dict with:
+            - success_count: Number of successfully processed records
+            - error_count: Total number of errors
+            - dropped_count: Number of records dropped due to pipeline issues
+            - errors_by_stage: Dict mapping stage name to error count
+        """
+        try:
+            dropped = len(self.writer._expected_filenames - self.writer._received_filenames) \
+                if hasattr(self.writer, '_expected_filenames') and hasattr(self.writer, '_received_filenames') \
+                else 0
+            return {
+                "success_count": self.writer._success_count,
+                "error_count": self.writer._error_count,
+                "dropped_count": dropped,
+                "errors_by_stage": dict(self.writer._error_by_stage),
+            }
+        except Exception:
+            return {
+                "success_count": 0,
+                "error_count": 0,
+                "dropped_count": 0,
+                "errors_by_stage": {},
+            }
+
     async def run(self) -> None:
+        """Run all pipeline stages with timeout protection."""
+        import json
+        import logging
+        logger = logging.getLogger(__name__)
+        
+        timeout_s = getattr(self.cfg, 'volume_timeout_s', 300.0)
+        
+        try:
+            await asyncio.wait_for(self._run_pipeline(), timeout=timeout_s)
+        except asyncio.TimeoutError:
+            # Dump diagnostic state before raising
+            state = self.get_diagnostic_state()
+            logger.error(
+                f"[LDVolumeWorker] Volume timeout after {timeout_s}s. "
+                f"Diagnostic state: {json.dumps(state, indent=2)}"
+            )
+            # Cancel all tasks
+            await self.aclose()
+            self._is_running = False
+            # Re-raise with diagnostic info
+            raise VolumeTimeoutError(
+                f"Volume processing exceeded {timeout_s}s timeout",
+                diagnostic_state=state
+            )
+
+    async def _run_pipeline(self) -> None:
         """Run all pipeline stages concurrently with proper exception handling."""
         import logging
         import time
@@ -358,17 +484,32 @@ class LDV1JobWorker:
             elif event.get('type') == 'error':
                 metrics['nb_errors'] += 1
         
-        # Run async pipeline
+        # Run async pipeline and collect error stats
+        error_stats: Dict[str, Any] = {}
+        
         try:
             async def run_pipeline():
+                nonlocal error_stats
                 # Create S3 context within async context
                 global_sem = asyncio.Semaphore(pipeline_cfg.s3_max_inflight_global)
                 s3ctx = S3Context(pipeline_cfg, global_sem)
                 
                 async with LDVolumeWorker(pipeline_cfg, volume_task, progress=progress_hook, s3ctx=s3ctx) as worker:
                     await worker.run()
+                    # Collect error stats after successful pipeline completion
+                    error_stats.update(worker.get_error_stats())
             
             asyncio.run(run_pipeline())
+            
+        except VolumeTimeoutError as e:
+            # Volume timeout is always retryable
+            log_memory_snapshot(f"[LDV1] TIMEOUT volume {ctx.volume.w_id}/{ctx.volume.i_id}", level=logging.ERROR)
+            logger.error(
+                f"LDV1 pipeline timeout for volume {ctx.volume.w_id}/{ctx.volume.i_id}: {e}",
+                exc_info=True
+            )
+            from bec_orch.errors import RetryableTaskError
+            raise RetryableTaskError(f"Volume timeout: {e}") from e
             
         except Exception as e:
             # Log memory state at failure (helps diagnose OOM)
@@ -403,7 +544,11 @@ class LDV1JobWorker:
         # Calculate metrics
         elapsed_ms = (time.time() - start_time) * 1000
         total_images = metrics['total_images']
-        nb_errors = metrics['nb_errors']
+        
+        # Get error counts from writer stats (more accurate than progress hook)
+        nb_errors = error_stats.get('error_count', metrics['nb_errors'])
+        nb_dropped = error_stats.get('dropped_count', 0)
+        errors_by_stage = error_stats.get('errors_by_stage', {})
         
         # Average duration per image (from collected durations or fallback to elapsed/count)
         if metrics['image_durations']:
@@ -418,15 +563,37 @@ class LDV1JobWorker:
         log_memory_snapshot(f"[LDV1] End volume {ctx.volume.w_id}/{ctx.volume.i_id}")
         
         logger.info(
-            f"LDV1 job completed: {total_images} images, {nb_errors} errors, "
-            f"avg {avg_duration_per_page_ms:.2f}ms/page"
+            f"LDV1 job completed: {total_images} images, {nb_errors} errors "
+            f"({nb_dropped} dropped), avg {avg_duration_per_page_ms:.2f}ms/page"
         )
+        
+        # Check for errors and raise appropriate exceptions
+        # (after logging so we have the metrics even on failure)
+        from bec_orch.errors import RetryableTaskError, TerminalTaskError
+        
+        if nb_dropped > 0:
+            # Dropped records indicate pipeline issues (timeout, backpressure)
+            # This is retryable - the issue might be transient
+            raise RetryableTaskError(
+                f"Volume had {nb_dropped} dropped records (pipeline timeout/backpressure). "
+                f"Total errors: {nb_errors}, errors by stage: {errors_by_stage}"
+            )
+        
+        if nb_errors > 0:
+            # Other processing errors are not retryable - the images have issues
+            # that won't be fixed by retrying
+            raise TerminalTaskError(
+                f"Volume had {nb_errors} processing errors. "
+                f"Errors by stage: {errors_by_stage}"
+            )
         
         return TaskResult(
             total_images=total_images,
             nb_errors=nb_errors,
             total_duration_ms=total_duration_ms,
             avg_duration_per_page_ms=avg_duration_per_page_ms,
+            nb_dropped_records=nb_dropped,
+            errors_by_stage=errors_by_stage if errors_by_stage else None,
         )
     
     def _build_pipeline_config(self, ctx: 'JobContext') -> PipelineConfig:

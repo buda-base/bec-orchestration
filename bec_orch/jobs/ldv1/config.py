@@ -23,7 +23,7 @@ class PipelineConfig:
     s3_get_timeout_s: int = 60
 
     # Queues (bounded)
-    max_q_prefetcher_to_decoder: int = 1000  # Large enough to hold entire volume (~200MB raw bytes)
+    max_q_prefetcher_to_decoder: int = 500  # Large enough to hold entire volume (~200MB raw bytes)
     max_q_decoder_to_tilebatcher: int = 32
     max_q_tilebatcher_to_inference: int = 8  # Allow more batches queued (reduces GPU starvation)
     max_q_gpu_pass_1_to_post_processor: int = 32
@@ -115,6 +115,12 @@ class PipelineConfig:
     enable_pytorch_profiler: bool = False  # Enable PyTorch profiler for GPU timing analysis
     profiler_trace_output: Optional[str] = None  # Output path for profiler trace (default: pytorch_trace.json)
     detailed_inference_timing: bool = True  # Log H2D/forward/stitch/D2H breakdown for each batch
+    
+    # Timeout settings (deadlock prevention)
+    volume_timeout_s: float = 300.0  # Overall volume timeout (5 minutes)
+    writer_eos_timeout_s: float = 10.0  # EOS wait timeout after all records received
+    queue_put_timeout_s: float = 60.0  # Timeout for queue.put() operations
+    transform_gather_timeout_s: float = 60.0  # Timeout waiting for pending transforms at EOS
     
     def __post_init__(self):
         """Validate configuration values."""

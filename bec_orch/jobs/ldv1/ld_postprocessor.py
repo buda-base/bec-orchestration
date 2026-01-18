@@ -99,6 +99,49 @@ class LDPostProcessor:
         self._pending_transforms: List[asyncio.Task] = []
         self._max_concurrent_transforms = getattr(cfg, "max_concurrent_transforms", 8)
         self._transform_semaphore = asyncio.Semaphore(self._max_concurrent_transforms)
+        
+        # Timeout for waiting on pending transforms at EOS
+        self._transform_gather_timeout_s = getattr(cfg, "transform_gather_timeout_s", 60.0)
+        
+        # Timeout for queue put operations
+        self._queue_put_timeout_s = getattr(cfg, "queue_put_timeout_s", 30.0)
+    
+    async def _put_with_timeout(
+        self,
+        queue: asyncio.Queue,
+        item: Any,
+        queue_name: str,
+        item_desc: str,
+    ) -> bool:
+        """
+        Put item to queue with timeout. Returns True if successful.
+        
+        On timeout, logs error with queue state to help diagnose deadlocks.
+        """
+        import logging
+        logger = logging.getLogger(__name__)
+        try:
+            await asyncio.wait_for(queue.put(item), timeout=self._queue_put_timeout_s)
+            return True
+        except asyncio.TimeoutError:
+            logger.error(
+                f"[PostProcessor] Timeout ({self._queue_put_timeout_s}s) putting {item_desc} to {queue_name} "
+                f"(qsize={queue.qsize()}/{queue.maxsize}). Pipeline may be deadlocked."
+            )
+            return False
+    
+    def _handle_transform_exception(self, task: asyncio.Task) -> None:
+        """Callback to log exceptions from fire-and-forget transform tasks."""
+        import logging
+        logger = logging.getLogger(__name__)
+        if task.cancelled():
+            return
+        try:
+            exc = task.exception()
+            if exc is not None:
+                logger.error(f"[PostProcessor] Transform task failed: {exc}", exc_info=exc)
+        except asyncio.InvalidStateError:
+            pass  # Task not done yet (shouldn't happen in done callback)
 
     async def _emit_pipeline_error(
         self,
@@ -252,11 +295,27 @@ class LDPostProcessor:
                         
                         # Wait for all pending transforms to complete before sending EOS.
                         # This ensures all pass 2 frames are enqueued before we signal completion.
+                        # Use timeout to prevent deadlock if transforms hang.
                         if self._pending_transforms:
                             pending_count = len([t for t in self._pending_transforms if not t.done()])
                             if pending_count > 0:
-                                logger.info(f"[PostProcessor] Waiting for {pending_count} pending transforms...")
-                                await asyncio.gather(*self._pending_transforms, return_exceptions=True)
+                                logger.info(f"[PostProcessor] Waiting for {pending_count} pending transforms (timeout={self._transform_gather_timeout_s}s)...")
+                                try:
+                                    await asyncio.wait_for(
+                                        asyncio.gather(*self._pending_transforms, return_exceptions=True),
+                                        timeout=self._transform_gather_timeout_s
+                                    )
+                                except asyncio.TimeoutError:
+                                    # Cancel remaining transforms and proceed
+                                    still_pending = [t for t in self._pending_transforms if not t.done()]
+                                    logger.error(
+                                        f"[PostProcessor] Timeout waiting for {len(still_pending)} transforms. "
+                                        f"Cancelling remaining and proceeding."
+                                    )
+                                    for t in still_pending:
+                                        t.cancel()
+                                    # Give cancelled tasks a chance to clean up
+                                    await asyncio.gather(*still_pending, return_exceptions=True)
                             self._pending_transforms.clear()
                         
                         # No more pass1 frames => no more reprocess frames will be generated.
@@ -389,6 +448,8 @@ class LDPostProcessor:
                 debug_this_image, _save_debug_safe
             )
         )
+        # Add callback to log any exceptions (prevents silent failures)
+        task.add_done_callback(self._handle_transform_exception)
         self._pending_transforms.append(task)
         
         # Clean up completed tasks periodically (don't let the list grow unbounded)
@@ -410,44 +471,71 @@ class LDPostProcessor:
         Run transform in thread pool and enqueue result for pass 2.
         Uses semaphore to limit concurrent transforms.
         """
-        async with self._transform_semaphore:
-            loop = asyncio.get_event_loop()
-            transformed_frame = await loop.run_in_executor(
-                None,  # Use default thread pool
-                apply_transform_1,
-                inf_frame.frame,
-                rotation_angle,
-                input_pts,
-                output_pts,
-                alpha,
+        try:
+            async with self._transform_semaphore:
+                loop = asyncio.get_event_loop()
+                transformed_frame = await loop.run_in_executor(
+                    None,  # Use default thread pool
+                    apply_transform_1,
+                    inf_frame.frame,
+                    rotation_angle,
+                    input_pts,
+                    output_pts,
+                    alpha,
+                )
+            
+            # Debug: save TPS image (if TPS was applied)
+            if debug_this_image and input_pts is not None:
+                try:
+                    from .img_helpers import _apply_rotation_1, _apply_tps_1
+                    if rotation_angle != 0.0:
+                        rotated_frame = _apply_rotation_1(inf_frame.frame, rotation_angle)
+                        tps_frame = _apply_tps_1(rotated_frame, input_pts, output_pts, alpha)
+                    else:
+                        tps_frame = _apply_tps_1(inf_frame.frame, input_pts, output_pts, alpha)
+                    asyncio.create_task(_save_debug_safe(save_debug_image, self.cfg, inf_frame.task.img_filename, "13_tps", tps_frame))
+                except Exception:
+                    pass  # Debug failures shouldn't affect pipeline
+            
+            success = await self._put_with_timeout(
+                self.q_post_processor_to_gpu_pass_2,
+                DecodedFrame(
+                    task=inf_frame.task,
+                    source_etag=inf_frame.source_etag,
+                    frame=transformed_frame,
+                    orig_w=inf_frame.orig_w,
+                    orig_h=inf_frame.orig_h,
+                    is_binary=False,
+                    first_pass=False,
+                    rotation_angle=rotation_angle,
+                    tps_data=(input_pts, output_pts, alpha),
+                ),
+                "q_post_processor_to_gpu_pass_2",
+                f"DecodedFrame({inf_frame.task.img_filename}, pass2)",
             )
-        
-        # Debug: save TPS image (if TPS was applied)
-        if debug_this_image and input_pts is not None:
-            try:
-                from .img_helpers import _apply_rotation_1, _apply_tps_1
-                if rotation_angle != 0.0:
-                    rotated_frame = _apply_rotation_1(inf_frame.frame, rotation_angle)
-                    tps_frame = _apply_tps_1(rotated_frame, input_pts, output_pts, alpha)
-                else:
-                    tps_frame = _apply_tps_1(inf_frame.frame, input_pts, output_pts, alpha)
-                asyncio.create_task(_save_debug_safe(save_debug_image, self.cfg, inf_frame.task.img_filename, "13_tps", tps_frame))
-            except Exception:
-                pass  # Debug failures shouldn't affect pipeline
-        
-        await self.q_post_processor_to_gpu_pass_2.put(
-            DecodedFrame(
+            if not success:
+                # Could not enqueue for pass 2, emit error instead
+                await self._emit_pipeline_error(
+                    internal_stage="_do_transform_and_enqueue.queue_timeout",
+                    exc=TimeoutError(f"Could not enqueue for pass 2 after {self._queue_put_timeout_s}s"),
+                    task=inf_frame.task,
+                    source_etag=inf_frame.source_etag,
+                    retryable=False,
+                    attempt=1,
+                )
+        except asyncio.CancelledError:
+            # Task was cancelled (e.g., due to timeout) - just re-raise
+            raise
+        except Exception as e:
+            # Transform failed - emit error to writer so this image is tracked
+            await self._emit_pipeline_error(
+                internal_stage="_do_transform_and_enqueue",
+                exc=e,
                 task=inf_frame.task,
                 source_etag=inf_frame.source_etag,
-                frame=transformed_frame,
-                orig_w=inf_frame.orig_w,
-                orig_h=inf_frame.orig_h,
-                is_binary=False,
-                first_pass=False,
-                rotation_angle=rotation_angle,
-                tps_data=(input_pts, output_pts, alpha),
+                retryable=False,
+                attempt=1,
             )
-        )
 
     async def _finalize_record(self, inf_frame: InferredFrame) -> None:
         # Decode packed-bit masks if GPU stage sent them

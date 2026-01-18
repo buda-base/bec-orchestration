@@ -278,6 +278,9 @@ class LDInferenceRunner:
         self._p1_eos_sent = False
         self._p2_eos_sent = False
         
+        # Timeout for queue put operations
+        self._queue_put_timeout_s = getattr(cfg, "queue_put_timeout_s", 30.0)
+        
         # CUDA streams for overlapping H2D with compute
         self._use_streams = self.device == "cuda" and getattr(cfg, "cuda_streams", 2) >= 2
         self._h2d_stream: Optional[torch.cuda.Stream] = None
@@ -405,6 +408,28 @@ class LDInferenceRunner:
     # Result emission
     # -------------------------------------------------------------------------
 
+    async def _put_with_timeout(
+        self,
+        queue: asyncio.Queue,
+        item: Any,
+        queue_name: str,
+        item_desc: str,
+    ) -> bool:
+        """
+        Put item to queue with timeout. Returns True if successful.
+        
+        On timeout, logs error with queue state to help diagnose deadlocks.
+        """
+        try:
+            await asyncio.wait_for(queue.put(item), timeout=self._queue_put_timeout_s)
+            return True
+        except asyncio.TimeoutError:
+            logger.error(
+                f"[InferenceRunner] Timeout ({self._queue_put_timeout_s}s) putting {item_desc} to {queue_name} "
+                f"(qsize={queue.qsize()}/{queue.maxsize}). Pipeline may be deadlocked."
+            )
+            return False
+
     async def _emit_result(self, meta: Dict[str, Any], mask_np: np.ndarray) -> None:
         """Emit InferredFrame to appropriate output queue."""
         dec_frame: DecodedFrame = meta["dec_frame"]
@@ -425,10 +450,21 @@ class LDInferenceRunner:
             line_mask=mask_np,  # grayscale uint8, {0, 255}
         )
 
+        img_filename = dec_frame.task.img_filename if dec_frame.task else "unknown"
         if second_pass:
-            await self.q_gpu_pass_2_to_post_processor.put(out)
+            await self._put_with_timeout(
+                self.q_gpu_pass_2_to_post_processor,
+                out,
+                "q_gpu_pass_2_to_post_processor",
+                f"InferredFrame({img_filename}, pass2)",
+            )
         else:
-            await self.q_gpu_pass_1_to_post_processor.put(out)
+            await self._put_with_timeout(
+                self.q_gpu_pass_1_to_post_processor,
+                out,
+                "q_gpu_pass_1_to_post_processor",
+                f"InferredFrame({img_filename}, pass1)",
+            )
 
     # -------------------------------------------------------------------------
     # Batch processing with CUDA streams

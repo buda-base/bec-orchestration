@@ -43,6 +43,9 @@ class TaskResult:
     nb_errors: int
     total_duration_ms: float
     avg_duration_per_page_ms: float
+    # Error breakdown for proper failure classification
+    nb_dropped_records: int = 0  # Records dropped due to pipeline timeout
+    errors_by_stage: Optional[Dict[str, int]] = None  # Error counts by stage
 
 @dataclass(frozen=True)
 class JobRecord:

@@ -77,6 +77,7 @@ class ParquetWriter:
         parquet_uri: str,
         errors_jsonl_uri: str,
         progress: Optional[ProgressHook] = None,
+        expected_filenames: Optional[List[str]] = None,
     ):
         self.cfg = cfg
         self.q_post_processor_to_writer = q_post_processor_to_writer
@@ -103,6 +104,13 @@ class ParquetWriter:
         self._error_by_stage: Dict[str, int] = {}
         self._last_summary_time = 0.0
         self._summary_interval = 100  # Emit summary every N items
+        
+        # Missing records tracking (for data integrity)
+        self._expected_filenames: set = set(expected_filenames) if expected_filenames else set()
+        self._received_filenames: set = set()
+        
+        # EOS timeout (for deadlock prevention)
+        self._eos_timeout_s = getattr(cfg, 'writer_eos_timeout_s', 10.0)
 
     def _emit_progress(self, event: Dict[str, Any]) -> None:
         """Best-effort progress emission. Must never break the pipeline."""
@@ -302,17 +310,46 @@ class ParquetWriter:
     async def run(self) -> None:
         """
         Consume messages until EndOfStream, then flush and close.
+        
+        Includes:
+        - EOS timeout fallback: if all expected records received, wait with timeout for EOS
+        - Missing records tracking: fill any missing records with errors at finalization
         """
         try:
             # If pyarrow is absent, we still drain the queue to keep pipeline behavior consistent.
             # (Useful for unit tests / environments without optional deps.)
             while True:
-                msg = await self.q_post_processor_to_writer.get()
+                # Check if all expected records have been received
+                total_received = self._success_count + self._error_count
+                expected_count = len(self._expected_filenames)
+                all_received = expected_count > 0 and total_received >= expected_count
+                
+                if all_received:
+                    # All records received, wait for EOS with timeout
+                    try:
+                        msg = await asyncio.wait_for(
+                            self.q_post_processor_to_writer.get(),
+                            timeout=self._eos_timeout_s
+                        )
+                    except asyncio.TimeoutError:
+                        logger.warning(
+                            f"[ParquetWriter] EOS timeout after {self._eos_timeout_s}s. "
+                            f"All {total_received} records received (expected {expected_count}). "
+                            f"Finishing without EOS."
+                        )
+                        break  # Proceed to flush and close
+                else:
+                    msg = await self.q_post_processor_to_writer.get()
 
                 if isinstance(msg, EndOfStream):
                     break
 
                 if isinstance(msg, PipelineError):
+                    # Track received filename
+                    img_filename = getattr(getattr(msg, "task", None), "img_filename", None)
+                    if img_filename:
+                        self._received_filenames.add(img_filename)
+                    
                     # Write error summary row to Parquet + full JSONL record
                     self._ensure_open()
                     self._buffer.append(self._row_from_error(msg))
@@ -327,13 +364,15 @@ class ParquetWriter:
                         {
                             "type": "item",
                             "ok": False,
-                            "img": getattr(msg.task, "img_filename", "") if getattr(msg, "task", None) else "",
+                            "img": img_filename or "",
                             "stage": msg.stage,
                             "error_type": msg.error_type,
                         }
                     )
                 else:
-                    # Record
+                    # Record - track received filename
+                    self._received_filenames.add(msg.task.img_filename)
+                    
                     try:
                         self._buffer.append(self._row_from_record(msg))
                     except Exception as e:
@@ -361,6 +400,15 @@ class ParquetWriter:
                 if len(self._buffer) >= self.flush_every:
                     self._flush()
 
+            # Fill any missing records with errors before final flush
+            dropped_count = self._fill_missing_records()
+            if dropped_count > 0:
+                self._emit_progress({
+                    "type": "dropped_records",
+                    "count": dropped_count,
+                    "filenames": sorted(list(self._expected_filenames - self._received_filenames))[:10],
+                })
+
             # Final flush & close
             self._flush()
             self._close()
@@ -381,6 +429,55 @@ class ParquetWriter:
                 }
             )
             raise
+    
+    def _fill_missing_records(self) -> int:
+        """
+        Create error rows for any expected records that were never received.
+        
+        This ensures data integrity: every expected image has a row in the parquet file,
+        even if it was dropped due to pipeline timeouts or errors.
+        
+        Returns:
+            Number of missing records that were filled.
+        """
+        if not self._expected_filenames:
+            return 0
+        
+        missing = self._expected_filenames - self._received_filenames
+        if not missing:
+            return 0
+        
+        logger.warning(
+            f"[ParquetWriter] {len(missing)} records never received. "
+            f"Creating error rows for missing images."
+        )
+        
+        self._ensure_open()
+        
+        for filename in sorted(missing):
+            # Create a synthetic error row for the missing record
+            row = {
+                "img_file_name": filename,
+                "source_etag": None,
+                "rotation_angle": None,
+                "tps_points": None,
+                "tps_alpha": None,
+                "contours": None,
+                "nb_contours": None,
+                "contours_bboxes": None,
+                "ok": False,
+                "error_stage": "Pipeline",
+                "error_type": "DroppedByPipeline",
+                "error_message": _truncate(
+                    "Record never received (likely dropped due to timeout or pipeline error)",
+                    self.max_error_message_len
+                ),
+            }
+            self._buffer.append(row)
+            self._error_count += 1
+            self._error_by_stage["Pipeline"] = self._error_by_stage.get("Pipeline", 0) + 1
+        
+        return len(missing)
     
     def _emit_error_summary(self, final: bool = False) -> None:
         """Emit error rate summary for monitoring."""

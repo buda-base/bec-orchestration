@@ -102,10 +102,27 @@ class LDVolumeWorker:
         # Don't suppress exceptions.
         return False
 
-    async def aclose(self) -> None:
-        """Best-effort cancellation of any running stage tasks."""
+    async def aclose(
+        self,
+        graceful_writer_flush: bool = False,
+        timeout_diagnostic_state: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """
+        Best-effort cancellation of any running stage tasks.
+        
+        Args:
+            graceful_writer_flush: If True, try to send EndOfStream to writer
+                                   and wait briefly for it to flush before cancelling.
+            timeout_diagnostic_state: If provided (on timeout), send a PipelineError
+                                      to the writer with this diagnostic info.
+        """
         if not self._tasks:
             return
+        
+        if graceful_writer_flush:
+            # Try to let the writer flush its buffer before cancellation
+            await self._try_graceful_writer_flush(timeout_diagnostic_state)
+        
         for t in self._tasks:
             if not t.done():
                 t.cancel()
@@ -113,6 +130,80 @@ class LDVolumeWorker:
         with contextlib.suppress(Exception):
             await asyncio.gather(*self._tasks, return_exceptions=True)
         self._tasks = []
+    
+    async def _try_graceful_writer_flush(
+        self,
+        diagnostic_state: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """
+        Try to flush the ParquetWriter's buffer gracefully on timeout.
+        
+        Sends a timeout error (if diagnostic_state provided) and EndOfStream to the
+        writer queue, then waits briefly for it to process and flush.
+        This preserves any errors/records already collected before the timeout.
+        """
+        import json
+        import logging
+        logger = logging.getLogger(__name__)
+        
+        try:
+            # First, cancel all stages EXCEPT the writer
+            writer_task = None
+            for t in self._tasks:
+                if t.get_name() == "writer":
+                    writer_task = t
+                elif not t.done():
+                    t.cancel()
+            
+            # Drain the cancelled tasks
+            non_writer_tasks = [t for t in self._tasks if t.get_name() != "writer"]
+            with contextlib.suppress(Exception):
+                await asyncio.gather(*non_writer_tasks, return_exceptions=True)
+            
+            if writer_task is None or writer_task.done():
+                return
+            
+            # If we have diagnostic state, send a timeout error to the writer
+            if diagnostic_state is not None:
+                try:
+                    # Create a volume-level timeout error
+                    # Use a dummy ImageTask with None values for volume-level error
+                    timeout_error = PipelineError(
+                        stage="Pipeline",
+                        task=ImageTask(source_uri="", img_filename=""),  # Dummy task for volume-level
+                        source_etag=None,
+                        error_type="VolumeTimeout",
+                        message=f"Volume processing exceeded timeout. Diagnostic: {json.dumps(diagnostic_state)}",
+                        traceback=None,
+                        retryable=True,
+                    )
+                    await asyncio.wait_for(
+                        self.q_post_processor_to_writer.put(timeout_error),
+                        timeout=1.0
+                    )
+                    logger.debug("[aclose] Sent timeout error to writer")
+                except asyncio.TimeoutError:
+                    logger.debug("[aclose] Could not send timeout error to writer (queue full)")
+            
+            # Try to send EndOfStream to writer with a short timeout
+            try:
+                await asyncio.wait_for(
+                    self.q_post_processor_to_writer.put(EndOfStream(source="timeout_shutdown")),
+                    timeout=1.0
+                )
+                logger.debug("[aclose] Sent EndOfStream to writer for graceful shutdown")
+            except asyncio.TimeoutError:
+                logger.debug("[aclose] Could not send EndOfStream to writer (queue full)")
+                return
+            
+            # Wait briefly for writer to flush
+            try:
+                await asyncio.wait_for(writer_task, timeout=5.0)
+                logger.info("[aclose] Writer flushed successfully before cancellation")
+            except asyncio.TimeoutError:
+                logger.debug("[aclose] Writer did not complete in time, will cancel")
+        except Exception as e:
+            logger.debug(f"[aclose] Graceful writer flush failed: {e}")
 
 
     def health_check(self) -> Dict[str, Any]:
@@ -268,8 +359,8 @@ class LDVolumeWorker:
                 f"[LDVolumeWorker] Volume timeout after {timeout_s}s. "
                 f"Diagnostic state: {json.dumps(state, indent=2)}"
             )
-            # Cancel all tasks
-            await self.aclose()
+            # Try to flush writer gracefully (with timeout error), then cancel all tasks
+            await self.aclose(graceful_writer_flush=True, timeout_diagnostic_state=state)
             self._is_running = False
             # Re-raise with diagnostic info
             raise VolumeTimeoutError(

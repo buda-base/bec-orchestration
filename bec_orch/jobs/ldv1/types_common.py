@@ -103,7 +103,7 @@ class TiledBatch:
 @dataclass(frozen=True)
 class PipelineError:
     """Error message that can flow through queues."""
-    stage: Literal["Prefetcher", "Decoder", "TileBatcher", "LDInferenceRunner", "LDGpuBatcher", "LDPostProcessor", "ParquetWriter"]
+    stage: Literal["Prefetcher", "Decoder", "TileBatcher", "LDInferenceRunner", "LDGpuBatcher", "LDPostProcessor", "ParquetWriter", "Pipeline"]
     task: ImageTask
     source_etag: Optional[str]
     error_type: str

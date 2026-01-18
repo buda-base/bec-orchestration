@@ -280,14 +280,35 @@ def show_errors(volume: Optional[str], w_id: Optional[str], i_id: Optional[str],
         console.print(f"\n[bold]Found {len(errors_list)} errors:[/bold]\n")
 
         for i, err in enumerate(errors_list, 1):
-            img = err.get("img_filename", "unknown")
+            img = err.get("img_filename")
             stage = err.get("stage", "?")
             err_type = err.get("error_type", "?")
             message = err.get("message", "")
 
-            console.print(f"[cyan]{i}.[/cyan] [green]{img}[/green]")
+            # Handle volume-level errors (no specific image or empty string)
+            if img and img.strip():
+                console.print(f"[cyan]{i}.[/cyan] [green]{img}[/green]")
+            else:
+                console.print(f"[cyan]{i}.[/cyan] [bold magenta]⚠ VOLUME-LEVEL ERROR[/bold magenta]")
+            
             console.print(f"   Stage: [yellow]{stage}[/yellow], Type: [red]{err_type}[/red]")
-            console.print(f"   Message: {message[:200]}{'...' if len(message) > 200 else ''}")
+            
+            # For VolumeTimeout, parse diagnostic from message or show truncated message
+            if err_type == "VolumeTimeout" and "Diagnostic:" in message:
+                # Extract and display diagnostic state from message
+                try:
+                    import json
+                    diag_start = message.index("Diagnostic:") + len("Diagnostic:")
+                    diag_json = message[diag_start:].strip()
+                    diag = json.loads(diag_json)
+                    console.print("   [dim]Pipeline timed out. Queue state:[/dim]")
+                    if isinstance(diag, dict) and "queues" in diag:
+                        for q_name, q_state in diag["queues"].items():
+                            console.print(f"     [dim]{q_name}: {q_state}[/dim]")
+                except (ValueError, json.JSONDecodeError):
+                    console.print(f"   Message: {message[:200]}{'...' if len(message) > 200 else ''}")
+            else:
+                console.print(f"   Message: {message[:200]}{'...' if len(message) > 200 else ''}")
 
             if full and err.get("traceback"):
                 console.print("   [dim]Traceback:[/dim]")

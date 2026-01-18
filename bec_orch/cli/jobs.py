@@ -395,6 +395,27 @@ def stats(job_name):
                 (job.id,)
             )
             totals = cur.fetchone()
+            
+            # Get slowest volume by avg page duration
+            cur.execute(
+                """
+                SELECT 
+                    v.bdrc_w_id,
+                    v.bdrc_i_id,
+                    te.avg_duration_per_page_ms,
+                    te.total_images,
+                    te.total_duration_ms
+                FROM task_executions te
+                JOIN volumes v ON te.volume_id = v.id
+                WHERE te.job_id = %s 
+                  AND te.status = 'done'
+                  AND te.avg_duration_per_page_ms IS NOT NULL
+                ORDER BY te.avg_duration_per_page_ms DESC
+                LIMIT 1
+                """,
+                (job.id,)
+            )
+            slowest = cur.fetchone()
         
         console.print(f"\n[bold]Job Statistics: {job.name}[/bold] (id={job.id})\n")
         
@@ -437,6 +458,15 @@ def stats(job_name):
             console.print(f"  Avg Duration per Task: {totals['avg_duration_ms']:.2f} ms")
         if totals['avg_per_page_ms']:
             console.print(f"  Avg Duration per Page: {totals['avg_per_page_ms']:.2f} ms")
+        
+        # Slowest volume
+        if slowest:
+            console.print(f"\n[bold]Slowest Volume (by avg page duration):[/bold]")
+            console.print(f"  Volume: [green]{slowest['bdrc_w_id']}/{slowest['bdrc_i_id']}[/green]")
+            console.print(f"  Avg Duration per Page: [yellow]{slowest['avg_duration_per_page_ms']:.2f} ms[/yellow]")
+            console.print(f"  Total Images: {slowest['total_images']}")
+            if slowest['total_duration_ms']:
+                console.print(f"  Total Duration: {slowest['total_duration_ms'] / 1000:.1f} s")
         console.print()
         
     except ValueError as e:
@@ -471,6 +501,7 @@ def tasks(job_name, limit, status):
                 te.total_images,
                 te.nb_errors,
                 te.total_duration_ms,
+                te.avg_duration_per_page_ms,
                 w.worker_name
             FROM task_executions te
             JOIN volumes v ON te.volume_id = v.id
@@ -507,6 +538,8 @@ def tasks(job_name, limit, status):
         table.add_column("Images", justify="right")
         table.add_column("Errors", justify="right")
         table.add_column("Duration (s)", justify="right")
+        table.add_column("Avg/img (ms)", justify="right")
+        table.add_column("Completed", style="dim")
         table.add_column("Worker", style="dim")
         
         for row in tasks_rows:
@@ -518,7 +551,9 @@ def tasks(job_name, limit, status):
             }.get(row['status'], 'white')
             
             duration_s = f"{row['total_duration_ms'] / 1000:.1f}" if row['total_duration_ms'] else "-"
+            avg_per_img = f"{row['avg_duration_per_page_ms']:.1f}" if row['avg_duration_per_page_ms'] else "-"
             worker_name = row['worker_name'][:15] if row['worker_name'] else "-"
+            completed_at = row['done_at'].strftime("%Y-%m-%d %H:%M") if row['done_at'] else "-"
             
             table.add_row(
                 str(row['id']),
@@ -527,6 +562,8 @@ def tasks(job_name, limit, status):
                 str(row['total_images'] or "-"),
                 str(row['nb_errors'] or "-"),
                 duration_s,
+                avg_per_img,
+                completed_at,
                 worker_name
             )
         

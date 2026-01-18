@@ -437,6 +437,8 @@ class ParquetWriter:
         This ensures data integrity: every expected image has a row in the parquet file,
         even if it was dropped due to pipeline timeouts or errors.
         
+        Also writes these errors to the JSONL sidecar file for visibility in `bec errors show`.
+        
         Returns:
             Number of missing records that were filled.
         """
@@ -454,8 +456,10 @@ class ParquetWriter:
         
         self._ensure_open()
         
+        error_message = "Record never received (likely dropped due to timeout or pipeline error)"
+        
         for filename in sorted(missing):
-            # Create a synthetic error row for the missing record
+            # Create a synthetic error row for the Parquet file
             row = {
                 "img_file_name": filename,
                 "source_etag": None,
@@ -468,12 +472,22 @@ class ParquetWriter:
                 "ok": False,
                 "error_stage": "Pipeline",
                 "error_type": "DroppedByPipeline",
-                "error_message": _truncate(
-                    "Record never received (likely dropped due to timeout or pipeline error)",
-                    self.max_error_message_len
-                ),
+                "error_message": _truncate(error_message, self.max_error_message_len),
             }
             self._buffer.append(row)
+            
+            # Also write to JSONL sidecar for visibility in `bec errors show`
+            synthetic_error = PipelineError(
+                stage="Pipeline",
+                task=ImageTask(source_uri="", img_filename=filename),
+                source_etag=None,
+                error_type="DroppedByPipeline",
+                message=error_message,
+                traceback=None,
+                retryable=True,
+            )
+            self._write_error_jsonl(synthetic_error)
+            
             self._error_count += 1
             self._error_by_stage["Pipeline"] = self._error_by_stage.get("Pipeline", 0) + 1
         

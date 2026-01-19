@@ -176,7 +176,7 @@ def _create_queue(
     
     # Add visibility timeout
     if not is_dlq:
-        attributes['VisibilityTimeout'] = '300'  # 5 minutes
+        attributes['VisibilityTimeout'] = '450'  # 7.5 minutes - gives buffer for long volumes
     
     # Add redrive policy for main queue
     if dlq_arn:

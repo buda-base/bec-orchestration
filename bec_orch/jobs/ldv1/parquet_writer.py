@@ -449,9 +449,17 @@ class ParquetWriter:
         if not missing:
             return 0
         
+        # Get first few filenames for debugging
+        missing_sorted = sorted(missing)
+        sample_filenames = missing_sorted[:3]
+        sample_str = ", ".join(sample_filenames)
+        if len(missing_sorted) > 3:
+            sample_str += f", ... (+{len(missing_sorted) - 3} more)"
+        
         logger.warning(
             f"[ParquetWriter] {len(missing)} records never received. "
-            f"Creating error rows for missing images."
+            f"Creating error rows for missing images. "
+            f"Missing: [{sample_str}]"
         )
         
         self._ensure_open()

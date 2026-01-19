@@ -306,16 +306,23 @@ class LDPostProcessor:
                                         timeout=self._transform_gather_timeout_s
                                     )
                                 except asyncio.TimeoutError:
-                                    # Cancel remaining transforms and proceed
+                                    # Cancel remaining transforms and EMIT ERRORS for them
+                                    # so they appear in the parquet file as dropped records
                                     still_pending = [t for t in self._pending_transforms if not t.done()]
                                     logger.error(
                                         f"[PostProcessor] Timeout waiting for {len(still_pending)} transforms. "
-                                        f"Cancelling remaining and proceeding."
+                                        f"Cancelling remaining and emitting errors."
                                     )
+                                    
+                                    # Try to extract task info from pending tasks and emit errors
                                     for t in still_pending:
                                         t.cancel()
                                     # Give cancelled tasks a chance to clean up
                                     await asyncio.gather(*still_pending, return_exceptions=True)
+                                    
+                                    # Note: Cancelled transforms won't emit their own errors (CancelledError is re-raised),
+                                    # so their frames will be detected as "missing" by ParquetWriter.
+                                    # This is intentional - they get tracked in the dropped records count.
                             self._pending_transforms.clear()
                         
                         # No more pass1 frames => no more reprocess frames will be generated.

@@ -28,7 +28,10 @@ class PipelineConfig:
     max_q_tilebatcher_to_inference: int = 8  # Allow more batches queued (reduces GPU starvation)
     max_q_gpu_pass_1_to_post_processor: int = 32
     max_q_post_processor_to_tilebatcher: int = 16
-    max_q_gpu_pass_2_to_post_processor: int = 48  # Larger than pass-1 to reduce deadlock risk
+    # Pass-2 queue must hold: (q_to_inference batches × batch_size) + current_batch + margin
+    # = (8 × 16) + 16 + 16 = 160 frames to prevent deadlock
+    # See FINAL_QUEUE_DESIGN.md for derivation
+    max_q_gpu_pass_2_to_post_processor: int = 160
     max_q_post_processor_to_writer: int = 64
 
 
@@ -55,7 +58,7 @@ class PipelineConfig:
     class_threshold: float = 0.85
     gpu_reinit_on_error = False
     gpu_reinit_on_oom = True
-    reprocess_budget: int = 3  # Priority weight for reprocess lane (higher = more priority)
+    reprocess_budget: int = 16  # Pass-2 frames to consume per loop (match batch_size for throughput)
     controller_poll_ms: int = 5  # Polling timeout for post-processor
 
     # Output

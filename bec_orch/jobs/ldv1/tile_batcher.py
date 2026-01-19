@@ -301,38 +301,56 @@ class TileBatcher:
         
         This combines preprocessing (binarization) and tiling into a single
         thread pool operation to avoid blocking the async event loop.
+        
+        On error, returns a dict with "failed": True and error info instead of raising.
+        This allows the caller to emit proper PipelineError without losing track of the frame.
         """
         t0 = time.perf_counter()
         
-        if self._use_parallel_tiling and self._tile_executor is not None:
-            loop = asyncio.get_event_loop()
-            # Run BOTH binarization and tiling in thread pool
-            gray, tiles, x_steps, y_steps, pad_x, pad_y = await loop.run_in_executor(
-                self._tile_executor,
-                self._preprocess_and_tile_sync,
-                dec_frame,
+        try:
+            if self._use_parallel_tiling and self._tile_executor is not None:
+                loop = asyncio.get_event_loop()
+                # Run BOTH binarization and tiling in thread pool
+                gray, tiles, x_steps, y_steps, pad_x, pad_y = await loop.run_in_executor(
+                    self._tile_executor,
+                    self._preprocess_and_tile_sync,
+                    dec_frame,
+                )
+            else:
+                # Fallback: run synchronously (will block)
+                gray = self._preprocess_frame_sync(dec_frame)
+                tiles, x_steps, y_steps, pad_x, pad_y = tile_frame_sync(
+                    gray, self.patch_size, self.tile_dtype, self.pin_tile_memory
+                )
+            
+            tile_time = time.perf_counter() - t0
+            
+            # Note: 'gray' (binarized image) is NOT stored here - it was only needed for tiling.
+            # Downstream uses dec_frame.frame (original grayscale) for pass-2 transforms.
+            return {
+                "failed": False,
+                "dec_frame": dec_frame,
+                "second_pass": is_pass2,
+                "tiles": tiles,
+                "x_steps": x_steps,
+                "y_steps": y_steps,
+                "pad_x": pad_x,
+                "pad_y": pad_y,
+                "tile_time": tile_time,
+            }
+        except Exception as e:
+            tile_time = time.perf_counter() - t0
+            logger.error(
+                f"[TileBatcher] Tiling failed for {dec_frame.task.img_filename}: {e}",
+                exc_info=True
             )
-        else:
-            # Fallback: run synchronously (will block)
-            gray = self._preprocess_frame_sync(dec_frame)
-            tiles, x_steps, y_steps, pad_x, pad_y = tile_frame_sync(
-                gray, self.patch_size, self.tile_dtype, self.pin_tile_memory
-            )
-        
-        tile_time = time.perf_counter() - t0
-        
-        # Note: 'gray' (binarized image) is NOT stored here - it was only needed for tiling.
-        # Downstream uses dec_frame.frame (original grayscale) for pass-2 transforms.
-        return {
-            "dec_frame": dec_frame,
-            "second_pass": is_pass2,
-            "tiles": tiles,
-            "x_steps": x_steps,
-            "y_steps": y_steps,
-            "pad_x": pad_x,
-            "pad_y": pad_y,
-            "tile_time": tile_time,
-        }
+            return {
+                "failed": True,
+                "dec_frame": dec_frame,
+                "second_pass": is_pass2,
+                "error": e,
+                "tile_time": tile_time,
+            }
     
     def _preprocess_and_tile_sync(
         self,
@@ -353,7 +371,7 @@ class TileBatcher:
         
         return gray, tiles, x_steps, y_steps, pad_x, pad_y
 
-    def _collect_completed_tiles(self) -> Tuple[int, int, float]:
+    def _collect_completed_tiles(self) -> Tuple[int, int, float, List[Dict[str, Any]]]:
         """
         Check pending tile tasks and move completed ones to appropriate buffer.
         
@@ -361,17 +379,26 @@ class TileBatcher:
         This separation prevents deadlock by allowing pass-1 and pass-2 to flow independently.
         
         Returns:
-            (n_completed_pass1, n_completed_pass2, total_tile_time)
+            (n_completed_pass1, n_completed_pass2, total_tile_time, failed_entries)
+            where failed_entries is a list of dicts with dec_frame, second_pass, and error info
         """
         completed_p1 = 0
         completed_p2 = 0
         total_time = 0.0
         still_pending = []
+        failed_entries: List[Dict[str, Any]] = []
         
         for task in self._pending_tiles:
             if task.done():
                 try:
                     entry = task.result()
+                    
+                    # Check if tiling failed (handled gracefully in _tile_frame_async)
+                    if entry.get("failed", False):
+                        failed_entries.append(entry)
+                        total_time += entry.get("tile_time", 0.0)
+                        continue
+                    
                     # Route to appropriate buffer based on pass type
                     if entry["second_pass"]:
                         self._buffer_pass2.append(entry)
@@ -381,13 +408,13 @@ class TileBatcher:
                         completed_p1 += 1
                     total_time += entry.get("tile_time", 0.0)
                 except Exception as e:
-                    # Task failed - log error but continue
-                    logger.error(f"[TileBatcher] Tile task failed: {e}")
+                    # Task itself failed (unexpected) - log error
+                    logger.error(f"[TileBatcher] Tile task raised unexpected exception: {e}")
             else:
                 still_pending.append(task)
         
         self._pending_tiles = still_pending
-        return completed_p1, completed_p2, total_time
+        return completed_p1, completed_p2, total_time, failed_entries
 
     # -------------------------------------------------------------------------
     # Batch preparation (multi_image_collate_fn logic)
@@ -635,8 +662,24 @@ class TileBatcher:
                 loop_count += 1
                 
                 # --- Collect completed tiling tasks (routes to correct buffer) ---
-                n_p1_completed, n_p2_completed, tile_time = self._collect_completed_tiles()
+                n_p1_completed, n_p2_completed, tile_time, failed_entries = self._collect_completed_tiles()
                 total_tile_time += tile_time
+                
+                # Emit errors for failed tiling tasks
+                for failed_entry in failed_entries:
+                    dec_frame = failed_entry.get("dec_frame")
+                    is_pass2 = failed_entry.get("second_pass", False)
+                    error = failed_entry.get("error")
+                    if dec_frame and error:
+                        await self._emit_pipeline_error(
+                            internal_stage="tile_frame",
+                            exc=error,
+                            lane_second_pass=is_pass2,
+                            task=dec_frame.task,
+                            source_etag=dec_frame.source_etag,
+                            retryable=False,
+                            attempt=1,
+                        )
                 
                 # --- Check termination ---
                 # Only terminate when both inputs are done AND no pending work AND buffers empty
@@ -721,7 +764,8 @@ class TileBatcher:
                 
                 if warmup_complete:
                     # Try pass-2 first (higher priority, smaller volume)
-                    if self._should_emit_from_buffer(self._buffer_pass2, max_tiles):
+                    # Use lower threshold (50%) for pass-2 to ensure it gets priority even with smaller batches
+                    if self._should_emit_from_buffer(self._buffer_pass2, max_tiles, min_flush_ratio=0.5):
                         emit_start = time.perf_counter()
                         batch, frames_taken = self._prepare_batch_from_buffer(self._buffer_pass2, is_pass2=True)
                         self._remove_from_buffer(self._buffer_pass2, frames_taken, is_pass2=True)
@@ -744,7 +788,7 @@ class TileBatcher:
                     
                     # Then try pass-1 (can flow independently of pass-2)
                     # This is the KEY deadlock fix: pass-1 doesn't wait for pass-2
-                    elif self._should_emit_from_buffer(self._buffer_pass1, max_tiles):
+                    elif self._should_emit_from_buffer(self._buffer_pass1, max_tiles):  # Keep 75% for pass-1
                         emit_start = time.perf_counter()
                         batch, frames_taken = self._prepare_batch_from_buffer(self._buffer_pass1, is_pass2=False)
                         self._remove_from_buffer(self._buffer_pass1, frames_taken, is_pass2=False)

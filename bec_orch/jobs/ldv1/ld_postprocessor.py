@@ -249,6 +249,10 @@ class LDPostProcessor:
                         logger.info(f"[PostProcessor] Received gpu_pass_2 EOS at t={p2_eos_time:.2f}s")
                         
                         # CRITICAL: Drain any remaining pass-2 frames from the queue before breaking.
+                        queue_size_p2 = self.q_second.qsize()
+                        if queue_size_p2 > 0:
+                            logger.info(f"[PostProcessor] Queue has {queue_size_p2} pass-2 items to drain after EOS")
+                        
                         p2_drained = 0
                         while True:
                             remaining = self._try_get_nowait(self.q_second)
@@ -405,6 +409,10 @@ class LDPostProcessor:
                         
                         # CRITICAL: Drain any remaining pass-1 frames from the queue before breaking.
                         # The EOS might have arrived before we consumed all queued frames.
+                        queue_size_before_drain = self.q_first.qsize()
+                        if queue_size_before_drain > 0:
+                            logger.info(f"[PostProcessor] Queue has {queue_size_before_drain} pass-1 items to drain after EOS")
+                        
                         drained_count = 0
                         while True:
                             remaining_msg = self._try_get_nowait(self.q_first)

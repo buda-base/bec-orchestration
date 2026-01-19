@@ -294,36 +294,66 @@ class LDPostProcessor:
                         logger.info(f"[PostProcessor] Received gpu_pass_1 EOS at t={p1_eos_time:.2f}s")
                         
                         # Wait for all pending transforms to complete before sending EOS.
-                        # This ensures all pass 2 frames are enqueued before we signal completion.
-                        # Use timeout to prevent deadlock if transforms hang.
-                        if self._pending_transforms:
-                            pending_count = len([t for t in self._pending_transforms if not t.done()])
-                            if pending_count > 0:
-                                logger.info(f"[PostProcessor] Waiting for {pending_count} pending transforms (timeout={self._transform_gather_timeout_s}s)...")
-                                try:
-                                    await asyncio.wait_for(
-                                        asyncio.gather(*self._pending_transforms, return_exceptions=True),
-                                        timeout=self._transform_gather_timeout_s
-                                    )
-                                except asyncio.TimeoutError:
-                                    # Cancel remaining transforms and EMIT ERRORS for them
-                                    # so they appear in the parquet file as dropped records
-                                    still_pending = [t for t in self._pending_transforms if not t.done()]
-                                    logger.error(
-                                        f"[PostProcessor] Timeout waiting for {len(still_pending)} transforms. "
-                                        f"Cancelling remaining and emitting errors."
-                                    )
-                                    
-                                    # Try to extract task info from pending tasks and emit errors
-                                    for t in still_pending:
-                                        t.cancel()
-                                    # Give cancelled tasks a chance to clean up
-                                    await asyncio.gather(*still_pending, return_exceptions=True)
-                                    
-                                    # Note: Cancelled transforms won't emit their own errors (CancelledError is re-raised),
-                                    # so their frames will be detected as "missing" by ParquetWriter.
-                                    # This is intentional - they get tracked in the dropped records count.
-                            self._pending_transforms.clear()
+                        # CRITICAL: We must also drain pass-2 during this wait to prevent deadlock!
+                        # The old blocking wait caused deadlock: InferenceRunner blocked on full q_pass2_to_post
+                        # while PostProcessor was stuck waiting for transforms.
+                        wait_start = time.perf_counter()
+                        wait_timeout = self._transform_gather_timeout_s
+                        
+                        while True:
+                            # FIRST: Drain any available pass-2 frames to prevent queue backup
+                            for _ in range(p2_budget):
+                                p2_msg = self._try_get_nowait(self.q_second)
+                                if p2_msg is None:
+                                    break
+                                if isinstance(p2_msg, EndOfStream) and p2_msg.stream == "gpu_pass_2":
+                                    # Pass-2 EOS arrived during wait - this is fine, we'll handle it in main loop
+                                    self._p2_done = True
+                                    p2_eos_time = time.perf_counter() - run_start
+                                    logger.info(f"[PostProcessor] Received gpu_pass_2 EOS during transform wait at t={p2_eos_time:.2f}s")
+                                    break
+                                if isinstance(p2_msg, PipelineError):
+                                    await self.q_post_processor_to_writer.put(p2_msg)
+                                    continue
+                                if isinstance(p2_msg, InferredFrame):
+                                    try:
+                                        t0 = time.perf_counter()
+                                        await self._finalize_record(p2_msg)
+                                        total_p2_time += time.perf_counter() - t0
+                                        p2_count += 1
+                                    except Exception as e:
+                                        await self._emit_pipeline_error(
+                                            internal_stage="run.finalize_pass2_during_wait",
+                                            exc=e,
+                                            task=p2_msg.task,
+                                            source_etag=p2_msg.source_etag,
+                                            retryable=False,
+                                            attempt=1,
+                                        )
+                            
+                            # Check if all transforms are done
+                            pending = [t for t in self._pending_transforms if not t.done()]
+                            if not pending:
+                                logger.debug("[PostProcessor] All transforms completed")
+                                break
+                            
+                            # Check timeout
+                            elapsed = time.perf_counter() - wait_start
+                            if elapsed > wait_timeout:
+                                logger.error(
+                                    f"[PostProcessor] Timeout waiting for {len(pending)} transforms after {elapsed:.1f}s. "
+                                    f"Cancelling remaining and emitting errors."
+                                )
+                                for t in pending:
+                                    t.cancel()
+                                # Give cancelled tasks a chance to clean up
+                                await asyncio.gather(*pending, return_exceptions=True)
+                                break
+                            
+                            # Wait a bit before checking again (but not too long)
+                            await asyncio.sleep(0.05)
+                        
+                        self._pending_transforms.clear()
                         
                         # No more pass1 frames => no more reprocess frames will be generated.
                         await self.q_post_processor_to_gpu_pass_2.put(

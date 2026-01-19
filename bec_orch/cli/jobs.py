@@ -170,7 +170,7 @@ def _create_queue(
     sqs = boto3.client('sqs', region_name=region)
     
     attributes = {
-        'MessageRetentionPeriod': '345600',  # 4 days
+        'MessageRetentionPeriod': '864000',  # 10 days
         'ReceiveMessageWaitTimeSeconds': '20',  # Long polling
     }
     
@@ -188,7 +188,10 @@ def _create_queue(
     try:
         response = sqs.create_queue(
             QueueName=queue_name,
-            Attributes=attributes
+            Attributes=attributes,
+            tags={
+                'Project': 'BEC'
+            }
         )
         return response['QueueUrl']
     except sqs.exceptions.QueueNameExists:

@@ -408,8 +408,17 @@ class TileBatcher:
                         completed_p1 += 1
                     total_time += entry.get("tile_time", 0.0)
                 except Exception as e:
-                    # Task itself failed (unexpected) - log error
-                    logger.error(f"[TileBatcher] Tile task raised unexpected exception: {e}")
+                    # Task itself failed (unexpected) - create a failed entry so error is emitted
+                    # This handles cases where _tile_frame_async raised before returning a dict
+                    logger.error(f"[TileBatcher] Tile task raised unexpected exception: {e}", exc_info=True)
+                    # We don't have dec_frame here since task.result() failed - create placeholder
+                    failed_entries.append({
+                        "failed": True,
+                        "dec_frame": None,  # Unknown - will be logged as "unknown" filename
+                        "second_pass": False,
+                        "error": e,
+                        "tile_time": 0.0,
+                    })
             else:
                 still_pending.append(task)
         
@@ -670,16 +679,23 @@ class TileBatcher:
                     dec_frame = failed_entry.get("dec_frame")
                     is_pass2 = failed_entry.get("second_pass", False)
                     error = failed_entry.get("error")
-                    if dec_frame and error:
-                        await self._emit_pipeline_error(
-                            internal_stage="tile_frame",
-                            exc=error,
-                            lane_second_pass=is_pass2,
-                            task=dec_frame.task,
-                            source_etag=dec_frame.source_etag,
-                            retryable=False,
-                            attempt=1,
-                        )
+                    if error:
+                        if dec_frame:
+                            await self._emit_pipeline_error(
+                                internal_stage="tile_frame",
+                                exc=error,
+                                lane_second_pass=is_pass2,
+                                task=dec_frame.task,
+                                source_etag=dec_frame.source_etag,
+                                retryable=False,
+                                attempt=1,
+                            )
+                        else:
+                            # We lost track of which frame failed - log prominently
+                            logger.error(
+                                f"[TileBatcher] CRITICAL: Tile task failed but dec_frame unknown: {error}. "
+                                "This frame will be recorded as missing by ParquetWriter."
+                            )
                 
                 # --- Check termination ---
                 # Only terminate when both inputs are done AND no pending work AND buffers empty

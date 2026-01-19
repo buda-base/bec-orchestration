@@ -4,8 +4,10 @@ BEC Orchestration CLI - Main entry point.
 
 Commands:
   bec worker    - Run worker to process tasks
+  bec workers   - List and inspect workers
   bec jobs      - Manage jobs (create, show, update)
   bec queue     - Manage task queues (enqueue, stats, redrive)
+  bec errors    - Inspect task execution errors
 """
 
 import logging
@@ -46,12 +48,14 @@ def cli(ctx, verbose):
 
 # Import subcommands
 from bec_orch.cli.worker import worker, run_volume
+from bec_orch.cli.workers import workers
 from bec_orch.cli.jobs import jobs
 from bec_orch.cli.queue import queue
 from bec_orch.cli.errors import errors
 
 cli.add_command(worker)
 cli.add_command(run_volume)
+cli.add_command(workers)
 cli.add_command(jobs)
 cli.add_command(queue)
 cli.add_command(errors)

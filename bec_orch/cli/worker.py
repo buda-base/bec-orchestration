@@ -118,7 +118,8 @@ def worker(
         runtime.run_forever()
         logger.info("Worker completed successfully")
     except KeyboardInterrupt:
-        logger.info("Worker interrupted by user")
+        logger.info("Worker interrupted (SIGINT/SIGTERM or forced shutdown)")
+        sys.exit(0)
     except Exception as e:
         logger.error(f"Worker failed: {e}", exc_info=True)
         raise

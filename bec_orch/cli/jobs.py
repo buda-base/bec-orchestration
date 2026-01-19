@@ -345,7 +345,8 @@ def delete(job_identifier, yes):
 
 @jobs.command()
 @click.argument('job_name')
-def stats(job_name):
+@click.option('--worker', help='Filter by worker ID or name (EC2 instance ID)')
+def stats(job_name, worker):
     """Show job statistics (task execution summary)."""
     from bec_orch.orch.job_admin import get_job_by_name
     from tabulate import tabulate
@@ -355,10 +356,40 @@ def stats(job_name):
         # Get job
         job = get_job_by_name(conn, job_name)
         
+        # Resolve worker identifier if provided
+        worker_id = None
+        if worker:
+            # Try to resolve worker identifier to worker_id
+            try:
+                worker_id = int(worker)
+                # Verify it exists
+                with conn.cursor() as cur:
+                    cur.execute("SELECT worker_id FROM workers WHERE worker_id = %s", (worker_id,))
+                    if not cur.fetchone():
+                        console.print(f"[red]Error:[/red] Worker ID {worker_id} not found")
+                        sys.exit(1)
+            except ValueError:
+                # Not an integer, treat as worker name
+                with conn.cursor() as cur:
+                    cur.execute("SELECT worker_id FROM workers WHERE worker_name = %s", (worker,))
+                    row = cur.fetchone()
+                    if row:
+                        worker_id = row['worker_id']
+                    else:
+                        console.print(f"[red]Error:[/red] Worker '{worker}' not found")
+                        sys.exit(1)
+        
+        # Build worker filter
+        worker_filter = ""
+        params = [job.id]
+        if worker_id:
+            worker_filter = " AND worker_id = %s"
+            params.append(worker_id)
+        
         # Get statistics
         with conn.cursor() as cur:
             cur.execute(
-                """
+                f"""
                 SELECT 
                     status,
                     COUNT(*) as count,
@@ -366,7 +397,7 @@ def stats(job_name):
                     SUM(total_images) as total_images,
                     SUM(nb_errors) as total_errors
                 FROM task_executions 
-                WHERE job_id = %s 
+                WHERE job_id = %s {worker_filter}
                 GROUP BY status
                 ORDER BY 
                     CASE status
@@ -376,13 +407,13 @@ def stats(job_name):
                         WHEN 'terminal_failed' THEN 4
                     END
                 """,
-                (job.id,)
+                params
             )
             stats_rows = cur.fetchall()
             
             # Get overall totals
             cur.execute(
-                """
+                f"""
                 SELECT 
                     COUNT(*) as total_tasks,
                     SUM(total_images) as total_images,
@@ -390,15 +421,15 @@ def stats(job_name):
                     ROUND(AVG(total_duration_ms)::numeric, 2) as avg_duration_ms,
                     ROUND(AVG(avg_duration_per_page_ms)::numeric, 2) as avg_per_page_ms
                 FROM task_executions 
-                WHERE job_id = %s
+                WHERE job_id = %s {worker_filter}
                 """,
-                (job.id,)
+                params
             )
             totals = cur.fetchone()
             
             # Get slowest volume by avg page duration
             cur.execute(
-                """
+                f"""
                 SELECT 
                     v.bdrc_w_id,
                     v.bdrc_i_id,
@@ -407,17 +438,20 @@ def stats(job_name):
                     te.total_duration_ms
                 FROM task_executions te
                 JOIN volumes v ON te.volume_id = v.id
-                WHERE te.job_id = %s 
+                WHERE te.job_id = %s {worker_filter}
                   AND te.status = 'done'
                   AND te.avg_duration_per_page_ms IS NOT NULL
                 ORDER BY te.avg_duration_per_page_ms DESC
                 LIMIT 1
                 """,
-                (job.id,)
+                params
             )
             slowest = cur.fetchone()
         
-        console.print(f"\n[bold]Job Statistics: {job.name}[/bold] (id={job.id})\n")
+        title = f"\n[bold]Job Statistics: {job.name}[/bold] (id={job.id})"
+        if worker_id:
+            title += f" [dim]- Worker {worker}[/dim]"
+        console.print(title + "\n")
         
         if not stats_rows:
             console.print("[yellow]No task executions found[/yellow]")
@@ -480,7 +514,8 @@ def stats(job_name):
 @click.argument('job_name')
 @click.option('--limit', type=int, default=10, help='Number of recent tasks to show (default: 10)')
 @click.option('--status', help='Filter by status (running, done, retryable_failed, terminal_failed)')
-def tasks(job_name, limit, status):
+@click.option('--worker', help='Filter by worker ID or name (EC2 instance ID)')
+def tasks(job_name, limit, status, worker):
     """Show recent task executions for a job."""
     from bec_orch.orch.job_admin import get_job_by_name
     
@@ -488,6 +523,29 @@ def tasks(job_name, limit, status):
     try:
         # Get job
         job = get_job_by_name(conn, job_name)
+        
+        # Resolve worker identifier if provided
+        worker_id = None
+        if worker:
+            # Try to resolve worker identifier to worker_id
+            try:
+                worker_id = int(worker)
+                # Verify it exists
+                with conn.cursor() as cur:
+                    cur.execute("SELECT worker_id FROM workers WHERE worker_id = %s", (worker_id,))
+                    if not cur.fetchone():
+                        console.print(f"[red]Error:[/red] Worker ID {worker_id} not found")
+                        sys.exit(1)
+            except ValueError:
+                # Not an integer, treat as worker name
+                with conn.cursor() as cur:
+                    cur.execute("SELECT worker_id FROM workers WHERE worker_name = %s", (worker,))
+                    row = cur.fetchone()
+                    if row:
+                        worker_id = row['worker_id']
+                    else:
+                        console.print(f"[red]Error:[/red] Worker '{worker}' not found")
+                        sys.exit(1)
         
         # Build query
         query = """
@@ -502,7 +560,8 @@ def tasks(job_name, limit, status):
                 te.nb_errors,
                 te.total_duration_ms,
                 te.avg_duration_per_page_ms,
-                w.worker_name
+                w.worker_name,
+                te.worker_id
             FROM task_executions te
             JOIN volumes v ON te.volume_id = v.id
             LEFT JOIN workers w ON te.worker_id = w.worker_id
@@ -514,6 +573,10 @@ def tasks(job_name, limit, status):
             query += " AND te.status = %s"
             params.append(status)
         
+        if worker_id:
+            query += " AND te.worker_id = %s"
+            params.append(worker_id)
+        
         query += " ORDER BY te.id DESC LIMIT %s"
         params.append(limit)
         
@@ -522,8 +585,13 @@ def tasks(job_name, limit, status):
             tasks_rows = cur.fetchall()
         
         console.print(f"\n[bold]Recent Task Executions: {job.name}[/bold] (id={job.id})")
+        filters = []
         if status:
-            console.print(f"[dim]Filtered by status: {status}[/dim]")
+            filters.append(f"status: {status}")
+        if worker_id:
+            filters.append(f"worker: {worker}")
+        if filters:
+            console.print(f"[dim]Filters: {', '.join(filters)}[/dim]")
         console.print()
         
         if not tasks_rows:
@@ -552,7 +620,7 @@ def tasks(job_name, limit, status):
             
             duration_s = f"{row['total_duration_ms'] / 1000:.1f}" if row['total_duration_ms'] else "-"
             avg_per_img = f"{row['avg_duration_per_page_ms']:.1f}" if row['avg_duration_per_page_ms'] else "-"
-            worker_name = row['worker_name'][:15] if row['worker_name'] else "-"
+            worker_name = row['worker_name'] if row['worker_name'] else "-"
             completed_at = row['done_at'].strftime("%Y-%m-%d %H:%M") if row['done_at'] else "-"
             
             table.add_row(

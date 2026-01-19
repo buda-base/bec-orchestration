@@ -105,7 +105,8 @@ def errors():
     help="Type of errors: all (default), task-failed, image-errors",
 )
 @click.option("--limit", "-n", type=int, default=20, help="Number of results (default: 20)")
-def list_errors(job: Optional[str], error_type: str, limit: int):
+@click.option("--worker", help="Filter by worker ID or name (EC2 instance ID)")
+def list_errors(job: Optional[str], error_type: str, limit: int, worker: Optional[str]):
     """List recent task executions with errors.
 
     Shows tasks that either failed (retryable_failed/terminal_failed) or
@@ -113,6 +114,29 @@ def list_errors(job: Optional[str], error_type: str, limit: int):
     """
     conn = get_db_connection()
     try:
+        # Resolve worker identifier if provided
+        worker_id = None
+        if worker:
+            # Try to resolve worker identifier to worker_id
+            try:
+                worker_id = int(worker)
+                # Verify it exists
+                with conn.cursor() as cur:
+                    cur.execute("SELECT worker_id FROM workers WHERE worker_id = %s", (worker_id,))
+                    if not cur.fetchone():
+                        console.print(f"[red]Error:[/red] Worker ID {worker_id} not found")
+                        sys.exit(1)
+            except ValueError:
+                # Not an integer, treat as worker name
+                with conn.cursor() as cur:
+                    cur.execute("SELECT worker_id FROM workers WHERE worker_name = %s", (worker,))
+                    row = cur.fetchone()
+                    if row:
+                        worker_id = row['worker_id']
+                    else:
+                        console.print(f"[red]Error:[/red] Worker '{worker}' not found")
+                        sys.exit(1)
+        
         # Build query based on error type filter
         conditions = []
         params = []
@@ -130,6 +154,10 @@ def list_errors(job: Optional[str], error_type: str, limit: int):
         if job:
             conditions.append("j.name = %s")
             params.append(job)
+        
+        if worker_id:
+            conditions.append("te.worker_id = %s")
+            params.append(worker_id)
 
         where_clause = " AND ".join(conditions)
 
@@ -144,10 +172,13 @@ def list_errors(job: Optional[str], error_type: str, limit: int):
                 te.total_images,
                 te.done_at,
                 te.started_at,
-                encode(te.s3_etag, 'hex') as etag_hex
+                encode(te.s3_etag, 'hex') as etag_hex,
+                w.worker_name,
+                te.worker_id
             FROM task_executions te
             JOIN volumes v ON te.volume_id = v.id
             JOIN jobs j ON te.job_id = j.id
+            LEFT JOIN workers w ON te.worker_id = w.worker_id
             WHERE {where_clause}
             ORDER BY COALESCE(te.done_at, te.started_at) DESC
             LIMIT %s
@@ -163,13 +194,17 @@ def list_errors(job: Optional[str], error_type: str, limit: int):
             return
 
         # Display table
-        table = Table(title=f"Task Executions with Errors (showing {len(rows)})")
+        title = f"Task Executions with Errors (showing {len(rows)})"
+        if worker_id:
+            title += f" - Worker {worker}"
+        table = Table(title=title)
         table.add_column("ID", style="cyan")
         table.add_column("Volume", style="green")
         table.add_column("Job", style="blue")
         table.add_column("Status")
         table.add_column("Errors", justify="right")
         table.add_column("Images", justify="right")
+        table.add_column("Worker", style="dim")
         table.add_column("Time", style="dim")
 
         for row in rows:
@@ -189,6 +224,8 @@ def list_errors(job: Optional[str], error_type: str, limit: int):
                 if row["started_at"]
                 else "-"
             )
+            
+            worker_name = row["worker_name"] if row["worker_name"] else "-"
 
             table.add_row(
                 str(row["id"]),
@@ -197,6 +234,7 @@ def list_errors(job: Optional[str], error_type: str, limit: int):
                 f"[{status_style}]{status}[/{status_style}]",
                 str(row["nb_errors"] or 0),
                 str(row["total_images"] or "-"),
+                worker_name,
                 time_str,
             )
 

@@ -4,6 +4,7 @@ import hashlib
 import io
 import json
 import logging
+import signal
 import socket
 import time
 from pathlib import Path
@@ -95,6 +96,10 @@ class BECWorkerRuntime:
         
         # Empty poll tracking
         self._empty_polls: int = 0
+        
+        # Graceful shutdown flag
+        self._shutdown_requested: bool = False
+        self._processing_message: bool = False
 
     def initialize(self) -> None:
         """
@@ -104,6 +109,7 @@ class BECWorkerRuntime:
         - Fetch job record (by name) and parse config
         - Get queue URLs from job record
         - Load job worker implementation via registry
+        - Install signal handlers for graceful shutdown
         """
         logger.info("Initializing BECWorkerRuntime")
         
@@ -141,11 +147,15 @@ class BECWorkerRuntime:
         factory = get_job_worker_factory(self.job_record.name)
         self.job_worker = factory()
         logger.info(f"Loaded job worker for '{self.job_record.name}'")
+        
+        # Install signal handlers for graceful shutdown
+        self._install_signal_handlers()
 
     def run_forever(self) -> None:
         """
         Main loop: poll SQS, process messages, exit after N empty polls.
         If shutdown_after_empty_polls <= 0, runs indefinitely (daemon mode for systemd).
+        Handles graceful shutdown on SIGTERM/SIGINT.
         """
         if self.cfg.shutdown_after_empty_polls > 0:
             logger.info(f"Starting main loop (shutdown after {self.cfg.shutdown_after_empty_polls} empty polls)")
@@ -153,6 +163,15 @@ class BECWorkerRuntime:
             logger.info("Starting main loop (running indefinitely in daemon mode)")
         
         while True:
+            # Check for shutdown request
+            if self._shutdown_requested:
+                if self._processing_message:
+                    logger.info("Shutdown requested, waiting for current job to complete")
+                    # Continue to allow current message to finish
+                else:
+                    logger.info("Shutdown requested, stopping SQS polling")
+                    break
+            
             # Update heartbeat if needed
             self._maybe_heartbeat()
             
@@ -180,6 +199,12 @@ class BECWorkerRuntime:
                 
                 continue
             
+            # Check again for shutdown before processing new message
+            if self._shutdown_requested:
+                logger.info("Shutdown requested before processing message, stopping without processing")
+                logger.info(f"Message {msg.message_id} will be reprocessed after visibility timeout expires")
+                break
+            
             # Reset empty poll counter
             self._empty_polls = 0
             
@@ -188,6 +213,9 @@ class BECWorkerRuntime:
                 f"Received message from SQS: {msg.message_id} for volume {msg.volume.w_id}/{msg.volume.i_id}"
             )
             
+            # Mark that we're processing a message
+            self._processing_message = True
+            
             # Process message
             try:
                 self._process_message(msg)
@@ -195,6 +223,8 @@ class BECWorkerRuntime:
                 logger.error(f"Failed to process message: {e}", exc_info=True)
                 # Don't delete message - let it go back to queue or DLQ
                 # Could implement visibility timeout extension here
+            finally:
+                self._processing_message = False
 
     def shutdown(self) -> None:
         """Mark worker stopped and close DB connection."""
@@ -648,6 +678,47 @@ class BECWorkerRuntime:
         
         # Fall back to hostname if not on EC2 or library not available
         return socket.gethostname()
+    
+    def _install_signal_handlers(self) -> None:
+        """
+        Install signal handlers for graceful shutdown.
+        
+        Handles SIGTERM (sent by systemd/AWS during shutdown) and SIGINT (Ctrl+C).
+        When a signal is received:
+        - Stops polling SQS immediately (no new messages)
+        - Allows current job to complete if one is in progress
+        - Cleans up and exits
+        """
+        def signal_handler(signum: int, frame: Any) -> None:
+            sig_name = signal.Signals(signum).name
+            if not self._shutdown_requested:
+                logger.info(
+                    f"Received {sig_name} signal. Initiating graceful shutdown. "
+                    f"Will stop polling SQS and finish current job if any."
+                )
+                self._shutdown_requested = True
+                
+                # Log current state
+                if self._processing_message:
+                    logger.info(
+                        "Currently processing a job. Will complete it before shutting down. "
+                        "If the job doesn't complete within systemd timeout, the message will "
+                        "be reprocessed after visibility timeout expires."
+                    )
+                else:
+                    logger.info("No job in progress. Stopping SQS polling immediately.")
+            else:
+                # Second signal - force exit
+                logger.warning(
+                    f"Received second {sig_name} signal. Forcing immediate shutdown. "
+                    "Current job (if any) will be reprocessed after visibility timeout expires."
+                )
+                raise KeyboardInterrupt("Forced shutdown by second signal")
+        
+        # Install handlers for SIGTERM (systemd/AWS shutdown) and SIGINT (Ctrl+C)
+        signal.signal(signal.SIGTERM, signal_handler)
+        signal.signal(signal.SIGINT, signal_handler)
+        logger.info("Signal handlers installed for graceful shutdown (SIGTERM, SIGINT)")
 
 
 def get_s3_folder_prefix(w_id: str, i_id: str) -> str:

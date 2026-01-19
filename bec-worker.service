@@ -20,10 +20,12 @@ WorkingDirectory=/home/ec2-user/bec-orchestration
 # For non-templated service, replace %i with your job name (e.g., ldv1)
 ExecStart=/opt/pytorch/bin/bec worker --job-name %i
 
-# Graceful shutdown handling
+# Graceful shutdown handling for AWS ASG scale-down
+# AWS sends SIGTERM and gives ~2 minutes (120s) before force termination
+# Give worker 110s to complete current job gracefully
 KillMode=mixed
 KillSignal=SIGTERM
-TimeoutStopSec=60
+TimeoutStopSec=110
 
 # Restart policy
 Restart=always

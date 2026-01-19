@@ -28,7 +28,7 @@ class PipelineConfig:
     max_q_tilebatcher_to_inference: int = 8  # Allow more batches queued (reduces GPU starvation)
     max_q_gpu_pass_1_to_post_processor: int = 32
     max_q_post_processor_to_tilebatcher: int = 16
-    max_q_gpu_pass_2_to_post_processor: int = 16
+    max_q_gpu_pass_2_to_post_processor: int = 48  # Larger than pass-1 to reduce deadlock risk
     max_q_post_processor_to_writer: int = 64
 
 

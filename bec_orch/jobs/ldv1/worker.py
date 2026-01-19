@@ -305,7 +305,8 @@ class LDVolumeWorker:
             state["tilebatcher"] = {
                 "decoder_done": self.tilebatcher._decoder_done,
                 "postprocessor_done": self.tilebatcher._postprocessor_done,
-                "buffer_size": len(self.tilebatcher._buffer),
+                "buffer_pass1": len(self.tilebatcher._buffer_pass1),
+                "buffer_pass2": len(self.tilebatcher._buffer_pass2),
                 "pending_tiles": len(self.tilebatcher._pending_tiles),
             }
         except Exception:

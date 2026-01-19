@@ -192,16 +192,19 @@ class TileBatcher:
         self._postprocessor_done = False
         self._pass1_eos_sent = False  # Track if we've sent pass-1 EOS
 
-        # Buffer for accumulating tiled frames before emitting a batch
+        # SEPARATE buffers for pass-1 and pass-2 frames to prevent deadlock
+        # When pass-2 output queue is full, pass-1 can still flow through independently
         # Each entry: dict with tiles, metadata, etc.
-        self._buffer: List[Dict[str, Any]] = []
+        self._buffer_pass1: List[Dict[str, Any]] = []
+        self._buffer_pass2: List[Dict[str, Any]] = []
         
         # Pending tiling tasks (for parallel tiling)
+        # Tasks are tracked with their pass type for routing to correct buffer
         self._pending_tiles: List[asyncio.Task] = []
         
         # Buffer size limit to prevent memory accumulation
         # Each buffered frame holds ~25MB (tiles tensor) + metadata
-        # Set to 0 to disable limit
+        # Set to 0 to disable limit (limit applies to EACH buffer separately)
         self._max_buffer_size: int = getattr(cfg, "max_tilebatcher_buffer", 64)
 
         # Thread pool for parallel tiling (optional, can be disabled)
@@ -350,14 +353,18 @@ class TileBatcher:
         
         return gray, tiles, x_steps, y_steps, pad_x, pad_y
 
-    def _collect_completed_tiles(self) -> Tuple[int, float]:
+    def _collect_completed_tiles(self) -> Tuple[int, int, float]:
         """
-        Check pending tile tasks and move completed ones to buffer.
+        Check pending tile tasks and move completed ones to appropriate buffer.
+        
+        Routes completed tiles to _buffer_pass1 or _buffer_pass2 based on second_pass flag.
+        This separation prevents deadlock by allowing pass-1 and pass-2 to flow independently.
         
         Returns:
-            (n_completed, total_tile_time)
+            (n_completed_pass1, n_completed_pass2, total_tile_time)
         """
-        completed = 0
+        completed_p1 = 0
+        completed_p2 = 0
         total_time = 0.0
         still_pending = []
         
@@ -365,8 +372,13 @@ class TileBatcher:
             if task.done():
                 try:
                     entry = task.result()
-                    self._buffer.append(entry)
-                    completed += 1
+                    # Route to appropriate buffer based on pass type
+                    if entry["second_pass"]:
+                        self._buffer_pass2.append(entry)
+                        completed_p2 += 1
+                    else:
+                        self._buffer_pass1.append(entry)
+                        completed_p1 += 1
                     total_time += entry.get("tile_time", 0.0)
                 except Exception as e:
                     # Task failed - log error but continue
@@ -375,18 +387,28 @@ class TileBatcher:
                 still_pending.append(task)
         
         self._pending_tiles = still_pending
-        return completed, total_time
+        return completed_p1, completed_p2, total_time
 
     # -------------------------------------------------------------------------
     # Batch preparation (multi_image_collate_fn logic)
     # -------------------------------------------------------------------------
 
-    def _prepare_batch(self) -> TiledBatch:
+    def _prepare_batch_from_buffer(self, buffer: List[Dict[str, Any]], is_pass2: bool) -> Tuple[TiledBatch, int]:
         """
         Combine buffered tiled frames into a single TiledBatch.
         
         This is the collate_fn equivalent from the reference code.
         Respects batch_size (frames) and max_tiles_per_batch limits.
+        
+        IMPORTANT: Takes from a SINGLE buffer (pass-1 OR pass-2), never mixed.
+        This prevents deadlock by ensuring pass-1 and pass-2 pipelines flow independently.
+        
+        Args:
+            buffer: The buffer to take frames from (_buffer_pass1 or _buffer_pass2)
+            is_pass2: Whether this is the pass-2 buffer (for logging)
+        
+        Returns:
+            Tuple of (TiledBatch, frames_taken)
         """
         all_tiles = []
         tile_ranges = []
@@ -398,7 +420,7 @@ class TileBatcher:
         total_tiles = 0
 
         # First pass: count how many frames we can take
-        for entry in self._buffer:
+        for entry in buffer:
             n_tiles = entry["tiles"].shape[0]
             
             # Stop if adding this frame would exceed limits
@@ -410,23 +432,13 @@ class TileBatcher:
             frames_to_take += 1
             total_tiles += n_tiles
         
-        # Track batch composition (pass 1 vs pass 2)
-        p1_count = 0
-        p2_count = 0
-        
-        # Second pass: collect the frames
-        for entry in self._buffer[:frames_to_take]:
+        # Collect the frames
+        for entry in buffer[:frames_to_take]:
             tiles = entry["tiles"]
             n_tiles = tiles.shape[0]
             
             tile_ranges.append((offset, offset + n_tiles))
             all_tiles.append(tiles)
-            
-            # Track pass composition
-            if entry["second_pass"]:
-                p2_count += 1
-            else:
-                p1_count += 1
             
             # Note: 'gray' is not stored in entry - downstream uses dec_frame.frame
             metas.append({
@@ -446,7 +458,7 @@ class TileBatcher:
         # Explicitly delete individual tiles tensors to help GC
         # (they've been concatenated into all_tiles_tensor)
         del all_tiles
-        for entry in self._buffer[:frames_to_take]:
+        for entry in buffer[:frames_to_take]:
             if "tiles" in entry:
                 del entry["tiles"]
         
@@ -455,9 +467,6 @@ class TileBatcher:
         if self.pin_tile_memory and torch.cuda.is_available() and not all_tiles_tensor.is_pinned():
             all_tiles_tensor = all_tiles_tensor.pin_memory()
         
-        # Remove taken frames from buffer
-        self._buffer = self._buffer[frames_to_take:]
-        
         # Store composition for logging (will be used by caller)
         batch = TiledBatch(
             all_tiles=all_tiles_tensor,
@@ -465,10 +474,18 @@ class TileBatcher:
             metas=metas,
         )
         # Attach composition info as attributes for logging
-        batch._p1_count = p1_count
-        batch._p2_count = p2_count
+        # With separate buffers, batches are now homogeneous (all pass-1 or all pass-2)
+        batch._p1_count = 0 if is_pass2 else frames_to_take
+        batch._p2_count = frames_to_take if is_pass2 else 0
         
-        return batch
+        return batch, frames_to_take
+    
+    def _remove_from_buffer(self, buffer: List[Dict[str, Any]], count: int, is_pass2: bool) -> None:
+        """Remove taken frames from the appropriate buffer."""
+        if is_pass2:
+            del self._buffer_pass2[:count]
+        else:
+            del self._buffer_pass1[:count]
 
     # -------------------------------------------------------------------------
     # Queue helpers
@@ -488,6 +505,21 @@ class TileBatcher:
         except asyncio.TimeoutError:
             return None
 
+    def _has_pending_pass1_tiles(self) -> bool:
+        """Check if there are any pending pass-1 tiles in the tiling queue."""
+        for task in self._pending_tiles:
+            if not task.done():
+                # Can't know the pass type until done, be conservative
+                # Actually we can check the task's coroutine args, but simpler to be safe
+                continue
+            try:
+                entry = task.result()
+                if not entry["second_pass"]:
+                    return True
+            except Exception:
+                pass
+        return False
+    
     async def _maybe_emit_pass1_eos(self) -> None:
         """
         Emit pass-1 EOS when decoder lane is fully drained.
@@ -504,9 +536,8 @@ class TileBatcher:
         if not self._decoder_done:
             return
         
-        # Check if any frames in buffer are from pass-1
-        has_pass1_frames = any(not entry["second_pass"] for entry in self._buffer)
-        if has_pass1_frames:
+        # Check if any frames in pass-1 buffer (now separate from pass-2)
+        if self._buffer_pass1:
             return
 
         await self.q_to_inference.put(
@@ -518,15 +549,61 @@ class TileBatcher:
     # Main run loop
     # -------------------------------------------------------------------------
 
+    def _get_buffer_tiles(self, buffer: List[Dict[str, Any]]) -> int:
+        """Calculate total tiles in a buffer."""
+        return sum(entry["tiles"].shape[0] for entry in buffer) if buffer else 0
+    
+    def _should_emit_from_buffer(
+        self, 
+        buffer: List[Dict[str, Any]], 
+        max_tiles: int,
+        min_flush_ratio: float = 0.75,
+        force_flush: bool = False,
+    ) -> bool:
+        """
+        Determine if we should emit a batch from the given buffer.
+        
+        Args:
+            buffer: The buffer to check
+            max_tiles: Maximum tiles per batch
+            min_flush_ratio: Minimum fullness ratio for partial flush
+            force_flush: If True, emit even partial batches
+        
+        Returns:
+            True if we should emit a batch from this buffer
+        """
+        if not buffer:
+            return False
+        
+        if force_flush:
+            return True
+        
+        buffer_tiles = self._get_buffer_tiles(buffer)
+        frame_fullness = len(buffer) / self.batch_size
+        tile_fullness = buffer_tiles / max_tiles
+        
+        # Emit if buffer is at least batch_size or max_tiles
+        if len(buffer) >= self.batch_size or buffer_tiles >= max_tiles:
+            return True
+        
+        # Emit partial if at least 75% full
+        if frame_fullness >= min_flush_ratio or tile_fullness >= min_flush_ratio:
+            return True
+        
+        return False
+
     async def run(self) -> None:
         """
         Main loop: receive frames, tile them in parallel, batch, and emit.
         
-        Key optimization: Fire off multiple tiling tasks in parallel instead
-        of awaiting each one sequentially. This keeps the thread pool busy
-        while we fetch more frames.
+        Key optimizations:
+        1. Fire off multiple tiling tasks in parallel instead of awaiting each one sequentially
+        2. SEPARATE BUFFERS for pass-1 and pass-2 to prevent deadlock
+        3. Pass-2 has priority but pass-1 can always flow independently
         
-        Load balancing: prefer pass-2 (postprocessor) over pass-1 (decoder).
+        The two-buffer design breaks the circular dependency that causes deadlock:
+        - When pass-2 output queue is full, pass-1 batches can still be emitted
+        - Pass-1 and pass-2 flow through the GPU independently
         """
         # Timing stats
         loop_count = 0
@@ -539,7 +616,8 @@ class TileBatcher:
         # Pass composition stats (for diagnosing pass-2 overhead)
         total_p1_frames = 0
         total_p2_frames = 0
-        p2_only_batches = 0  # Batches with only pass-2 frames (inefficient)
+        p1_batches = 0
+        p2_batches = 0
         
         # Max frames to have in-flight (tiling) at once
         max_inflight = self.tile_workers * 2  # 2x workers for good overlap
@@ -549,41 +627,34 @@ class TileBatcher:
         warmup_frames = getattr(self.cfg, "inference_warmup_frames", 0)
         warmup_complete = (warmup_frames == 0)  # Skip warmup if disabled
         
+        max_tiles = getattr(self.cfg, "max_tiles_per_batch", 80)
+        
         try:
             while True:
                 loop_start = time.perf_counter()
                 loop_count += 1
                 
-                # --- Collect completed tiling tasks ---
-                n_completed, tile_time = self._collect_completed_tiles()
+                # --- Collect completed tiling tasks (routes to correct buffer) ---
+                n_p1_completed, n_p2_completed, tile_time = self._collect_completed_tiles()
                 total_tile_time += tile_time
                 
                 # --- Check termination ---
-                # Only terminate when both inputs are done AND no pending work
+                # Only terminate when both inputs are done AND no pending work AND buffers empty
                 all_done = self._decoder_done and self._postprocessor_done
                 no_pending = len(self._pending_tiles) == 0
+                buffers_empty = not self._buffer_pass1 and not self._buffer_pass2
                 
-                if all_done and no_pending:
+                if all_done and no_pending and buffers_empty:
                     timings_logger.info(
                         f"[TileBatcher] DONE - loops={loop_count}, frames_submitted={frames_submitted}, "
                         f"batches={batches_emitted}, total_wait={total_wait_time:.2f}s, "
                         f"total_tile={total_tile_time:.2f}s, total_emit={total_batch_emit_time:.2f}s"
                     )
-                    # Log pass composition summary if any pass-2 frames were processed
-                    if total_p2_frames > 0:
-                        timings_logger.info(
-                            f"[TileBatcher] COMPOSITION: p1_frames={total_p1_frames}, p2_frames={total_p2_frames}, "
-                            f"p2_only_batches={p2_only_batches} (potential inefficiency if >0)"
-                        )
-                    # Flush remaining buffer
-                    if self._buffer:
-                        batch = self._prepare_batch()
-                        batches_emitted += 1
-                        await self.q_to_inference.put(batch)
-                        logger.info(
-                            f"[TileBatcher] Emitted final batch #{batches_emitted}: "
-                            f"{len(batch.metas)} frames, {batch.all_tiles.shape[0]} tiles"
-                        )
+                    # Log pass composition summary
+                    timings_logger.info(
+                        f"[TileBatcher] COMPOSITION: p1_frames={total_p1_frames} ({p1_batches} batches), "
+                        f"p2_frames={total_p2_frames} ({p2_batches} batches)"
+                    )
                     
                     # Send pass-1 EOS if not already sent
                     if not self._pass1_eos_sent:
@@ -597,71 +668,120 @@ class TileBatcher:
                         EndOfStream(stream="tiled_pass_2", producer="TileBatcher")
                     )
                     break
+                
+                # --- Flush remaining buffers at termination ---
+                if all_done and no_pending:
+                    # Flush pass-1 buffer first (pass-2 might still be trickling)
+                    if self._buffer_pass1:
+                        emit_start = time.perf_counter()
+                        batch, frames_taken = self._prepare_batch_from_buffer(self._buffer_pass1, is_pass2=False)
+                        self._remove_from_buffer(self._buffer_pass1, frames_taken, is_pass2=False)
+                        
+                        await self.q_to_inference.put(batch)
+                        batches_emitted += 1
+                        p1_batches += 1
+                        total_p1_frames += frames_taken
+                        total_batch_emit_time += time.perf_counter() - emit_start
+                        logger.info(
+                            f"[TileBatcher] Emitted final pass-1 batch #{batches_emitted}: "
+                            f"{len(batch.metas)} frames, {batch.all_tiles.shape[0]} tiles"
+                        )
+                    
+                    # Then flush pass-2 buffer
+                    if self._buffer_pass2:
+                        emit_start = time.perf_counter()
+                        batch, frames_taken = self._prepare_batch_from_buffer(self._buffer_pass2, is_pass2=True)
+                        self._remove_from_buffer(self._buffer_pass2, frames_taken, is_pass2=True)
+                        
+                        await self.q_to_inference.put(batch)
+                        batches_emitted += 1
+                        p2_batches += 1
+                        total_p2_frames += frames_taken
+                        total_batch_emit_time += time.perf_counter() - emit_start
+                        logger.info(
+                            f"[TileBatcher] Emitted final pass-2 batch #{batches_emitted}: "
+                            f"{len(batch.metas)} frames, {batch.all_tiles.shape[0]} tiles"
+                        )
+                    continue
 
-                # --- Warmup phase: wait for buffer to fill ---
+                # --- Warmup phase: wait for pass-1 buffer to fill ---
                 if not warmup_complete:
-                    total_ready = len(self._buffer) + len(self._pending_tiles)
+                    total_ready = len(self._buffer_pass1) + len(self._pending_tiles)
                     if total_ready >= warmup_frames or self._decoder_done:
                         warmup_complete = True
                         timings_logger.debug(
-                            f"[TileBatcher] Warmup complete: {len(self._buffer)} frames ready, "
-                            f"{len(self._pending_tiles)} pending"
+                            f"[TileBatcher] Warmup complete: {len(self._buffer_pass1)} pass-1 frames ready, "
+                            f"{len(self._buffer_pass2)} pass-2 frames, {len(self._pending_tiles)} pending"
                         )
-                    else:
-                        # Still warming up - don't emit, just collect more frames
-                        # Continue to the fetch section below
-                        pass
                 
-                # --- Calculate current tiles in buffer ---
-                buffer_tiles = sum(entry["tiles"].shape[0] for entry in self._buffer) if self._buffer else 0
-                max_tiles = getattr(self.cfg, "max_tiles_per_batch", 80)
+                # --- Emit batches with PRIORITY: pass-2 first, then pass-1 ---
+                # This ensures pass-2 frames (which complete the image) get processed quickly
+                # But pass-1 can still flow even when pass-2 output is backed up
+                emitted_this_loop = False
                 
-                # --- Emit batch when full (only after warmup) ---
-                # Emit when: batch_size frames reached OR max_tiles exceeded
-                if warmup_complete and (len(self._buffer) >= self.batch_size or buffer_tiles >= max_tiles):
-                    emit_start = time.perf_counter()
-                    batch = self._prepare_batch()
-                    n_frames = len(batch.metas)  # Actual frames in batch (after max_tiles limit)
-                    n_tiles = batch.all_tiles.shape[0]
-                    # Get batch composition (p1/p2)
-                    p1_count = getattr(batch, '_p1_count', 0)
-                    p2_count = getattr(batch, '_p2_count', 0)
+                if warmup_complete:
+                    # Try pass-2 first (higher priority, smaller volume)
+                    if self._should_emit_from_buffer(self._buffer_pass2, max_tiles):
+                        emit_start = time.perf_counter()
+                        batch, frames_taken = self._prepare_batch_from_buffer(self._buffer_pass2, is_pass2=True)
+                        self._remove_from_buffer(self._buffer_pass2, frames_taken, is_pass2=True)
+                        
+                        put_start = time.perf_counter()
+                        await self.q_to_inference.put(batch)
+                        put_time = time.perf_counter() - put_start
+                        
+                        emit_time = time.perf_counter() - emit_start
+                        total_batch_emit_time += emit_time
+                        batches_emitted += 1
+                        p2_batches += 1
+                        total_p2_frames += frames_taken
+                        emitted_this_loop = True
+                        
+                        timings_logger.debug(
+                            f"[TileBatcher] Emitted pass-2 batch #{batches_emitted}: {frames_taken} frames, "
+                            f"{batch.all_tiles.shape[0]} tiles, prepare={emit_time-put_time:.3f}s, put={put_time:.3f}s"
+                        )
                     
-                    put_start = time.perf_counter()
-                    await self.q_to_inference.put(batch)
-                    put_time = time.perf_counter() - put_start
-                    
-                    emit_time = time.perf_counter() - emit_start
-                    total_batch_emit_time += emit_time
-                    batches_emitted += 1
-                    
-                    # Track composition totals
-                    total_p1_frames += p1_count
-                    total_p2_frames += p2_count
-                    if p1_count == 0 and p2_count > 0:
-                        p2_only_batches += 1
-                    
-                    # Only show composition if there are pass-2 frames
-                    composition = f", p1={p1_count}/p2={p2_count}" if p2_count > 0 else ""
-                    timings_logger.debug(
-                        f"[TileBatcher] Emitted batch #{batches_emitted}: {n_frames} frames, {n_tiles} tiles{composition}, "
-                        f"reason=full, prepare={emit_time-put_time:.3f}s, put_wait={put_time:.3f}s, "
-                        f"pending={len(self._pending_tiles)}, buffer={len(self._buffer)}"
-                    )
+                    # Then try pass-1 (can flow independently of pass-2)
+                    # This is the KEY deadlock fix: pass-1 doesn't wait for pass-2
+                    elif self._should_emit_from_buffer(self._buffer_pass1, max_tiles):
+                        emit_start = time.perf_counter()
+                        batch, frames_taken = self._prepare_batch_from_buffer(self._buffer_pass1, is_pass2=False)
+                        self._remove_from_buffer(self._buffer_pass1, frames_taken, is_pass2=False)
+                        
+                        put_start = time.perf_counter()
+                        await self.q_to_inference.put(batch)
+                        put_time = time.perf_counter() - put_start
+                        
+                        emit_time = time.perf_counter() - emit_start
+                        total_batch_emit_time += emit_time
+                        batches_emitted += 1
+                        p1_batches += 1
+                        total_p1_frames += frames_taken
+                        emitted_this_loop = True
+                        
+                        timings_logger.debug(
+                            f"[TileBatcher] Emitted pass-1 batch #{batches_emitted}: {frames_taken} frames, "
+                            f"{batch.all_tiles.shape[0]} tiles, prepare={emit_time-put_time:.3f}s, put={put_time:.3f}s"
+                        )
 
                 # --- Fetch more frames if we have capacity ---
                 # Keep fetching while we have room for more in-flight tasks
-                # Also respect buffer size limit to prevent memory accumulation
+                # Buffer limit applies to EACH buffer independently
                 frames_fetched_this_loop = 0
                 max_fetch_per_loop = max_inflight  # Don't spin forever
                 
-                # Check buffer capacity (buffer + pending tiles)
-                total_in_flight = len(self._buffer) + len(self._pending_tiles)
-                buffer_has_space = (self._max_buffer_size == 0 or total_in_flight < self._max_buffer_size)
+                # Check buffer capacity (both buffers + pending tiles)
+                total_p1 = len(self._buffer_pass1)
+                total_p2 = len(self._buffer_pass2)
+                total_pending = len(self._pending_tiles)
+                
+                # Each buffer has its own limit
+                p1_has_space = (self._max_buffer_size == 0 or total_p1 < self._max_buffer_size)
+                p2_has_space = (self._max_buffer_size == 0 or total_p2 < self._max_buffer_size)
                 
                 while (len(self._pending_tiles) < max_inflight and 
-                       frames_fetched_this_loop < max_fetch_per_loop and
-                       buffer_has_space):
+                       frames_fetched_this_loop < max_fetch_per_loop):
                     
                     msg = None
                     is_pass2 = False
@@ -669,8 +789,8 @@ class TileBatcher:
                     # --- First try NON-BLOCKING gets from both queues ---
                     # This avoids wasting 25ms on empty queues
                     
-                    # Prefer pass-2 (from PostProcessor)
-                    if not self._postprocessor_done:
+                    # Prefer pass-2 (from PostProcessor) if buffer has space
+                    if not self._postprocessor_done and p2_has_space:
                         msg = self._try_get_nowait(self.q_from_postprocessor)
                         if msg is not None:
                             is_pass2 = True
@@ -682,8 +802,8 @@ class TileBatcher:
                                 await self.q_to_inference.put(msg)
                                 msg = None
 
-                    # Then pass-1 (from Decoder)
-                    if msg is None and not self._decoder_done:
+                    # Then pass-1 (from Decoder) if buffer has space
+                    if msg is None and not self._decoder_done and p1_has_space:
                         msg = self._try_get_nowait(self.q_from_decoder)
                         if msg is not None:
                             is_pass2 = False
@@ -696,7 +816,7 @@ class TileBatcher:
                                 msg = None
                     
                     # --- If both queues empty, wait briefly on decoder queue ---
-                    if msg is None and not self._decoder_done:
+                    if msg is None and not self._decoder_done and p1_has_space:
                         wait_start = time.perf_counter()
                         msg = await self._pop_one(self.q_from_decoder, self.batch_timeout_s)
                         wait_time = time.perf_counter() - wait_start
@@ -729,110 +849,54 @@ class TileBatcher:
                         frames_submitted += 1
                         
                         # Update buffer capacity check for next iteration
-                        total_in_flight = len(self._buffer) + len(self._pending_tiles)
-                        buffer_has_space = (self._max_buffer_size == 0 or total_in_flight < self._max_buffer_size)
+                        # (pending tiles could be either pass, be conservative)
+                        total_pending = len(self._pending_tiles)
 
-                # --- Timeout flush: emit partial batch if nothing is coming ---
-                # Only flush if:
-                # 1. Warmup is complete
-                # 2. We have frames AND couldn't fetch any new ones AND no pending tiles
-                # 3. AND either: postprocessor is done OR batch is at least 75% full
-                # This prevents tiny batches when S3 fetches are slow/bursty
-                # IMPORTANT: Don't force-flush just because decoder is done - pass 2 frames
-                # may still be coming from PostProcessor transforms. Wait until postprocessor_done.
+                # --- Timeout flush: emit partial batches if nothing is coming ---
+                # Only flush if we couldn't fetch and didn't emit
                 if (warmup_complete and
                     frames_fetched_this_loop == 0 and 
-                    self._buffer and 
+                    not emitted_this_loop and
                     len(self._pending_tiles) == 0):
                     
-                    # Determine if we should flush or wait for more
-                    frame_fullness = len(self._buffer) / self.batch_size
-                    tile_fullness = buffer_tiles / max_tiles
-                    min_flush_ratio = 0.75  # Only flush if at least 75% full
+                    min_flush_ratio = 0.5  # Lower threshold for timeout flush
+                    min_batch = max(4, self.batch_size // 4)  # At least 4 frames
                     
-                    # Check if buffer contains any pass 2 frames
-                    has_pass2_in_buffer = any(entry["second_pass"] for entry in self._buffer)
-                    
-                    # After decoder done but before postprocessor done, be patient with pass 2 frames
-                    # They're still trickling in from transforms - wait for a reasonable batch
-                    if self._decoder_done and not self._postprocessor_done and has_pass2_in_buffer:
-                        # Only flush if we have enough pass 2 frames OR waited too long
-                        min_pass2_batch = max(4, self.batch_size // 4)  # At least 4 frames or 25% of batch
-                        should_flush = (
-                            len(self._buffer) >= min_pass2_batch or
-                            frame_fullness >= min_flush_ratio or
-                            tile_fullness >= min_flush_ratio
-                        )
-                    else:
-                        should_flush = (
-                            self._postprocessor_done or  # All pass 2 frames submitted, flush remaining
-                            self._decoder_done or  # Decoder done and no pass 2 in buffer
-                            frame_fullness >= min_flush_ratio or  # Nearly full by frames
-                            tile_fullness >= min_flush_ratio  # Nearly full by tiles
-                        )
-                    
-                    if should_flush:
+                    # Flush pass-2 if we're past decoder done and have enough frames
+                    if (self._decoder_done and self._buffer_pass2 and 
+                        (len(self._buffer_pass2) >= min_batch or self._postprocessor_done)):
                         emit_start = time.perf_counter()
-                        batch = self._prepare_batch()
-                        n_frames = len(batch.metas)  # Actual frames in batch
-                        n_tiles = batch.all_tiles.shape[0]
-                        # Get batch composition (p1/p2)
-                        p1_count = getattr(batch, '_p1_count', 0)
-                        p2_count = getattr(batch, '_p2_count', 0)
+                        batch, frames_taken = self._prepare_batch_from_buffer(self._buffer_pass2, is_pass2=True)
+                        self._remove_from_buffer(self._buffer_pass2, frames_taken, is_pass2=True)
                         
-                        put_start = time.perf_counter()
                         await self.q_to_inference.put(batch)
-                        put_time = time.perf_counter() - put_start
-                        
-                        emit_time = time.perf_counter() - emit_start
-                        total_batch_emit_time += emit_time
                         batches_emitted += 1
+                        p2_batches += 1
+                        total_p2_frames += frames_taken
+                        total_batch_emit_time += time.perf_counter() - emit_start
                         
-                        # Track composition totals
-                        total_p1_frames += p1_count
-                        total_p2_frames += p2_count
-                        if p1_count == 0 and p2_count > 0:
-                            p2_only_batches += 1
-                        
-                        # Determine flush reason for logging
-                        if self._postprocessor_done:
-                            reason = "postprocessor_done"
-                        elif self._decoder_done and has_pass2_in_buffer:
-                            reason = "pass2_batch_ready"
-                        elif self._decoder_done:
-                            reason = "decoder_done"
-                        else:
-                            reason = "nearly_full"
-                        composition = f", p1={p1_count}/p2={p2_count}" if p2_count > 0 else ""
                         timings_logger.debug(
-                            f"[TileBatcher] Emitted batch #{batches_emitted}: {n_frames} frames, {n_tiles} tiles{composition}, "
-                            f"reason={reason}, prepare={emit_time-put_time:.3f}s, put_wait={put_time:.3f}s"
+                            f"[TileBatcher] Timeout flush pass-2 batch #{batches_emitted}: {frames_taken} frames"
+                        )
+                    
+                    # Flush pass-1 if decoder is done or buffer is reasonably full
+                    elif self._buffer_pass1 and (self._decoder_done or len(self._buffer_pass1) >= min_batch):
+                        emit_start = time.perf_counter()
+                        batch, frames_taken = self._prepare_batch_from_buffer(self._buffer_pass1, is_pass2=False)
+                        self._remove_from_buffer(self._buffer_pass1, frames_taken, is_pass2=False)
+                        
+                        await self.q_to_inference.put(batch)
+                        batches_emitted += 1
+                        p1_batches += 1
+                        total_p1_frames += frames_taken
+                        total_batch_emit_time += time.perf_counter() - emit_start
+                        
+                        timings_logger.debug(
+                            f"[TileBatcher] Timeout flush pass-1 batch #{batches_emitted}: {frames_taken} frames"
                         )
                     else:
-                        # Wait for more frames with blocking timeout (avoid busy-spin)
-                        # This gives decoder/prefetcher time to provide more data
-                        # But only if we have buffer capacity
-                        total_in_flight = len(self._buffer) + len(self._pending_tiles)
-                        if self._max_buffer_size > 0 and total_in_flight >= self._max_buffer_size:
-                            # Buffer is full, don't fetch more - just yield
-                            await asyncio.sleep(0.01)
-                        else:
-                            wait_start = time.perf_counter()
-                            msg = await self._pop_one(self.q_from_decoder, self.batch_timeout_s * 4)  # 100ms wait
-                            total_wait_time += time.perf_counter() - wait_start
-                            
-                            if msg is not None:
-                                if isinstance(msg, EndOfStream) and msg.stream == "prefetched":
-                                    self._decoder_done = True
-                                elif isinstance(msg, PipelineError):
-                                    await self.q_to_inference.put(msg)
-                                elif isinstance(msg, DecodedFrame):
-                                    # Fire off async task that does BOTH binarization and tiling
-                                    task = asyncio.create_task(
-                                        self._tile_frame_async(msg, False)
-                                    )
-                                    self._pending_tiles.append(task)
-                                    frames_submitted += 1
+                        # Nothing to flush, wait a bit to avoid busy spin
+                        await asyncio.sleep(0.01)
 
                 # --- Check if we should send pass-1 EOS ---
                 await self._maybe_emit_pass1_eos()
@@ -842,8 +906,8 @@ class TileBatcher:
                 if loop_count % 100 == 0:
                     logger.debug(
                         f"[TileBatcher] Loop #{loop_count}: {loop_time*1000:.1f}ms, "
-                        f"buffer={len(self._buffer)}, pending={len(self._pending_tiles)}, "
-                        f"submitted={frames_submitted}"
+                        f"p1_buf={len(self._buffer_pass1)}, p2_buf={len(self._buffer_pass2)}, "
+                        f"pending={len(self._pending_tiles)}, submitted={frames_submitted}"
                     )
 
                 # Yield to event loop (allow pending tasks to progress)

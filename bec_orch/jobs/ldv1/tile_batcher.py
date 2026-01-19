@@ -540,7 +540,7 @@ class TileBatcher:
     async def _emit_batch(self, batch: TiledBatch) -> None:
         """Emit a batch to inference queue with tracing."""
         self._trace_batch(batch, "emitted")
-        await self._emit_batch(batch)
+        await self.q_to_inference.put(batch)
 
     # -------------------------------------------------------------------------
     # Queue helpers

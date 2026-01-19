@@ -15,10 +15,12 @@ def enqueue_volumes(
     volumes: Iterable[VolumeRef],
 ) -> int:
     """
-    Send SQS messages for volumes.
+    Send SQS messages for volumes using batch operations.
     
     Each message has format: {'w_id': '...', 'i_id': '...'}
     with message attributes for easy filtering.
+    
+    Uses AWS SQS batch send (up to 10 messages per API call) for better performance.
     
     Args:
         sqs: SQS client
@@ -28,22 +30,24 @@ def enqueue_volumes(
     Returns:
         Count of volumes enqueued
     """
-    count = 0
-    
+    # Prepare all messages first
+    messages = []
     for volume in volumes:
         body = json.dumps({
             'w_id': volume.w_id,
             'i_id': volume.i_id,
         })
-        
-        sqs.send_raw(queue_url, body, w_id=volume.w_id, i_id=volume.i_id)
-        count += 1
-        
-        if count % 100 == 0:
-            logger.info(f"Enqueued {count} volumes...")
+        messages.append((body, volume.w_id, volume.i_id))
     
-    logger.info(f"Enqueued {count} volumes total")
-    return count
+    # Send in batches (much faster than one at a time)
+    if messages:
+        total = len(messages)
+        logger.info(f"Enqueueing {total} volumes in batches...")
+        count = sqs.send_batch(queue_url, messages)
+        logger.info(f"Enqueued {count} volumes total")
+        return count
+    
+    return 0
 
 
 def enqueue_volume_list_from_file(

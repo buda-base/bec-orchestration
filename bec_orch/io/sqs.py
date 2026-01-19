@@ -171,3 +171,76 @@ class SQSClient:
             
         except ClientError as e:
             raise RuntimeError(f"Failed to send SQS message: {e}") from e
+
+    def send_batch(self, queue_url: str, messages: list[tuple[str, Optional[str], Optional[str]]]) -> int:
+        """
+        Send multiple messages to the queue in batches.
+        
+        AWS SQS supports up to 10 messages per batch request.
+        This method will automatically split larger lists into multiple batch requests.
+        
+        Args:
+            queue_url: SQS queue URL
+            messages: List of (body, w_id, i_id) tuples
+                body: Message body (typically JSON string)
+                w_id: Optional work ID (will be added as message attribute)
+                i_id: Optional image group ID (will be added as message attribute)
+                
+        Returns:
+            Total count of messages successfully sent
+        """
+        if not messages:
+            return 0
+        
+        total_sent = 0
+        batch_size = 10  # AWS SQS limit
+        
+        try:
+            # Process messages in batches of 10
+            for i in range(0, len(messages), batch_size):
+                batch = messages[i:i + batch_size]
+                entries = []
+                
+                for idx, (body, w_id, i_id) in enumerate(batch):
+                    entry = {
+                        'Id': str(idx),  # Must be unique within this batch
+                        'MessageBody': body
+                    }
+                    
+                    # Add message attributes if provided
+                    message_attributes = {}
+                    if w_id:
+                        message_attributes['w_id'] = {
+                            'StringValue': w_id,
+                            'DataType': 'String'
+                        }
+                    if i_id:
+                        message_attributes['i_id'] = {
+                            'StringValue': i_id,
+                            'DataType': 'String'
+                        }
+                    
+                    if message_attributes:
+                        entry['MessageAttributes'] = message_attributes
+                    
+                    entries.append(entry)
+                
+                # Send batch
+                response = self.client.send_message_batch(
+                    QueueUrl=queue_url,
+                    Entries=entries
+                )
+                
+                # Check for failures
+                if 'Failed' in response and response['Failed']:
+                    failed_ids = [f['Id'] for f in response['Failed']]
+                    raise RuntimeError(
+                        f"Failed to send {len(failed_ids)} messages in batch: {response['Failed']}"
+                    )
+                
+                total_sent += len(entries)
+            
+            return total_sent
+            
+        except ClientError as e:
+            raise RuntimeError(f"Failed to send batch messages to SQS: {e}") from e

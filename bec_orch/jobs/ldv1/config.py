@@ -1,6 +1,8 @@
-
 from dataclasses import dataclass, field
-from typing import Dict, Literal, Optional, Any
+from typing import Dict, Literal, Optional, Any, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .types_common import FrameTracker
 
 Precision = Literal["fp32", "fp16", "bf16", "auto"]
 
@@ -113,6 +115,10 @@ class PipelineConfig:
     debug_mode: bool = False
     debug_folder: Optional[str] = None  # Local folder path for debug output
     debug_images: Optional[set[str]] = None  # Set of image filenames to debug (None = all images)
+    
+    # Frame tracking (for debugging missing frames)
+    # Set by LDVolumeWorker at volume start; used by ParquetWriter for error reports
+    frame_tracker: Optional["FrameTracker"] = None
     
     # GPU profiling
     enable_pytorch_profiler: bool = False  # Enable PyTorch profiler for GPU timing analysis

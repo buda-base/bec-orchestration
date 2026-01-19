@@ -12,7 +12,7 @@ import cv2
 from functools import lru_cache
 import math
 
-from ..ldv1.types_common import ImageTask, DecodedFrame, FetchedBytesMsg, DecodedFrameMsg, FetchedBytes, PipelineError, EndOfStream
+from ..ldv1.types_common import ImageTask, DecodedFrame, FetchedBytesMsg, DecodedFrameMsg, FetchedBytes, PipelineError, EndOfStream, trace_frame, trace_frame_error
 from ..ldv1.debug_helpers import save_debug_bytes_sync, save_debug_image_sync
 
 # Pre-import PIL at module level (avoid repeated import overhead)
@@ -275,6 +275,7 @@ class Decoder:
                                     f"[Decoder] Decode failed for {original_item.task.img_filename}: "
                                     f"{result.error_type}: {result.message}"
                                 )
+                                trace_frame_error("Decoder", original_item.task.img_filename, f"{result.error_type}: {result.message}")
                                 output_buffer.append(result)
                             else:
                                 # Success
@@ -286,6 +287,7 @@ class Decoder:
                                     )
                                 
                                 # Add to output buffer instead of blocking put
+                                trace_frame("Decoder", "decoded", result.task.img_filename)
                                 output_buffer.append(result)
                             
                         except Exception as e:
@@ -347,6 +349,9 @@ class Decoder:
                         output_buffer.append(msg)  # Errors go through same path
                         error_count += 1
                         continue
+                    
+                    # Trace: frame received for decoding
+                    trace_frame("Decoder", "received", msg.task.img_filename)
                     
                     # Fire off decode in thread pool (returns Future, don't await!)
                     fut = loop.run_in_executor(

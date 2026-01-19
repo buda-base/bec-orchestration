@@ -17,7 +17,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from .types_common import DecodedFrame, PipelineError, EndOfStream, TiledBatch
+from .types_common import DecodedFrame, PipelineError, EndOfStream, TiledBatch, trace_frame, trace_frame_error
 from .img_helpers import adaptive_binarize
 
 logger = logging.getLogger(__name__)
@@ -395,15 +395,21 @@ class TileBatcher:
                     
                     # Check if tiling failed (handled gracefully in _tile_frame_async)
                     if entry.get("failed", False):
+                        dec_frame = entry.get("dec_frame")
+                        if dec_frame:
+                            trace_frame_error("TileBatcher", dec_frame.task.img_filename, str(entry.get("error", "unknown")))
                         failed_entries.append(entry)
                         total_time += entry.get("tile_time", 0.0)
                         continue
                     
                     # Route to appropriate buffer based on pass type
+                    dec_frame = entry["dec_frame"]
                     if entry["second_pass"]:
+                        trace_frame("TileBatcher", "buffered_pass2", dec_frame.task.img_filename, f"buf_size={len(self._buffer_pass2)+1}")
                         self._buffer_pass2.append(entry)
                         completed_p2 += 1
                     else:
+                        trace_frame("TileBatcher", "buffered_pass1", dec_frame.task.img_filename, f"buf_size={len(self._buffer_pass1)+1}")
                         self._buffer_pass1.append(entry)
                         completed_p1 += 1
                     total_time += entry.get("tile_time", 0.0)
@@ -522,6 +528,19 @@ class TileBatcher:
             del self._buffer_pass2[:count]
         else:
             del self._buffer_pass1[:count]
+    
+    def _trace_batch(self, batch: TiledBatch, action: str) -> None:
+        """Trace all frames in a batch."""
+        for meta in batch.metas:
+            dec_frame = meta.get("dec_frame")
+            if dec_frame:
+                pass_str = "pass2" if meta.get("second_pass", False) else "pass1"
+                trace_frame("TileBatcher", f"{action}_{pass_str}", dec_frame.task.img_filename)
+    
+    async def _emit_batch(self, batch: TiledBatch) -> None:
+        """Emit a batch to inference queue with tracing."""
+        self._trace_batch(batch, "emitted")
+        await self._emit_batch(batch)
 
     # -------------------------------------------------------------------------
     # Queue helpers
@@ -736,7 +755,7 @@ class TileBatcher:
                         batch, frames_taken = self._prepare_batch_from_buffer(self._buffer_pass1, is_pass2=False)
                         self._remove_from_buffer(self._buffer_pass1, frames_taken, is_pass2=False)
                         
-                        await self.q_to_inference.put(batch)
+                        await self._emit_batch(batch)
                         batches_emitted += 1
                         p1_batches += 1
                         total_p1_frames += frames_taken
@@ -752,7 +771,7 @@ class TileBatcher:
                         batch, frames_taken = self._prepare_batch_from_buffer(self._buffer_pass2, is_pass2=True)
                         self._remove_from_buffer(self._buffer_pass2, frames_taken, is_pass2=True)
                         
-                        await self.q_to_inference.put(batch)
+                        await self._emit_batch(batch)
                         batches_emitted += 1
                         p2_batches += 1
                         total_p2_frames += frames_taken
@@ -787,7 +806,7 @@ class TileBatcher:
                         self._remove_from_buffer(self._buffer_pass2, frames_taken, is_pass2=True)
                         
                         put_start = time.perf_counter()
-                        await self.q_to_inference.put(batch)
+                        await self._emit_batch(batch)
                         put_time = time.perf_counter() - put_start
                         
                         emit_time = time.perf_counter() - emit_start
@@ -810,7 +829,7 @@ class TileBatcher:
                         self._remove_from_buffer(self._buffer_pass1, frames_taken, is_pass2=False)
                         
                         put_start = time.perf_counter()
-                        await self.q_to_inference.put(batch)
+                        await self._emit_batch(batch)
                         put_time = time.perf_counter() - put_start
                         
                         emit_time = time.perf_counter() - emit_start
@@ -900,6 +919,10 @@ class TileBatcher:
                     
                     # --- Start tiling task (don't await!) ---
                     if isinstance(msg, DecodedFrame):
+                        # Trace: frame received for tiling
+                        pass_str = "pass2" if is_pass2 else "pass1"
+                        trace_frame("TileBatcher", f"received_{pass_str}", msg.task.img_filename)
+                        
                         # Fire off async task that does BOTH binarization and tiling
                         # in thread pool (avoids blocking the event loop)
                         task = asyncio.create_task(
@@ -929,7 +952,7 @@ class TileBatcher:
                         batch, frames_taken = self._prepare_batch_from_buffer(self._buffer_pass2, is_pass2=True)
                         self._remove_from_buffer(self._buffer_pass2, frames_taken, is_pass2=True)
                         
-                        await self.q_to_inference.put(batch)
+                        await self._emit_batch(batch)
                         batches_emitted += 1
                         p2_batches += 1
                         total_p2_frames += frames_taken
@@ -945,7 +968,7 @@ class TileBatcher:
                         batch, frames_taken = self._prepare_batch_from_buffer(self._buffer_pass1, is_pass2=False)
                         self._remove_from_buffer(self._buffer_pass1, frames_taken, is_pass2=False)
                         
-                        await self.q_to_inference.put(batch)
+                        await self._emit_batch(batch)
                         batches_emitted += 1
                         p1_batches += 1
                         total_p1_frames += frames_taken

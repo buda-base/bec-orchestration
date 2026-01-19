@@ -125,3 +125,154 @@ RecordMsg = Union[Record, PipelineError, EndOfStream]
 
 ProgressEvent = Dict[str, Any]
 ProgressHook = Callable[[ProgressEvent], None]
+
+
+# --- Frame Tracking ---------------------------------------------------------
+
+import os
+import logging
+import threading
+import time
+from dataclasses import dataclass as dc_dataclass, field as dc_field
+
+_trace_logger = logging.getLogger("bec.frame_trace")
+_FRAME_TRACE_ENABLED = os.environ.get("BEC_FRAME_TRACE", "0") == "1"
+
+
+@dc_dataclass
+class FrameState:
+    """State of a single frame in the pipeline."""
+    last_step: str
+    error: Optional[str] = None
+
+
+class FrameTracker:
+    """
+    Thread-safe tracker for frame progress through the pipeline.
+    
+    Each stage calls tracker.touch(filename, step) when it processes a frame.
+    At the end, missing frames can be reported with their last known step.
+    
+    Usage:
+        tracker = FrameTracker()
+        tracker.touch("image001.jpg", "Decoder.received")
+        tracker.touch("image001.jpg", "Decoder.decoded")
+        tracker.touch("image001.jpg", "TileBatcher.buffered_pass1")
+        ...
+        # At end, get report for missing frames
+        report = tracker.get_missing_report(expected_filenames, received_filenames)
+    """
+    
+    def __init__(self):
+        self._states: Dict[str, FrameState] = {}
+        self._lock = threading.Lock()
+    
+    def touch(self, filename: str, step: str) -> None:
+        """Update the last step for a frame. Thread-safe."""
+        with self._lock:
+            if filename not in self._states:
+                self._states[filename] = FrameState(step)
+            else:
+                self._states[filename].last_step = step
+        
+        # Also log if tracing is enabled
+        if _FRAME_TRACE_ENABLED:
+            _trace_logger.warning(f"[TRACE] {time.time():.3f} | {step:40s} | {filename}")
+    
+    def error(self, filename: str, step: str, error_msg: str) -> None:
+        """Record an error for a frame. Thread-safe."""
+        with self._lock:
+            self._states[filename] = FrameState(step, error_msg)
+        
+        # Also log if tracing is enabled
+        if _FRAME_TRACE_ENABLED:
+            _trace_logger.error(f"[TRACE] {time.time():.3f} | {step:40s} | {filename} | ERROR: {error_msg}")
+    
+    def get_state(self, filename: str) -> Optional[FrameState]:
+        """Get the current state of a frame. Thread-safe."""
+        with self._lock:
+            return self._states.get(filename)
+    
+    def get_last_step(self, filename: str) -> str:
+        """Get just the last step for a frame, or 'never_seen'."""
+        with self._lock:
+            state = self._states.get(filename)
+            return state.last_step if state else "never_seen"
+    
+    def get_missing_info(self, missing_filenames: Iterable[str]) -> Dict[str, FrameState]:
+        """
+        Get state info for a set of missing filenames.
+        
+        Returns dict mapping filename -> FrameState (or None if never seen).
+        """
+        with self._lock:
+            return {f: self._states.get(f) for f in missing_filenames}
+    
+    def get_missing_report(self, expected: Iterable[str], received: Iterable[str], max_items: int = 10) -> str:
+        """
+        Generate a human-readable report of missing frames with their last known steps.
+        """
+        missing = set(expected) - set(received)
+        if not missing:
+            return "No missing frames"
+        
+        with self._lock:
+            lines = []
+            for f in sorted(missing)[:max_items]:
+                state = self._states.get(f)
+                if state:
+                    if state.error:
+                        lines.append(f"  {f}: last_step={state.last_step}, error={state.error}")
+                    else:
+                        lines.append(f"  {f}: last_step={state.last_step}")
+                else:
+                    lines.append(f"  {f}: never_seen (not in manifest or fetch failed silently)")
+            
+            if len(missing) > max_items:
+                lines.append(f"  ... and {len(missing) - max_items} more")
+            
+            return "\n".join(lines)
+
+
+# Global tracker instance - will be replaced per-volume by LDVolumeWorker
+_global_tracker: Optional[FrameTracker] = None
+
+
+def get_tracker() -> Optional[FrameTracker]:
+    """Get the current frame tracker (if set)."""
+    return _global_tracker
+
+
+def set_tracker(tracker: Optional[FrameTracker]) -> None:
+    """Set the current frame tracker."""
+    global _global_tracker
+    _global_tracker = tracker
+
+
+# Convenience functions that use the global tracker
+def trace_frame(stage: str, action: str, filename: str, extra: str = "") -> None:
+    """
+    Update frame tracker and optionally log (if BEC_FRAME_TRACE=1).
+    
+    This is the main function stages should call to track frame progress.
+    """
+    step = f"{stage}.{action}"
+    tracker = _global_tracker
+    if tracker:
+        tracker.touch(filename, step)
+    elif _FRAME_TRACE_ENABLED:
+        # No tracker but tracing enabled - just log
+        msg = f"[TRACE] {time.time():.3f} | {step:40s} | {filename}"
+        if extra:
+            msg += f" | {extra}"
+        _trace_logger.warning(msg)
+
+
+def trace_frame_error(stage: str, filename: str, error: str) -> None:
+    """Record an error for a frame in the tracker."""
+    step = f"{stage}.error"
+    tracker = _global_tracker
+    if tracker:
+        tracker.error(filename, step, error)
+    elif _FRAME_TRACE_ENABLED:
+        _trace_logger.error(f"[TRACE] {time.time():.3f} | {step:40s} | {filename} | ERROR: {error}")

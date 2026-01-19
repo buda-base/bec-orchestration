@@ -40,6 +40,11 @@ class LDVolumeWorker:
         self.volume_task: VolumeTask = volume_task
         self.s3ctx: Optional[S3Context] = s3ctx
 
+        # Create frame tracker for this volume and set it globally + on config
+        self._frame_tracker = FrameTracker()
+        set_tracker(self._frame_tracker)
+        cfg.frame_tracker = self._frame_tracker
+
         # Queues
         self.q_prefetcher_to_decoder: asyncio.Queue[FetchedBytesMsg] = asyncio.Queue(maxsize=cfg.max_q_prefetcher_to_decoder)
         self.q_decoder_to_tilebatcher: asyncio.Queue[DecodedFrameMsg] = asyncio.Queue(maxsize=cfg.max_q_decoder_to_tilebatcher)
@@ -130,6 +135,9 @@ class LDVolumeWorker:
         with contextlib.suppress(Exception):
             await asyncio.gather(*self._tasks, return_exceptions=True)
         self._tasks = []
+        
+        # Clear global frame tracker to prevent memory leaks between volumes
+        set_tracker(None)
     
     async def _try_graceful_writer_flush(
         self,

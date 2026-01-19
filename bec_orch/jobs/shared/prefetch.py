@@ -118,6 +118,10 @@ class BasePrefetcher:
             if isinstance(msg, FetchedBytes):
                 fetched += 1
                 total_bytes += len(msg.file_bytes)
+                trace_frame("Prefetcher", "fetched", msg.task.img_filename)
+            elif isinstance(msg, PipelineError):
+                errors += 1
+                trace_frame_error("Prefetcher", msg.task.img_filename if msg.task else "unknown", f"{msg.error_type}: {msg.message}")
             else:
                 errors += 1
             

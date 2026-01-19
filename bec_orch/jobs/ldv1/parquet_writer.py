@@ -348,6 +348,7 @@ class ParquetWriter:
                     # Track received filename
                     img_filename = getattr(getattr(msg, "task", None), "img_filename", None)
                     if img_filename:
+                        trace_frame("ParquetWriter", "received_error", img_filename, f"stage={msg.stage}, type={msg.error_type}")
                         self._received_filenames.add(img_filename)
                     
                     # Write error summary row to Parquet + full JSONL record
@@ -371,6 +372,7 @@ class ParquetWriter:
                     )
                 else:
                     # Record - track received filename
+                    trace_frame("ParquetWriter", "received_record", msg.task.img_filename)
                     self._received_filenames.add(msg.task.img_filename)
                     
                     try:
@@ -438,6 +440,7 @@ class ParquetWriter:
         even if it was dropped due to pipeline timeouts or errors.
         
         Also writes these errors to the JSONL sidecar file for visibility in `bec errors show`.
+        Uses the FrameTracker to include the last known step for each missing image.
         
         Returns:
             Number of missing records that were filled.
@@ -449,24 +452,53 @@ class ParquetWriter:
         if not missing:
             return 0
         
-        # Get first few filenames for debugging
+        # Get frame tracker for last step info
+        tracker = self.cfg.frame_tracker
+        
+        # Build sample string with last_step info for log message
         missing_sorted = sorted(missing)
-        sample_filenames = missing_sorted[:3]
-        sample_str = ", ".join(sample_filenames)
-        if len(missing_sorted) > 3:
-            sample_str += f", ... (+{len(missing_sorted) - 3} more)"
+        sample_lines = []
+        for f in missing_sorted[:5]:  # Show up to 5 with step info
+            if tracker:
+                state = tracker.get_state(f)
+                if state:
+                    if state.error:
+                        sample_lines.append(f"{f} (last={state.last_step}, error={state.error})")
+                    else:
+                        sample_lines.append(f"{f} (last={state.last_step})")
+                else:
+                    sample_lines.append(f"{f} (never_seen)")
+            else:
+                sample_lines.append(f)
+        
+        if len(missing_sorted) > 5:
+            sample_lines.append(f"... (+{len(missing_sorted) - 5} more)")
         
         logger.warning(
             f"[ParquetWriter] {len(missing)} records never received. "
-            f"Creating error rows for missing images. "
-            f"Missing: [{sample_str}]"
+            f"Creating error rows for missing images:\n  " + "\n  ".join(sample_lines)
         )
         
         self._ensure_open()
         
-        error_message = "Record never received (likely dropped due to timeout or pipeline error)"
-        
         for filename in sorted(missing):
+            # Get last step from tracker for more informative error message
+            last_step = "unknown"
+            tracker_error = None
+            if tracker:
+                state = tracker.get_state(filename)
+                if state:
+                    last_step = state.last_step
+                    tracker_error = state.error
+                else:
+                    last_step = "never_seen"
+            
+            # Build error message with last step info
+            if tracker_error:
+                error_message = f"Dropped at {last_step}: {tracker_error}"
+            else:
+                error_message = f"Lost after {last_step} (no downstream receipt)"
+            
             # Create a synthetic error row for the Parquet file
             row = {
                 "img_file_name": filename,

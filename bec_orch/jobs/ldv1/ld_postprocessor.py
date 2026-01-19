@@ -1,7 +1,7 @@
 
 import asyncio
 import traceback
-from .types_common import DecodedFrame, Record, InferredFrame, PipelineError, EndOfStream
+from .types_common import DecodedFrame, Record, InferredFrame, PipelineError, EndOfStream, trace_frame, trace_frame_error
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 from .img_helpers import apply_transform_1
 from .debug_helpers import should_debug_image, save_debug_image, save_debug_contours
@@ -254,12 +254,15 @@ class LDPostProcessor:
                         continue
 
                     frame: InferredFrame = msg
+                    trace_frame("PostProcessor", "received_pass2", frame.task.img_filename)
                     try:
                         t0 = time.perf_counter()
                         await self._finalize_record(frame)  # cheap path
+                        trace_frame("PostProcessor", "finalized_pass2", frame.task.img_filename)
                         total_p2_time += time.perf_counter() - t0
                         p2_count += 1
                     except Exception as e:
+                        trace_frame_error("PostProcessor", frame.task.img_filename, f"finalize_pass2: {e}")
                         await self._emit_pipeline_error(
                             internal_stage="run.finalize_pass2",
                             exc=e,
@@ -376,6 +379,7 @@ class LDPostProcessor:
                         continue
 
                     frame: InferredFrame = msg
+                    trace_frame("PostProcessor", "received_pass1", frame.task.img_filename)
                     try:
                         t0 = time.perf_counter()
                         needs_pass2, frame_transform_time = await self._handle_pass1(frame)
@@ -383,9 +387,13 @@ class LDPostProcessor:
                         total_p1_time += elapsed
                         p1_count += 1
                         if needs_pass2:
+                            trace_frame("PostProcessor", "needs_pass2", frame.task.img_filename)
                             pass2_submitted += 1
                             transform_time += frame_transform_time
+                        else:
+                            trace_frame("PostProcessor", "finalized_pass1", frame.task.img_filename)
                     except Exception as e:
+                        trace_frame_error("PostProcessor", frame.task.img_filename, f"handle_pass1: {e}")
                         await self._emit_pipeline_error(
                             internal_stage="run.handle_pass1",
                             exc=e,
@@ -544,6 +552,7 @@ class LDPostProcessor:
                 except Exception:
                     pass  # Debug failures shouldn't affect pipeline
             
+            trace_frame("PostProcessor", "transform_done", inf_frame.task.img_filename)
             success = await self._put_with_timeout(
                 self.q_post_processor_to_gpu_pass_2,
                 DecodedFrame(
@@ -561,6 +570,7 @@ class LDPostProcessor:
                 f"DecodedFrame({inf_frame.task.img_filename}, pass2)",
             )
             if not success:
+                trace_frame_error("PostProcessor", inf_frame.task.img_filename, "transform_queue_timeout")
                 # Could not enqueue for pass 2, emit error instead
                 await self._emit_pipeline_error(
                     internal_stage="_do_transform_and_enqueue.queue_timeout",

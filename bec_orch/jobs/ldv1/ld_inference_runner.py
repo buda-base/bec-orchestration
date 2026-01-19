@@ -24,6 +24,8 @@ from .types_common import (
     EndOfStream,
     InferredFrame,
     TiledBatch,
+    trace_frame,
+    trace_frame_error,
 )
 
 logger = logging.getLogger(__name__)
@@ -455,6 +457,8 @@ class LDInferenceRunner:
         )
 
         img_filename = dec_frame.task.img_filename if dec_frame.task else "unknown"
+        pass_str = "pass2" if second_pass else "pass1"
+        
         if second_pass:
             success = await self._put_with_timeout(
                 self.q_gpu_pass_2_to_post_processor,
@@ -472,6 +476,7 @@ class LDInferenceRunner:
         
         # If put failed due to timeout, emit error so frame is tracked
         if not success:
+            trace_frame_error("InferenceRunner", img_filename, f"queue_timeout_{pass_str}")
             await self._emit_pipeline_error(
                 internal_stage="_emit_result.queue_timeout",
                 exc=TimeoutError(f"Could not emit result for {img_filename} after {self._queue_put_timeout_s}s"),
@@ -482,6 +487,8 @@ class LDInferenceRunner:
                 attempt=1,
                 timeout_s=2.0,  # Short timeout for error emission to avoid cascading
             )
+        else:
+            trace_frame("InferenceRunner", f"emitted_{pass_str}", img_filename)
         
         return success
 
@@ -694,6 +701,13 @@ class LDInferenceRunner:
                 elif isinstance(msg, TiledBatch):
                     n_tiles = msg.all_tiles.shape[0]
                     n_frames = len(msg.metas)
+                    
+                    # Trace each frame in the batch
+                    for meta in msg.metas:
+                        dec_frame = meta.get("dec_frame")
+                        if dec_frame:
+                            pass_str = "pass2" if meta.get("second_pass", False) else "pass1"
+                            trace_frame("InferenceRunner", f"received_{pass_str}", dec_frame.task.img_filename)
                     
                     # DOUBLE BUFFERING WITH CUDA STREAMS:
                     # 1. Stage current batch to GPU (H2D stream, non-blocking)

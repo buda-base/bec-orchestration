@@ -247,6 +247,41 @@ class LDPostProcessor:
                         self._p2_done = True
                         p2_eos_time = time.perf_counter() - run_start
                         logger.info(f"[PostProcessor] Received gpu_pass_2 EOS at t={p2_eos_time:.2f}s")
+                        
+                        # CRITICAL: Drain any remaining pass-2 frames from the queue before breaking.
+                        p2_drained = 0
+                        while True:
+                            remaining = self._try_get_nowait(self.q_second)
+                            if remaining is None:
+                                break
+                            if isinstance(remaining, PipelineError):
+                                await self.q_post_processor_to_writer.put(remaining)
+                                continue
+                            if isinstance(remaining, EndOfStream):
+                                continue  # Ignore additional EOS
+                            if isinstance(remaining, InferredFrame):
+                                trace_frame("PostProcessor", "received_pass2", remaining.task.img_filename)
+                                try:
+                                    t0 = time.perf_counter()
+                                    await self._finalize_record(remaining)
+                                    trace_frame("PostProcessor", "finalized_pass2", remaining.task.img_filename)
+                                    total_p2_time += time.perf_counter() - t0
+                                    p2_count += 1
+                                    p2_drained += 1
+                                except Exception as e:
+                                    trace_frame_error("PostProcessor", remaining.task.img_filename, f"finalize_pass2_drain: {e}")
+                                    await self._emit_pipeline_error(
+                                        internal_stage="run.finalize_pass2_drain",
+                                        exc=e,
+                                        task=remaining.task,
+                                        source_etag=remaining.source_etag,
+                                        retryable=False,
+                                        attempt=1,
+                                    )
+                        
+                        if p2_drained > 0:
+                            logger.info(f"[PostProcessor] Drained {p2_drained} remaining pass-2 frames after EOS")
+                        
                         break
 
                     if isinstance(msg, PipelineError):
@@ -365,6 +400,66 @@ class LDPostProcessor:
                             
                             # Wait a bit before checking again (but not too long)
                             await asyncio.sleep(0.05)
+                        
+                        self._pending_transforms.clear()
+                        
+                        # CRITICAL: Drain any remaining pass-1 frames from the queue before breaking.
+                        # The EOS might have arrived before we consumed all queued frames.
+                        drained_count = 0
+                        while True:
+                            remaining_msg = self._try_get_nowait(self.q_first)
+                            if remaining_msg is None:
+                                break
+                            if isinstance(remaining_msg, PipelineError):
+                                await self.q_post_processor_to_writer.put(remaining_msg)
+                                continue
+                            if isinstance(remaining_msg, EndOfStream):
+                                # Another EOS? Shouldn't happen, but ignore
+                                continue
+                            if isinstance(remaining_msg, InferredFrame):
+                                trace_frame("PostProcessor", "received_pass1", remaining_msg.task.img_filename)
+                                try:
+                                    t0 = time.perf_counter()
+                                    needs_pass2, frame_transform_time = await self._handle_pass1(remaining_msg)
+                                    elapsed = time.perf_counter() - t0
+                                    total_p1_time += elapsed
+                                    p1_count += 1
+                                    drained_count += 1
+                                    if needs_pass2:
+                                        trace_frame("PostProcessor", "needs_pass2", remaining_msg.task.img_filename)
+                                        pass2_submitted += 1
+                                        transform_time += frame_transform_time
+                                    else:
+                                        trace_frame("PostProcessor", "finalized_pass1", remaining_msg.task.img_filename)
+                                except Exception as e:
+                                    trace_frame_error("PostProcessor", remaining_msg.task.img_filename, f"handle_pass1_drain: {e}")
+                                    await self._emit_pipeline_error(
+                                        internal_stage="run.handle_pass1_drain",
+                                        exc=e,
+                                        task=remaining_msg.task,
+                                        source_etag=remaining_msg.source_etag,
+                                        retryable=False,
+                                        attempt=1,
+                                    )
+                        
+                        if drained_count > 0:
+                            logger.info(f"[PostProcessor] Drained {drained_count} remaining pass-1 frames after EOS")
+                        
+                        # Now wait for any NEW transforms we just created during draining
+                        pending_after_drain = [t for t in self._pending_transforms if not t.done()]
+                        if pending_after_drain:
+                            logger.debug(f"[PostProcessor] Waiting for {len(pending_after_drain)} transforms created during drain")
+                            try:
+                                await asyncio.wait_for(
+                                    asyncio.gather(*pending_after_drain, return_exceptions=True),
+                                    timeout=self._transform_gather_timeout_s
+                                )
+                            except asyncio.TimeoutError:
+                                logger.warning(f"[PostProcessor] Timeout waiting for {len(pending_after_drain)} drain transforms")
+                                for t in pending_after_drain:
+                                    if not t.done():
+                                        t.cancel()
+                                await asyncio.gather(*pending_after_drain, return_exceptions=True)
                         
                         self._pending_transforms.clear()
                         

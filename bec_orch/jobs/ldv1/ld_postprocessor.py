@@ -340,14 +340,24 @@ class LDPostProcessor:
                             # Check timeout
                             elapsed = time.perf_counter() - wait_start
                             if elapsed > wait_timeout:
+                                # Log which transforms are being cancelled
+                                cancelled_count = len(pending)
                                 logger.error(
-                                    f"[PostProcessor] Timeout waiting for {len(pending)} transforms after {elapsed:.1f}s. "
-                                    f"Cancelling remaining and emitting errors."
+                                    f"[PostProcessor] Timeout waiting for {cancelled_count} transforms after {elapsed:.1f}s. "
+                                    f"Cancelling remaining - errors will be emitted via CancelledError handlers."
                                 )
                                 for t in pending:
                                     t.cancel()
-                                # Give cancelled tasks a chance to clean up
-                                await asyncio.gather(*pending, return_exceptions=True)
+                                # Give cancelled tasks a chance to run their CancelledError handlers
+                                # which will emit PipelineError via put_nowait
+                                results = await asyncio.gather(*pending, return_exceptions=True)
+                                # Log summary of cancellation results
+                                n_cancelled = sum(1 for r in results if isinstance(r, asyncio.CancelledError))
+                                n_errors = sum(1 for r in results if isinstance(r, Exception) and not isinstance(r, asyncio.CancelledError))
+                                logger.info(
+                                    f"[PostProcessor] Transform cancellation complete: "
+                                    f"{n_cancelled} cancelled, {n_errors} other errors"
+                                )
                                 break
                             
                             # Wait a bit before checking again (but not too long)
@@ -561,8 +571,37 @@ class LDPostProcessor:
                     attempt=1,
                 )
         except asyncio.CancelledError:
-            # Task was cancelled (e.g., due to timeout) - just re-raise
-            raise
+            # Task was cancelled (e.g., due to timeout during EOS handling).
+            # CRITICAL: Emit error BEFORE re-raising so the frame is tracked, not silently lost!
+            # 
+            # NOTE: We use put_nowait to avoid async operations during cancellation,
+            # which can be unreliable. If the queue is full, we fall back to logging.
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.warning(
+                f"[PostProcessor] Transform cancelled for {inf_frame.task.img_filename} "
+                "(likely timeout during EOS). Emitting error."
+            )
+            err = PipelineError(
+                stage="LDPostProcessor",
+                task=inf_frame.task,
+                source_etag=inf_frame.source_etag,
+                error_type="CancelledError",
+                message=f"Transform cancelled (timeout) for {inf_frame.task.img_filename}",
+                traceback=None,
+                retryable=True,  # Retryable since it was just a timeout
+                attempt=1,
+            )
+            try:
+                # Use non-blocking put to avoid async issues during cancellation
+                self.q_post_processor_to_writer.put_nowait(err)
+            except asyncio.QueueFull:
+                # Queue is full - log prominently so we know the frame was lost
+                logger.error(
+                    f"[PostProcessor] DROPPED: Could not emit error for cancelled transform "
+                    f"(queue full): {inf_frame.task.img_filename}"
+                )
+            raise  # Still re-raise to let asyncio handle cancellation properly
         except Exception as e:
             # Transform failed - emit error to writer so this image is tracked
             await self._emit_pipeline_error(

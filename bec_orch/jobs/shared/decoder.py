@@ -6,7 +6,7 @@ import io
 import logging
 import os
 import time
-from typing import Tuple, Optional
+from typing import Tuple, Optional, Union
 import numpy as np
 import cv2
 from functools import lru_cache
@@ -189,11 +189,32 @@ class Decoder:
         decoded = DecodedFrame(task=item.task, source_etag=item.source_etag, orig_h=orig_h, orig_w=orig_w, frame=frame, is_binary=is_binary, first_pass=True, rotation_angle=None, tps_data=None)
         return decoded
 
-    def _decode_one_with_timing(self, item: FetchedBytes) -> Tuple[DecodedFrame, float, FetchedBytes]:
-        """Decode and return (result, decode_time_seconds, original_item)."""
+    def _decode_one_with_timing(self, item: FetchedBytes) -> Tuple[Union[DecodedFrame, PipelineError], float, FetchedBytes]:
+        """
+        Decode and return (result, decode_time_seconds, original_item).
+        
+        On error, returns a PipelineError instead of raising, so the caller
+        can track the failed frame and emit it to downstream stages.
+        """
+        import traceback as tb_mod
         t0 = time.perf_counter()
-        result = self._decode_one(item)
-        return result, time.perf_counter() - t0, item
+        try:
+            result = self._decode_one(item)
+            return result, time.perf_counter() - t0, item
+        except Exception as e:
+            decode_time = time.perf_counter() - t0
+            tb_str = tb_mod.format_exc()
+            error = PipelineError(
+                stage="Decoder",
+                task=item.task,
+                source_etag=item.source_etag,
+                error_type=type(e).__name__,
+                message=str(e),
+                traceback=tb_str,
+                retryable=False,
+                attempt=1,
+            )
+            return error, decode_time, item
 
     async def run(self) -> None:
         """
@@ -244,21 +265,33 @@ class Decoder:
                 for fut in pending_futures:
                     if fut.done():
                         try:
-                            decoded, decode_time, original_item = fut.result()
+                            result, decode_time, original_item = fut.result()
                             total_decode_time += decode_time
-                            decoded_count += 1
                             
-                            if decode_time > 0.5:
-                                timings_logger.warning(
-                                    f"[Decoder] Slow decode: {decoded.task.img_filename} took {decode_time:.2f}s"
+                            if isinstance(result, PipelineError):
+                                # Decode failed - emit the error so downstream tracks the frame
+                                error_count += 1
+                                logger.error(
+                                    f"[Decoder] Decode failed for {original_item.task.img_filename}: "
+                                    f"{result.error_type}: {result.message}"
                                 )
-                            
-                            # Add to output buffer instead of blocking put
-                            output_buffer.append(decoded)
+                                output_buffer.append(result)
+                            else:
+                                # Success
+                                decoded_count += 1
+                                
+                                if decode_time > 0.5:
+                                    timings_logger.warning(
+                                        f"[Decoder] Slow decode: {result.task.img_filename} took {decode_time:.2f}s"
+                                    )
+                                
+                                # Add to output buffer instead of blocking put
+                                output_buffer.append(result)
                             
                         except Exception as e:
+                            # Unexpected error from the future itself (not from decode)
                             error_count += 1
-                            logger.error(f"[Decoder] Decode failed: {e}")
+                            logger.error(f"[Decoder] Unexpected error from decode future: {e}", exc_info=True)
                     else:
                         still_pending.append(fut)
                 pending_futures = still_pending

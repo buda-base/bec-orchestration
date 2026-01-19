@@ -430,8 +430,12 @@ class LDInferenceRunner:
             )
             return False
 
-    async def _emit_result(self, meta: Dict[str, Any], mask_np: np.ndarray) -> None:
-        """Emit InferredFrame to appropriate output queue."""
+    async def _emit_result(self, meta: Dict[str, Any], mask_np: np.ndarray) -> bool:
+        """
+        Emit InferredFrame to appropriate output queue.
+        
+        Returns True if successful, False if the put timed out (frame will be lost).
+        """
         dec_frame: DecodedFrame = meta["dec_frame"]
         second_pass: bool = meta["second_pass"]
 
@@ -452,19 +456,34 @@ class LDInferenceRunner:
 
         img_filename = dec_frame.task.img_filename if dec_frame.task else "unknown"
         if second_pass:
-            await self._put_with_timeout(
+            success = await self._put_with_timeout(
                 self.q_gpu_pass_2_to_post_processor,
                 out,
                 "q_gpu_pass_2_to_post_processor",
                 f"InferredFrame({img_filename}, pass2)",
             )
         else:
-            await self._put_with_timeout(
+            success = await self._put_with_timeout(
                 self.q_gpu_pass_1_to_post_processor,
                 out,
                 "q_gpu_pass_1_to_post_processor",
                 f"InferredFrame({img_filename}, pass1)",
             )
+        
+        # If put failed due to timeout, emit error so frame is tracked
+        if not success:
+            await self._emit_pipeline_error(
+                internal_stage="_emit_result.queue_timeout",
+                exc=TimeoutError(f"Could not emit result for {img_filename} after {self._queue_put_timeout_s}s"),
+                lane_second_pass=second_pass,
+                task=dec_frame.task,
+                source_etag=dec_frame.source_etag,
+                retryable=False,
+                attempt=1,
+                timeout_s=2.0,  # Short timeout for error emission to avoid cascading
+            )
+        
+        return success
 
     # -------------------------------------------------------------------------
     # Batch processing with CUDA streams

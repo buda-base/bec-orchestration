@@ -585,6 +585,9 @@ class TileBatcher:
         - PostProcessor receives gpu_pass_1 EOS, can finish pass-1 processing
         - PostProcessor sends transformed_pass_1 EOS back to TileBatcher
         - TileBatcher can now finish
+        
+        CRITICAL: Must also check that no pass-1 tiles are pending in the thread pool!
+        Otherwise, pending tiles could complete and emit AFTER the EOS.
         """
         if self._pass1_eos_sent:
             return
@@ -593,6 +596,16 @@ class TileBatcher:
         
         # Check if any frames in pass-1 buffer (now separate from pass-2)
         if self._buffer_pass1:
+            return
+        
+        # CRITICAL: Check if any pending tiles could be pass-1 tiles.
+        # We can't know for sure until they complete, so if ANY tiles are pending
+        # and we haven't sent pass-1 EOS yet, we must wait.
+        # This prevents the race where pass-1 tiles complete after EOS is sent.
+        if self._pending_tiles:
+            # Check if any pending tiles are definitely pass-1 (not yet determinable)
+            # OR if there are any pending at all, be conservative and wait.
+            # Once they complete, they'll go to buffer_pass1 or buffer_pass2.
             return
 
         await self.q_to_inference.put(

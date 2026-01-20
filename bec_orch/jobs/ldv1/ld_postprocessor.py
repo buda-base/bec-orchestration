@@ -214,7 +214,7 @@ class LDPostProcessor:
                 q1_remaining = self.q_first.qsize()
                 q2_remaining = self.q_second.qsize()
                 if q1_remaining > 0 or q2_remaining > 0:
-                    logger.error(
+                    logger.warning(
                         f"[PostProcessor] EXITING WITH FRAMES IN QUEUES! "
                         f"q_first={q1_remaining}, q_second={q2_remaining}"
                     )
@@ -256,7 +256,7 @@ class LDPostProcessor:
                         self._p2_done = True
                         p2_eos_time = time.perf_counter() - run_start
                         q2_size = self.q_second.qsize()
-                        logger.warning(
+                        logger.info(
                             f"[PostProcessor] === PASS-2 EOS RECEIVED === "
                             f"t={p2_eos_time:.2f}s, q_second.qsize()={q2_size}"
                         )
@@ -347,7 +347,7 @@ class LDPostProcessor:
                         self._p1_done = True
                         p1_eos_time = time.perf_counter() - run_start
                         q1_size = self.q_first.qsize()
-                        logger.warning(
+                        logger.info(
                             f"[PostProcessor] === PASS-1 EOS RECEIVED === "
                             f"t={p1_eos_time:.2f}s, q_first.qsize()={q1_size}, "
                             f"pending_transforms={len(self._pending_transforms)}"

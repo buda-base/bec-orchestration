@@ -210,6 +210,15 @@ class LDPostProcessor:
             
             # Terminate only after both GPU streams have ended.
             if self._p1_done and self._p2_done:
+                # Check if there are any frames still in queues (should be 0!)
+                q1_remaining = self.q_first.qsize()
+                q2_remaining = self.q_second.qsize()
+                if q1_remaining > 0 or q2_remaining > 0:
+                    logger.error(
+                        f"[PostProcessor] EXITING WITH FRAMES IN QUEUES! "
+                        f"q_first={q1_remaining}, q_second={q2_remaining}"
+                    )
+                
                 run_time = time.perf_counter() - run_start
                 avg_p1 = total_p1_time / max(1, p1_count)
                 avg_p2 = total_p2_time / max(1, p2_count)
@@ -246,7 +255,11 @@ class LDPostProcessor:
                     if isinstance(msg, EndOfStream) and msg.stream == "gpu_pass_2":
                         self._p2_done = True
                         p2_eos_time = time.perf_counter() - run_start
-                        logger.info(f"[PostProcessor] Received gpu_pass_2 EOS at t={p2_eos_time:.2f}s")
+                        q2_size = self.q_second.qsize()
+                        logger.warning(
+                            f"[PostProcessor] === PASS-2 EOS RECEIVED === "
+                            f"t={p2_eos_time:.2f}s, q_second.qsize()={q2_size}"
+                        )
                         
                         # CRITICAL: Drain any remaining pass-2 frames from the queue before breaking.
                         queue_size_p2 = self.q_second.qsize()
@@ -333,7 +346,12 @@ class LDPostProcessor:
                     if isinstance(msg, EndOfStream) and msg.stream == "gpu_pass_1":
                         self._p1_done = True
                         p1_eos_time = time.perf_counter() - run_start
-                        logger.info(f"[PostProcessor] Received gpu_pass_1 EOS at t={p1_eos_time:.2f}s")
+                        q1_size = self.q_first.qsize()
+                        logger.warning(
+                            f"[PostProcessor] === PASS-1 EOS RECEIVED === "
+                            f"t={p1_eos_time:.2f}s, q_first.qsize()={q1_size}, "
+                            f"pending_transforms={len(self._pending_transforms)}"
+                        )
                         
                         # Wait for all pending transforms to complete before sending EOS.
                         # CRITICAL: We must also drain pass-2 during this wait to prevent deadlock!

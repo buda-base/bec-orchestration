@@ -37,3 +37,11 @@ segmentation_models_pytorch # for line segmentation
 
 pyvips==3.1.1
 pyvips[binary]
+opencv-python
+pyarrow
+s3fs
+boto3
+psycopg[binary]
+onnxruntime
+pyewts
+pyctcdecode @ git+https://github.com/tz579/pyctcdecode@5964a111f0ea1d059b711c7cbae701d91e2e7b82

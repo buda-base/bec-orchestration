@@ -8,7 +8,7 @@ _GLOBAL_BLANK_SIGN = "<blk>"
 
 
 # Beam width for CTC decoding (default pyctcdecode is 100, but 20 is usually sufficient)
-BEAM_WIDTH = 20
+BEAM_WIDTH = 50
 
 
 def _init_global_decoder(vocab: list[str]) -> None:

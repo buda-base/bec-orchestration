@@ -656,7 +656,7 @@ class AsyncOCRPipeline:
             initializer=init_worker_process,
             initargs=(self.ctc_decoder.ctc_vocab,),
         )
-        batch_size = 16  # Decode this many pages at once
+        batch_size = 4  # Decode this many pages at once (smaller = less latency)
         pending_pages: list[InferredPage] = []
         pages_received = 0
 

@@ -25,7 +25,7 @@ import numpy.typing as npt
 if TYPE_CHECKING:
     pass
 
-from .ctc_decoder import CTCDecoder, decode_logits_beam_search
+from .ctc_decoder import CTCDecoder, decode_logits_beam_search, init_worker_process
 from .line import get_line_image
 from .model import OCRModel
 from .parquet_writer import StreamingParquetWriter
@@ -150,7 +150,12 @@ class AsyncOCRPipeline:
         # Thread pool for image processing (cv2 releases GIL)
         self._image_executor = ThreadPoolExecutor(max_workers=image_processor_workers, thread_name_prefix="img")
         # Process pool for CTC decoding (bypasses GIL for true parallelism)
-        self._ctc_executor = ProcessPoolExecutor(max_workers=ctc_workers)
+        # Use initializer to build decoder once per worker process
+        self._ctc_executor = ProcessPoolExecutor(
+            max_workers=ctc_workers,
+            initializer=init_worker_process,
+            initargs=(ctc_decoder.ctc_vocab,),
+        )
 
         logger.info(
             f"Pipeline config: prefetch={prefetch_concurrency}, img_workers={image_processor_workers}, ctc_workers={ctc_workers}, gpu_batch={gpu_batch_size}"

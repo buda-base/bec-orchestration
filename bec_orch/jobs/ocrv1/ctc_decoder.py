@@ -17,6 +17,16 @@ def _init_global_decoder(vocab: list[str]) -> None:
         _GLOBAL_VOCAB = vocab
 
 
+def init_worker_process(vocab: list[str]) -> None:
+    """
+    Initializer function for ProcessPoolExecutor workers.
+
+    Called once when each worker process starts, avoiding repeated
+    decoder initialization overhead.
+    """
+    _init_global_decoder(vocab)
+
+
 def decode_logits_beam_search(logits: npt.NDArray, vocab: list[str]) -> str:
     """
     Module-level beam search decode function for use with ProcessPoolExecutor.

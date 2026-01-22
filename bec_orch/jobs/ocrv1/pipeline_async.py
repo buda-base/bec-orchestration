@@ -37,12 +37,14 @@ def _decode_page_for_process_pool(
     logits_list: list[tuple[npt.NDArray, int]],
     vocab: list[str],
     input_width: int,
-) -> list[str]:
+) -> tuple[list[str], float, int]:
     """
     Module-level decode function for ProcessPoolExecutor.
 
     This function can be pickled and sent to worker processes.
+    Returns (texts, decode_time_ms, num_lines).
     """
+    start_time = time.perf_counter()
     texts = []
     vocab_size = len(vocab)
 
@@ -61,7 +63,8 @@ def _decode_page_for_process_pool(
         text = decode_logits_beam_search(cropped, vocab)
         texts.append(text.strip().replace("§", " "))
 
-    return texts
+    decode_ms = (time.perf_counter() - start_time) * 1000
+    return texts, decode_ms, len(logits_list)
 
 
 @dataclass
@@ -151,12 +154,10 @@ class AsyncOCRPipeline:
         self._image_executor = ThreadPoolExecutor(max_workers=image_processor_workers, thread_name_prefix="img")
         # Process pool for CTC decoding (bypasses GIL for true parallelism)
         # Use initializer to build decoder once per worker process
-        # maxtasksperchild=50 restarts workers periodically to free memory
         self._ctc_executor = ProcessPoolExecutor(
             max_workers=ctc_workers,
             initializer=init_worker_process,
             initargs=(ctc_decoder.ctc_vocab,),
-            max_tasks_per_child=50,
         )
 
         logger.info(
@@ -652,12 +653,16 @@ class AsyncOCRPipeline:
 
                 try:
                     # Use module-level function for ProcessPoolExecutor
-                    texts = await loop.run_in_executor(
+                    texts, decode_ms, num_lines = await loop.run_in_executor(
                         self._ctc_executor,
                         _decode_page_for_process_pool,
                         inferred.logits_list,
                         self.ctc_decoder.ctc_vocab,
                         self.input_width,
+                    )
+
+                    logger.info(
+                        f"[CTCDecoder] Page {inferred.page_idx} decoded {num_lines} lines in {decode_ms:.0f}ms ({decode_ms / max(1, num_lines):.0f}ms/line)"
                     )
 
                     await self.q_results.put(

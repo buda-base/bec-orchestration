@@ -8,6 +8,7 @@ Usage:
 
 The model directory must contain model_config.json with the model configuration.
 """
+
 import gzip
 import json
 import logging
@@ -86,18 +87,18 @@ def main():
     logger.info(f"OCR dest bucket: {ocr_dest_bucket}")
     logger.info(f"Source image bucket: {source_image_bucket}")
 
-    max_images = 10  # Limit for testing
+    # max_images = 10  # Limit for testing
     manifest = get_volume_manifest_from_s3(w_id, i_id, source_image_bucket)
     logger.info(f"Manifest has {len(manifest.manifest)} images, etag={manifest.s3_etag}")
-    
-    # Limit manifest to first N images for testing
-    if max_images and len(manifest.manifest) > max_images:
-        logger.info(f"Limiting to first {max_images} images for testing")
-        manifest = VolumeManifest(
-            manifest=manifest.manifest[:max_images],
-            s3_etag=manifest.s3_etag,
-            last_modified_iso=manifest.last_modified_iso,
-        )
+
+    # # Limit manifest to first N images for testing
+    # if max_images and len(manifest.manifest) > max_images:
+    #     logger.info(f"Limiting to first {max_images} images for testing")
+    #     manifest = VolumeManifest(
+    #         manifest=manifest.manifest[:max_images],
+    #         s3_etag=manifest.s3_etag,
+    #         last_modified_iso=manifest.last_modified_iso,
+    #     )
 
     artifacts_location = ArtifactLocation(
         bucket=ocr_dest_bucket,

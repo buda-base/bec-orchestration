@@ -11,193 +11,15 @@ if TYPE_CHECKING:
 import cv2
 import numpy as np
 import numpy.typing as npt
-import onnxruntime as ort
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pyewts
 import s3fs
 
-from .utils import get_execution_providers
-from pyctcdecode.decoder import build_ctcdecoder
+from .line import get_line_image
+from .model import OCRModel
 
 logger = logging.getLogger(__name__)
-
-
-class OCRInference:
-    def __init__(
-        self,
-        model_file: str,
-        input_width: int,
-        input_height: int,
-        input_layer: str,
-        output_layer: str,
-        charset: str | list[str],
-        squeeze_channel: bool,
-        swap_hw: bool,
-        add_blank: bool,
-    ) -> None:
-        self._onnx_model_file = model_file
-        self._input_width = input_width
-        self._input_height = input_height
-        self._input_layer = input_layer
-        self._output_layer = output_layer
-        self._characters = charset
-        self._squeeze_channel_dim = squeeze_channel
-        self._swap_hw = swap_hw
-        self._add_blank = add_blank
-        self._execution_providers = get_execution_providers()
-        self.ocr_session = ort.InferenceSession(self._onnx_model_file, providers=self._execution_providers)
-
-
-        if isinstance(charset, str):
-            self.charset = list(charset)
-        else:
-            self.charset = charset
-
-        self.ctc_vocab = self.charset.copy()
-        if add_blank and " " not in self.ctc_vocab:
-            self.ctc_vocab.insert(0, " ")
-
-        self.ctc_decoder = build_ctcdecoder(self.ctc_vocab)
-
-    def _pad_ocr_line(
-        self,
-        img: npt.NDArray,
-        padding: str = "black",
-    ) -> npt.NDArray:
-        width_ratio = self._input_width / img.shape[1]
-        height_ratio = self._input_height / img.shape[0]
-
-        if width_ratio < height_ratio:
-            out_img = self._pad_to_width(img, self._input_width, self._input_height, padding)
-        elif width_ratio > height_ratio:
-            out_img = self._pad_to_height(img, self._input_width, self._input_height, padding)
-        else:
-            out_img = self._pad_to_width(img, self._input_width, self._input_height, padding)
-
-        return cv2.resize(
-            out_img,
-            (self._input_width, self._input_height),
-            interpolation=cv2.INTER_LINEAR,
-        )
-
-    def _pad_to_width(
-        self, img: npt.NDArray, target_width: int, target_height: int, padding: str
-    ) -> npt.NDArray:
-        h, w = img.shape[:2]
-        scale = target_width / w
-        new_h = int(h * scale)
-        resized = cv2.resize(img, (target_width, new_h), interpolation=cv2.INTER_LINEAR)
-
-        if new_h >= target_height:
-            return resized
-
-        pad_top = (target_height - new_h) // 2
-        pad_bottom = target_height - new_h - pad_top
-        pad_value = 0 if padding == "black" else 255
-        if len(resized.shape) == 3:
-            padded = np.pad(
-                resized,
-                ((pad_top, pad_bottom), (0, 0), (0, 0)),
-                mode="constant",
-                constant_values=pad_value,
-            )
-        else:
-            padded = np.pad(
-                resized,
-                ((pad_top, pad_bottom), (0, 0)),
-                mode="constant",
-                constant_values=pad_value,
-            )
-        return padded
-
-    def _pad_to_height(
-        self, img: npt.NDArray, target_width: int, target_height: int, padding: str
-    ) -> npt.NDArray:
-        h, w = img.shape[:2]
-        scale = target_height / h
-        new_w = int(w * scale)
-        resized = cv2.resize(img, (new_w, target_height), interpolation=cv2.INTER_LINEAR)
-
-        if new_w >= target_width:
-            return resized
-
-        pad_left = (target_width - new_w) // 2
-        pad_right = target_width - new_w - pad_left
-        pad_value = 0 if padding == "black" else 255
-        if len(resized.shape) == 3:
-            padded = np.pad(
-                resized,
-                ((0, 0), (pad_left, pad_right), (0, 0)),
-                mode="constant",
-                constant_values=pad_value,
-            )
-        else:
-            padded = np.pad(
-                resized,
-                ((0, 0), (pad_left, pad_right)),
-                mode="constant",
-                constant_values=pad_value,
-            )
-        return padded
-
-    def _binarize(self, img: npt.NDArray) -> npt.NDArray:
-        if len(img.shape) == 3:
-            gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
-        else:
-            gray = img
-        _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        if len(img.shape) == 3:
-            return cv2.cvtColor(binary, cv2.COLOR_GRAY2RGB)
-        return binary
-
-    def _prepare_ocr_line(self, image: npt.NDArray) -> npt.NDArray:
-        line_image = self._pad_ocr_line(image)
-        line_image = self._binarize(line_image)
-
-        if len(line_image.shape) == 3:
-            line_image = cv2.cvtColor(line_image, cv2.COLOR_RGB2GRAY)
-
-        line_image = line_image.reshape((1, self._input_height, self._input_width))
-        line_image = (line_image / 127.5) - 1.0
-        return line_image.astype(np.float32)
-
-    def _pre_pad(self, image: npt.NDArray) -> npt.NDArray:
-        h, w = image.shape[:2]
-        if len(image.shape) == 3:
-            c = image.shape[2]
-            patch = np.ones(shape=(h, h, c), dtype=np.uint8) * 255
-        else:
-            patch = np.ones(shape=(h, h), dtype=np.uint8) * 255
-        return np.hstack(tup=[patch, image, patch])
-
-    def _predict(self, image_batch: npt.NDArray) -> npt.NDArray:
-        image_batch = image_batch.astype(np.float32)
-        ort_batch = ort.OrtValue.ortvalue_from_numpy(image_batch)
-        ocr_results = self.ocr_session.run_with_ort_values(
-            [self._output_layer], {self._input_layer: ort_batch}
-        )
-        logits = ocr_results[0].numpy()
-        return np.squeeze(logits)
-
-    def _decode(self, logits: npt.NDArray) -> str:
-        if logits.shape[0] == len(self.ctc_vocab):
-            logits = np.transpose(logits, axes=[1, 0])
-        return self.ctc_decoder.decode(logits).replace(" ", "")
-
-    def run(self, line_image: npt.NDArray, *, pre_pad: bool = True) -> str:
-        if pre_pad:
-            line_image = self._pre_pad(line_image)
-        line_image = self._prepare_ocr_line(line_image)
-
-        if self._swap_hw:
-            line_image = np.transpose(line_image, axes=[0, 2, 1])
-
-        if not self._squeeze_channel_dim:
-            line_image = np.expand_dims(line_image, axis=1)
-
-        logits = self._predict(line_image)
-        return self._decode(logits)
 
 
 def ocr_build_schema() -> pa.Schema:
@@ -301,10 +123,8 @@ class OCRV1JobWorker:
         logger.info(f"  Architecture: {config.get('architecture', 'unknown')}, Version: {config.get('version', 'unknown')}")
         logger.info(f"  Input: {input_width}x{input_height}, Charset length: {len(charset)}")
 
-        self.ocr_inference = OCRInference(
+        self.ocr_model = OCRModel(
             model_file=str(onnx_model_file),
-            input_width=input_width,
-            input_height=input_height,
             input_layer=input_layer,
             output_layer=output_layer,
             charset=charset,
@@ -313,12 +133,15 @@ class OCRV1JobWorker:
             add_blank=add_blank,
         )
 
+        self._input_width = input_width
+        self._input_height = input_height
+
         self.converter = pyewts.pyewts()
-        # TODO: make this configurable
-        self.use_line_prepadding = False
 
         self.ld_bucket = os.environ.get("BEC_LD_BUCKET", "bec.bdrc.io")
         self.source_image_bucket = os.environ.get("BEC_SOURCE_IMAGE_BUCKET", "archive.tbrc.org")
+
+        self._s3 = s3fs.S3FileSystem()
 
         logger.info("OCR model loaded successfully")
 
@@ -380,7 +203,6 @@ class OCRV1JobWorker:
                 for item in ctx.volume_manifest.manifest
                 if item.get("filename")
             }
-            total_images = len(manifest_filenames)
 
             missing_in_parquet = manifest_filenames - parquet_filenames
             if missing_in_parquet:
@@ -389,7 +211,8 @@ class OCRV1JobWorker:
                     f"{sorted(missing_in_parquet)[:5]}{'...' if len(missing_in_parquet) > 5 else ''}"
                 )
 
-            for filename in sorted(manifest_filenames):
+            total_images = len(manifest_filenames)
+            for idx, filename in enumerate(sorted(manifest_filenames), 1):
                 row = parquet_rows_by_filename[filename]
 
                 if not row.get("ok", True):
@@ -398,10 +221,13 @@ class OCRV1JobWorker:
                     )
 
                 try:
+                    logger.info(f"[{idx}/{total_images}] Processing {filename}")
                     result = self._process_image(row, ctx)
                     records.append(result)
+                    nb_lines = len(result.get("texts", []))
+                    logger.info(f"[{idx}/{total_images}] {filename}: {nb_lines} lines recognized")
                 except Exception as e:
-                    logger.warning(f"OCR failed for {filename}: {e}")
+                    logger.warning(f"[{idx}/{total_images}] OCR failed for {filename}: {e}")
                     records.append(self._build_error_record(row, "OCR", type(e).__name__, str(e)))
                     nb_errors += 1
                     errors_by_stage["OCR"] = errors_by_stage.get("OCR", 0) + 1
@@ -486,14 +312,12 @@ class OCRV1JobWorker:
 
     def _check_s3_exists(self, uri: str) -> bool:
         """Check if an S3 object exists."""
-        s3 = s3fs.S3FileSystem()
         s3_path = uri.replace("s3://", "")
-        return s3.exists(s3_path)
+        return self._s3.exists(s3_path)
 
     def _read_input_parquet(self, uri: str) -> pa.Table:
-        s3 = s3fs.S3FileSystem()
         s3_path = uri.replace("s3://", "")
-        with s3.open(s3_path, "rb") as f:
+        with self._s3.open(s3_path, "rb") as f:
             table = pq.read_table(f)
         return table
 
@@ -501,9 +325,8 @@ class OCRV1JobWorker:
         schema = ocr_build_schema()
         table = pa.Table.from_pylist(records, schema=schema)
 
-        s3 = s3fs.S3FileSystem()
         s3_path = uri.replace("s3://", "")
-        with s3.open(s3_path, "wb") as f:
+        with self._s3.open(s3_path, "wb") as f:
             pq.write_table(table, f)
 
         logger.info(f"Wrote {len(records)} records to {uri}")
@@ -512,10 +335,17 @@ class OCRV1JobWorker:
         img_file_name = row.get("img_file_name", "")
         source_etag = row.get("source_etag", "")
         contours = row.get("contours", [])
-        contours_bboxes = row.get("contours_bboxes", [])
 
         image = self._load_image(img_file_name, ctx)
+        logger.debug(f"Loaded image shape={image.shape}, dtype={image.dtype}")
 
+        image = self._transform_image(image, row)
+
+        texts = self._extract_and_ocr_lines(image, contours)
+
+        return self._build_record(img_file_name, source_etag, contours, texts)
+
+    def _transform_image(self, image: npt.NDArray, row: dict) -> npt.NDArray:
         rotation_angle = row.get("rotation_angle")
         if rotation_angle is not None and (np.isnan(rotation_angle) or abs(rotation_angle) < 1e-6):
             rotation_angle = None
@@ -525,28 +355,145 @@ class OCRV1JobWorker:
         if tps_alpha is not None and np.isnan(tps_alpha):
             tps_alpha = None
 
+        logger.debug(f"Applying transforms (rotation={rotation_angle}, tps={tps_points is not None})")
         image = self._apply_transforms(image, rotation_angle, tps_points, tps_alpha)
+        logger.debug(f"Transformed image shape={image.shape}")
+        return image
 
+    def _extract_and_ocr_lines(self, image: npt.NDArray, contours: list) -> list[str]:
+        nb_lines = len(contours)
+        logger.debug(f"Processing {nb_lines} line contours")
+        
         texts = []
-        for idx, bbox in enumerate(contours_bboxes):
-            x = bbox.get("x", 0)
-            y = bbox.get("y", 0)
-            w = bbox.get("w", 0)
-            h = bbox.get("h", 0)
-
-            if w <= 0 or h <= 0:
+        current_k = 1.7  # Adaptive k_factor for morphological operations
+        
+        # Pre-allocate mask buffer (reused for each line)
+        mask_buffer = np.zeros((image.shape[0], image.shape[1]), dtype=np.uint8)
+        
+        for contour_points in contours:
+            line_img, current_k = self._extract_line_from_contour(image, contour_points, current_k, mask_buffer)
+            if line_img is None:
                 texts.append("")
                 continue
 
-            line_img = image[y : y + h, x : x + w]
-            if line_img.size == 0:
-                texts.append("")
-                continue
-
-            text = self.ocr_inference.run(line_img, pre_pad=self.use_line_prepadding)
-            text = text.strip().replace("§", " ")
+            text = self._ocr_line(line_img)
             texts.append(text)
 
+        return texts
+
+    def _extract_line_from_contour(
+        self, image: npt.NDArray, contour_points: list[dict], k_factor: float, mask_buffer: npt.NDArray
+    ) -> tuple[npt.NDArray | None, float]:
+        """Extract line image from contour polygon using mask-based extraction."""
+        if not contour_points:
+            return None, k_factor
+
+        # Convert list of {x, y} dicts to numpy array for cv2
+        pts = np.array([[p["x"], p["y"]] for p in contour_points], dtype=np.int32)
+        
+        # Get bounding box height for adaptive extraction
+        _, _, _, bbox_h = cv2.boundingRect(pts)
+        if bbox_h <= 0:
+            return None, k_factor
+
+        # Clear and reuse mask buffer
+        mask_buffer.fill(0)
+        cv2.drawContours(mask_buffer, [pts], -1, 255, -1)
+
+        # Extract line using morphological mask-based method
+        line_img, adapted_k = get_line_image(image, mask_buffer, bbox_h, bbox_tolerance=3.0, k_factor=k_factor)
+        
+        if line_img.size == 0:
+            return None, adapted_k
+
+        return line_img, adapted_k
+
+    def _ocr_line(self, line_img: npt.NDArray) -> str:
+        """Preprocess line image and run OCR inference."""
+        tensor = self._preprocess_line(line_img)
+        logits = self.ocr_model.predict(tensor)
+        text = self.ocr_model.decode(logits)
+        return text.strip().replace("§", " ")
+
+    def _preprocess_line(self, image: npt.NDArray) -> npt.NDArray:
+        """Convert line image to model input tensor.
+        
+        Steps: pad to aspect ratio -> binarize -> grayscale -> normalize
+        """
+        image = self._pad_to_model_size(image)
+        image = self._binarize(image)
+
+        if len(image.shape) == 3:
+            image = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+
+        image = image.reshape((1, self._input_height, self._input_width))
+        image = (image / 127.5) - 1.0
+        return image.astype(np.float32)
+
+    def _pad_to_model_size(self, img: npt.NDArray, padding: str = "black") -> npt.NDArray:
+        """Resize and pad image to model input dimensions."""
+        width_ratio = self._input_width / img.shape[1]
+        height_ratio = self._input_height / img.shape[0]
+
+        if width_ratio <= height_ratio:
+            img = self._pad_to_width(img, padding)
+        else:
+            img = self._pad_to_height(img, padding)
+
+        return cv2.resize(img, (self._input_width, self._input_height), interpolation=cv2.INTER_LINEAR)
+
+    def _pad_to_width(self, img: npt.NDArray, padding: str) -> npt.NDArray:
+        h, w = img.shape[:2]
+        scale = self._input_width / w
+        new_h = int(h * scale)
+        resized = cv2.resize(img, (self._input_width, new_h), interpolation=cv2.INTER_LINEAR)
+
+        if new_h >= self._input_height:
+            return resized
+
+        pad_top = (self._input_height - new_h) // 2
+        pad_bottom = self._input_height - new_h - pad_top
+        pad_value = 0 if padding == "black" else 255
+
+        if len(resized.shape) == 3:
+            return np.pad(resized, ((pad_top, pad_bottom), (0, 0), (0, 0)), mode="constant", constant_values=pad_value)
+        return np.pad(resized, ((pad_top, pad_bottom), (0, 0)), mode="constant", constant_values=pad_value)
+
+    def _pad_to_height(self, img: npt.NDArray, padding: str) -> npt.NDArray:
+        h, w = img.shape[:2]
+        scale = self._input_height / h
+        new_w = int(w * scale)
+        resized = cv2.resize(img, (new_w, self._input_height), interpolation=cv2.INTER_LINEAR)
+
+        if new_w >= self._input_width:
+            return resized
+
+        pad_left = (self._input_width - new_w) // 2
+        pad_right = self._input_width - new_w - pad_left
+        pad_value = 0 if padding == "black" else 255
+
+        if len(resized.shape) == 3:
+            return np.pad(resized, ((0, 0), (pad_left, pad_right), (0, 0)), mode="constant", constant_values=pad_value)
+        return np.pad(resized, ((0, 0), (pad_left, pad_right)), mode="constant", constant_values=pad_value)
+
+    def _binarize(self, img: npt.NDArray) -> npt.NDArray:
+        if len(img.shape) == 3:
+            gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+        else:
+            gray = img
+        _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        if len(img.shape) == 3:
+            return cv2.cvtColor(binary, cv2.COLOR_GRAY2RGB)
+        return binary
+
+    def _build_record(
+        self,
+        img_file_name: str,
+        source_etag: str,
+        contours: list,
+        texts: list[str],
+    ) -> dict:
+        logger.debug(f"Building output record with {len(texts)} texts")
         return {
             "img_file_name": img_file_name,
             "source_etag": source_etag,
@@ -562,11 +509,9 @@ class OCRV1JobWorker:
         from bec_orch.core.worker_runtime import get_s3_folder_prefix
 
         vol_prefix = get_s3_folder_prefix(ctx.volume.w_id, ctx.volume.i_id)
-        s3_uri = f"s3://{self.source_image_bucket}/{vol_prefix}{img_file_name}"
+        s3_path = f"{self.source_image_bucket}/{vol_prefix}{img_file_name}"
 
-        s3 = s3fs.S3FileSystem()
-        s3_path = s3_uri.replace("s3://", "")
-        with s3.open(s3_path, "rb") as f:
+        with self._s3.open(s3_path, "rb") as f:
             img_bytes = f.read()
 
         img_array = np.frombuffer(img_bytes, dtype=np.uint8)

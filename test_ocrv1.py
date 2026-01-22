@@ -21,9 +21,14 @@ from bec_orch.core.worker_runtime import get_s3_folder_prefix
 from bec_orch.jobs.base import JobContext
 
 logging.basicConfig(
-    level=logging.DEBUG,
+    level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
+logging.getLogger("botocore").setLevel(logging.INFO)
+logging.getLogger("urllib3").setLevel(logging.INFO)
+logging.getLogger("s3fs").setLevel(logging.INFO)
+logging.getLogger("aiobotocore").setLevel(logging.INFO)
+logging.getLogger("fsspec").setLevel(logging.INFO)
 logger = logging.getLogger("test_ocrv1")
 
 
@@ -81,8 +86,18 @@ def main():
     logger.info(f"OCR dest bucket: {ocr_dest_bucket}")
     logger.info(f"Source image bucket: {source_image_bucket}")
 
+    max_images = 10  # Limit for testing
     manifest = get_volume_manifest_from_s3(w_id, i_id, source_image_bucket)
     logger.info(f"Manifest has {len(manifest.manifest)} images, etag={manifest.s3_etag}")
+    
+    # Limit manifest to first N images for testing
+    if max_images and len(manifest.manifest) > max_images:
+        logger.info(f"Limiting to first {max_images} images for testing")
+        manifest = VolumeManifest(
+            manifest=manifest.manifest[:max_images],
+            s3_etag=manifest.s3_etag,
+            last_modified_iso=manifest.last_modified_iso,
+        )
 
     artifacts_location = ArtifactLocation(
         bucket=ocr_dest_bucket,

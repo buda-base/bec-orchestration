@@ -344,7 +344,6 @@ class AsyncOCRPipeline:
 
     def _process_image_sync(self, fetched: FetchedBytes) -> ProcessedPage:
         """Synchronous image processing (runs in thread pool)."""
-        start_time = time.perf_counter()
         ld_row = fetched.ld_row
 
         # Decode image
@@ -392,9 +391,6 @@ class AsyncOCRPipeline:
             original_width = line_img.shape[1]
             tensor = self._preprocess_line(line_img)
             line_tensors.append((tensor, original_width))
-
-        proc_ms = (time.perf_counter() - start_time) * 1000
-        logger.info(f"[ImageProcessor] Page {fetched.page_idx} processed {len(line_tensors)} lines in {proc_ms:.0f}ms")
 
         return ProcessedPage(
             page_idx=fetched.page_idx,

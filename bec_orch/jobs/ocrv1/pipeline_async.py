@@ -25,7 +25,7 @@ import numpy.typing as npt
 if TYPE_CHECKING:
     pass
 
-from .ctc_decoder import CTCDecoder, decode_logits_beam_search, init_worker_process
+from .ctc_decoder import CAN_USE_MP_POOL, CTCDecoder, decode_logits_batch, init_worker_process
 from .line import get_line_image
 from .model import OCRModel
 from .parquet_writer import StreamingParquetWriter
@@ -45,11 +45,11 @@ def _decode_page_for_process_pool(
     Returns (texts, decode_time_ms, num_lines).
     """
     start_time = time.perf_counter()
-    texts = []
     vocab_size = len(vocab)
 
+    # Prepare cropped logits for batch decoding
+    cropped_logits = []
     for logits, orig_w in logits_list:
-        # Crop logits
         time_axis = 1 if logits.shape[0] == vocab_size else 0
         total_timesteps = logits.shape[time_axis]
         crop_timesteps = max(1, int(total_timesteps * orig_w / input_width))
@@ -58,10 +58,11 @@ def _decode_page_for_process_pool(
             cropped = logits[:, :crop_timesteps]
         else:
             cropped = logits[:crop_timesteps, :]
+        cropped_logits.append(cropped)
 
-        # Decode using module-level function
-        text = decode_logits_beam_search(cropped, vocab)
-        texts.append(text.strip().replace("§", " "))
+    # Batch decode all lines at once
+    decoded_texts = decode_logits_batch(cropped_logits, vocab)
+    texts = [text.strip().replace("§", " ") for text in decoded_texts]
 
     decode_ms = (time.perf_counter() - start_time) * 1000
     return texts, decode_ms, len(logits_list)
@@ -629,10 +630,123 @@ class AsyncOCRPipeline:
         logger.info(f"[GPUInference] Done, processed {lines_processed} lines, emitted {pages_emitted} pages")
 
     async def _ctc_decoder_stage(self) -> None:
-        """Decode logits to text concurrently using semaphore for backpressure."""
-        logger.info(f"[CTCDecoder] Starting with {self.ctc_workers} concurrent workers")
+        """Decode logits to text using batched decoding with multiprocessing pool on Linux."""
+        logger.info(f"[CTCDecoder] Starting with {self.ctc_workers} workers, batch_pool={CAN_USE_MP_POOL}")
         loop = asyncio.get_event_loop()
 
+        if CAN_USE_MP_POOL:
+            # Linux: use decode_batch with multiprocessing pool for better parallelism
+            await self._ctc_decoder_stage_batched(loop)
+        else:
+            # macOS: use ProcessPoolExecutor with per-page decoding
+            await self._ctc_decoder_stage_per_page(loop)
+
+        logger.info(f"[CTCDecoder] Done, decoded {self.stats['decoded']} pages")
+
+    async def _ctc_decoder_stage_batched(self, loop) -> None:
+        """Linux: Batch decode multiple pages using decode_batch with multiprocessing pool."""
+        import multiprocessing
+
+        # Create a pool for decode_batch
+        pool = multiprocessing.Pool(processes=self.ctc_workers)
+        batch_size = 16  # Decode this many pages at once
+        pending_pages: list[InferredPage] = []
+        pages_received = 0
+
+        try:
+            while True:
+                msg = await self.q_inferred.get()
+                if isinstance(msg, EndOfStream):
+                    # Process remaining pages
+                    if pending_pages:
+                        await self._decode_batch_pages(pending_pages, pool, loop)
+                    await self.q_results.put(EOS)
+                    break
+
+                inferred: InferredPage = msg
+                pages_received += 1
+
+                if pages_received % 20 == 0:
+                    logger.info(f"[CTCDecoder] Received {pages_received} pages")
+
+                if inferred.error or not inferred.logits_list:
+                    await self.q_results.put(
+                        PageResult(
+                            page_idx=inferred.page_idx,
+                            filename=inferred.filename,
+                            source_etag=inferred.source_etag,
+                            texts=[],
+                            error=inferred.error,
+                        )
+                    )
+                    continue
+
+                pending_pages.append(inferred)
+
+                # Decode batch when we have enough pages
+                if len(pending_pages) >= batch_size:
+                    await self._decode_batch_pages(pending_pages, pool, loop)
+                    pending_pages = []
+        finally:
+            pool.close()
+            pool.join()
+
+    async def _decode_batch_pages(self, pages: list[InferredPage], pool, loop) -> None:
+        """Decode a batch of pages using decode_batch with pool."""
+        start_time = time.perf_counter()
+        vocab = self.ctc_decoder.ctc_vocab
+        vocab_size = len(vocab)
+
+        # Collect all logits from all pages, tracking which page each belongs to
+        all_logits = []
+        page_line_counts = []  # How many lines per page
+
+        for page in pages:
+            cropped_logits = []
+            for logits, orig_w in page.logits_list:
+                time_axis = 1 if logits.shape[0] == vocab_size else 0
+                total_timesteps = logits.shape[time_axis]
+                crop_timesteps = max(1, int(total_timesteps * orig_w / self.input_width))
+
+                if time_axis == 1:
+                    cropped = logits[:, :crop_timesteps]
+                else:
+                    cropped = logits[:crop_timesteps, :]
+                cropped_logits.append(cropped)
+
+            all_logits.extend(cropped_logits)
+            page_line_counts.append(len(cropped_logits))
+
+        # Decode all lines at once with pool
+        all_texts = await loop.run_in_executor(
+            None,  # Use default executor for the blocking call
+            lambda: decode_logits_batch(all_logits, vocab, pool),
+        )
+
+        decode_ms = (time.perf_counter() - start_time) * 1000
+        total_lines = len(all_logits)
+        logger.info(
+            f"[CTCDecoder] Batch decoded {len(pages)} pages, {total_lines} lines in {decode_ms:.0f}ms ({decode_ms / max(1, total_lines):.0f}ms/line)"
+        )
+
+        # Split results back to pages
+        text_idx = 0
+        for page, line_count in zip(pages, page_line_counts):
+            page_texts = [t.strip().replace("§", " ") for t in all_texts[text_idx : text_idx + line_count]]
+            text_idx += line_count
+
+            await self.q_results.put(
+                PageResult(
+                    page_idx=page.page_idx,
+                    filename=page.filename,
+                    source_etag=page.source_etag,
+                    texts=page_texts,
+                )
+            )
+            self.stats["decoded"] += 1
+
+    async def _ctc_decoder_stage_per_page(self, loop) -> None:
+        """macOS: Decode one page at a time using ProcessPoolExecutor."""
         sem = asyncio.Semaphore(self.ctc_workers)
         pending_tasks: set[asyncio.Task] = set()
         pages_received = 0
@@ -652,7 +766,6 @@ class AsyncOCRPipeline:
                     return
 
                 try:
-                    # Use module-level function for ProcessPoolExecutor
                     texts, decode_ms, num_lines = await loop.run_in_executor(
                         self._ctc_executor,
                         _decode_page_for_process_pool,
@@ -705,8 +818,6 @@ class AsyncOCRPipeline:
             task = asyncio.create_task(decode_one(inferred))
             pending_tasks.add(task)
             task.add_done_callback(pending_tasks.discard)
-
-        logger.info(f"[CTCDecoder] Done, decoded {self.stats['decoded']} pages")
 
     async def _parquet_writer(self, output_uri: str, total_pages: int) -> None:
         """Write results to parquet using streaming writer."""

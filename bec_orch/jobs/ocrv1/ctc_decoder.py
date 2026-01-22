@@ -1,3 +1,6 @@
+import multiprocessing
+import sys
+
 import numpy as np
 import numpy.typing as npt
 
@@ -6,9 +9,16 @@ _GLOBAL_DECODER = None
 _GLOBAL_VOCAB_LEN = None  # Use length for fast comparison
 _GLOBAL_BLANK_SIGN = "<blk>"
 
-
-# Beam width for CTC decoding (default pyctcdecode is 100, but 20 is usually sufficient)
+# Beam width for CTC decoding
 BEAM_WIDTH = 50
+
+# Token pruning - skip tokens with log probability below this threshold
+# Default is -5.0, more negative = less pruning, less negative = more pruning
+TOKEN_MIN_LOGP = -5.0
+
+# Check if we can use multiprocessing pool with decode_batch
+# Linux uses 'fork' which works, macOS uses 'spawn' which doesn't
+CAN_USE_MP_POOL = sys.platform != "darwin" and multiprocessing.get_start_method() == "fork"
 
 
 def _init_global_decoder(vocab: list[str]) -> None:
@@ -37,7 +47,7 @@ def decode_logits_beam_search(logits: npt.NDArray, vocab: list[str]) -> str:
 
     This function can be pickled and sent to worker processes.
     """
-    global _GLOBAL_DECODER, _GLOBAL_VOCAB_LEN, _GLOBAL_BLANK_SIGN
+    global _GLOBAL_DECODER, _GLOBAL_VOCAB_LEN
 
     # Initialize decoder in worker process if needed (should already be done by initializer)
     if _GLOBAL_DECODER is None or _GLOBAL_VOCAB_LEN != len(vocab):
@@ -50,15 +60,52 @@ def decode_logits_beam_search(logits: npt.NDArray, vocab: list[str]) -> str:
     if _GLOBAL_DECODER is None:
         raise RuntimeError("CTC decoder not initialized")
 
-    return _GLOBAL_DECODER.decode(logits, beam_width=BEAM_WIDTH).replace(_GLOBAL_BLANK_SIGN, "")
+    return _GLOBAL_DECODER.decode(logits, beam_width=BEAM_WIDTH, token_min_logp=TOKEN_MIN_LOGP).replace(
+        _GLOBAL_BLANK_SIGN, ""
+    )
+
+
+def decode_logits_batch(logits_list: list[npt.NDArray], vocab: list[str], pool=None) -> list[str]:
+    """
+    Batch decode multiple logit arrays using pyctcdecode's decode_batch.
+
+    Args:
+        logits_list: List of logit arrays to decode
+        vocab: Vocabulary list
+        pool: Optional multiprocessing pool (only works on Linux with 'fork' context)
+    """
+    global _GLOBAL_DECODER, _GLOBAL_VOCAB_LEN
+
+    if _GLOBAL_DECODER is None or _GLOBAL_VOCAB_LEN != len(vocab):
+        _init_global_decoder(vocab)
+
+    if _GLOBAL_DECODER is None:
+        raise RuntimeError("CTC decoder not initialized")
+
+    # Ensure all logits are (time, vocab) shape
+    vocab_size = len(vocab)
+    prepared = []
+    for logits in logits_list:
+        if logits.shape[0] == vocab_size:
+            logits = np.transpose(logits, axes=[1, 0])
+        prepared.append(logits)
+
+    # Use decode_batch - pool enables parallel decoding on Linux
+    results = _GLOBAL_DECODER.decode_batch(
+        pool=pool,
+        logits_list=prepared,
+        beam_width=BEAM_WIDTH,
+        token_min_logp=TOKEN_MIN_LOGP,
+    )
+
+    return [text.replace(_GLOBAL_BLANK_SIGN, "") for text in results]
 
 
 class CTCDecoder:
-    """CTC decoder with greedy (fast) and beam search (slow) modes."""
+    """CTC decoder with beam search."""
 
     def __init__(self, charset: str | list[str], add_blank: bool, use_beam_search: bool = True):
         self.blank_sign = "<blk>"
-        self.use_beam_search = use_beam_search
 
         if isinstance(charset, str):
             self.charset = list(charset)
@@ -72,48 +119,17 @@ class CTCDecoder:
         else:
             self.blank_idx = -1
 
-        # Build beam search decoder if needed (for in-process use)
-        self._beam_decoder = None
-        if use_beam_search:
-            from pyctcdecode.decoder import build_ctcdecoder
+        # Build beam search decoder
+        from pyctcdecode.decoder import build_ctcdecoder
 
-            self._beam_decoder = build_ctcdecoder(self.ctc_vocab)
+        self._beam_decoder = build_ctcdecoder(self.ctc_vocab)
 
     def decode(self, logits: npt.NDArray) -> str:
-        """Decode logits to text using greedy or beam search."""
+        """Decode logits to text using beam search."""
         # Ensure shape is (time, vocab)
         if logits.shape[0] == len(self.ctc_vocab):
             logits = np.transpose(logits, axes=[1, 0])
 
-        if self.use_beam_search and self._beam_decoder is not None:
-            return self._beam_decoder.decode(logits, beam_width=BEAM_WIDTH).replace(self.blank_sign, "")
-
-        return self._greedy_decode(logits)
-
-    def _greedy_decode(self, logits: npt.NDArray) -> str:
-        """Fast greedy CTC decoding."""
-        # Handle different shapes - ensure 2D (time, vocab)
-        if logits.ndim == 1:
-            # Single timestep - just return best char
-            best_idx = int(np.argmax(logits))
-            if best_idx < len(self.ctc_vocab) and best_idx != self.blank_idx:
-                char = self.ctc_vocab[best_idx]
-                if char != self.blank_sign:
-                    return char
-            return ""
-
-        # Get best class at each timestep (axis=1 for vocab dimension)
-        best_indices = np.argmax(logits, axis=1)
-
-        # Collapse repeated characters and remove blanks
-        chars = []
-        prev_idx = -1
-        for idx in best_indices:
-            if idx != prev_idx and idx != self.blank_idx:
-                if idx < len(self.ctc_vocab):
-                    char = self.ctc_vocab[idx]
-                    if char != self.blank_sign:
-                        chars.append(char)
-            prev_idx = idx
-
-        return "".join(chars)
+        return self._beam_decoder.decode(logits, beam_width=BEAM_WIDTH, token_min_logp=TOKEN_MIN_LOGP).replace(
+            self.blank_sign, ""
+        )

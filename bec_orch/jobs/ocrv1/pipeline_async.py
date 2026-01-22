@@ -186,6 +186,17 @@ class AsyncOCRPipeline:
 
         logger.info(f"[AsyncOCRPipeline] Starting pipeline for {total_pages} pages")
 
+        # Queue depth monitor task
+        async def monitor_queues():
+            while True:
+                await asyncio.sleep(5)
+                logger.info(
+                    f"[QueueDepth] fetched={self.q_fetched.qsize()}, processed={self.q_processed.qsize()}, "
+                    f"inferred={self.q_inferred.qsize()}, results={self.q_results.qsize()}"
+                )
+
+        monitor_task = asyncio.create_task(monitor_queues(), name="monitor")
+
         # Start all stages as concurrent tasks
         tasks = [
             asyncio.create_task(self._prefetcher(pages), name="prefetcher"),
@@ -197,6 +208,7 @@ class AsyncOCRPipeline:
 
         # Wait for all tasks
         results = await asyncio.gather(*tasks, return_exceptions=True)
+        monitor_task.cancel()
 
         # Check for errors
         stage_names = ["prefetcher", "image_processor", "gpu_inference", "ctc_decoder", "writer"]
@@ -293,16 +305,20 @@ class AsyncOCRPipeline:
                     return
 
                 try:
+                    start_time = time.perf_counter()
                     processed = await loop.run_in_executor(
                         self._image_executor,
                         self._process_image_sync,
                         fetched,
                     )
+                    proc_ms = (time.perf_counter() - start_time) * 1000
+                    num_lines = len(processed.line_tensors) if processed.line_tensors else 0
+                    logger.info(
+                        f"[ImageProcessor] Page {fetched.page_idx} processed {num_lines} lines in {proc_ms:.0f}ms"
+                    )
+
                     await self.q_processed.put(processed)
                     self.stats["processed"] += 1
-
-                    if self.stats["processed"] % 20 == 0:
-                        logger.info(f"[ImageProcessor] Processed {self.stats['processed']} pages")
 
                 except Exception as e:
                     logger.warning(f"[ImageProcessor] Failed to process {fetched.filename}: {e}")
@@ -490,7 +506,7 @@ class AsyncOCRPipeline:
                 return
 
             batch_size = len(pending_tensors)
-            logger.info(f"[GPUInference] Running batch of {batch_size} lines")
+            start_time = time.perf_counter()
 
             # Stack tensors
             tensors = np.concatenate([t[2] for t in pending_tensors], axis=0)
@@ -512,8 +528,9 @@ class AsyncOCRPipeline:
 
             pending_tensors.clear()
 
+            batch_ms = (time.perf_counter() - start_time) * 1000
             logger.info(
-                f"[GPUInference] Batch done. Total: {lines_processed} lines, {pages_emitted} pages emitted, {len(pages_in_flight)} in flight"
+                f"[GPUInference] Batch {batch_size} lines in {batch_ms:.0f}ms ({batch_ms / batch_size:.0f}ms/line). Total: {lines_processed} lines, {pages_emitted} pages emitted"
             )
 
         async def try_emit_completed_pages():
@@ -642,12 +659,20 @@ class AsyncOCRPipeline:
 
                 try:
                     # Use module-level function for ProcessPoolExecutor
+                    num_lines = len(inferred.logits_list)
+                    start_time = time.perf_counter()
+
                     texts = await loop.run_in_executor(
                         self._ctc_executor,
                         _decode_page_for_process_pool,
                         inferred.logits_list,
                         self.ctc_decoder.ctc_vocab,
                         self.input_width,
+                    )
+
+                    decode_ms = (time.perf_counter() - start_time) * 1000
+                    logger.info(
+                        f"[CTCDecoder] Page {inferred.page_idx} decoded {num_lines} lines in {decode_ms:.0f}ms ({decode_ms / max(1, num_lines):.0f}ms/line)"
                     )
 
                     await self.q_results.put(
@@ -659,9 +684,6 @@ class AsyncOCRPipeline:
                         )
                     )
                     self.stats["decoded"] += 1
-
-                    if self.stats["decoded"] % 20 == 0:
-                        logger.info(f"[CTCDecoder] Decoded {self.stats['decoded']} pages")
 
                 except Exception as e:
                     logger.warning(f"[CTCDecoder] Failed to decode {inferred.filename}: {e}")

@@ -626,6 +626,12 @@ class AsyncOCRPipeline:
         pending_tasks: set[asyncio.Task] = set()
         pages_received = 0
 
+        # Limit concurrent page decodes to avoid overwhelming the executor
+        # With 8 workers and ~6 lines/page, allow 2 pages to decode simultaneously
+        # This prevents resource contention that causes progressive slowdown on Linux
+        max_concurrent_pages = max(1, self.ctc_workers // 4)
+        page_sem = asyncio.Semaphore(max_concurrent_pages)
+
         async def decode_one(inferred: InferredPage) -> None:
             if inferred.error or not inferred.logits_list:
                 await self.q_results.put(
@@ -639,56 +645,57 @@ class AsyncOCRPipeline:
                 )
                 return
 
-            try:
-                start_time = time.perf_counter()
-                vocab = self.ctc_decoder.ctc_vocab
-                vocab_size = len(vocab)
-                num_lines = len(inferred.logits_list)
+            async with page_sem:
+                try:
+                    start_time = time.perf_counter()
+                    vocab = self.ctc_decoder.ctc_vocab
+                    vocab_size = len(vocab)
+                    num_lines = len(inferred.logits_list)
 
-                # Submit all lines to executor in parallel
-                futures = []
-                for logits, orig_w in inferred.logits_list:
-                    future = loop.run_in_executor(
-                        self._ctc_executor,
-                        _decode_single_line,
-                        logits,
-                        orig_w,
-                        vocab,
-                        self.input_width,
-                        vocab_size,
+                    # Submit all lines to executor in parallel
+                    futures = []
+                    for logits, orig_w in inferred.logits_list:
+                        future = loop.run_in_executor(
+                            self._ctc_executor,
+                            _decode_single_line,
+                            logits,
+                            orig_w,
+                            vocab,
+                            self.input_width,
+                            vocab_size,
+                        )
+                        futures.append(future)
+
+                    # Wait for all lines to complete in parallel
+                    texts = list(await asyncio.gather(*futures))
+
+                    decode_ms = (time.perf_counter() - start_time) * 1000
+                    logger.info(
+                        f"[CTCDecoder] Page {inferred.page_idx} decoded {num_lines} lines in {decode_ms:.0f}ms ({decode_ms / max(1, num_lines):.0f}ms/line)"
                     )
-                    futures.append(future)
 
-                # Wait for all lines to complete in parallel
-                texts = list(await asyncio.gather(*futures))
-
-                decode_ms = (time.perf_counter() - start_time) * 1000
-                logger.info(
-                    f"[CTCDecoder] Page {inferred.page_idx} decoded {num_lines} lines in {decode_ms:.0f}ms ({decode_ms / max(1, num_lines):.0f}ms/line)"
-                )
-
-                await self.q_results.put(
-                    PageResult(
-                        page_idx=inferred.page_idx,
-                        filename=inferred.filename,
-                        source_etag=inferred.source_etag,
-                        texts=texts,
+                    await self.q_results.put(
+                        PageResult(
+                            page_idx=inferred.page_idx,
+                            filename=inferred.filename,
+                            source_etag=inferred.source_etag,
+                            texts=texts,
+                        )
                     )
-                )
-                self.stats["decoded"] += 1
+                    self.stats["decoded"] += 1
 
-            except Exception as e:
-                logger.warning(f"[CTCDecoder] Failed to decode {inferred.filename}: {e}")
-                await self.q_results.put(
-                    PageResult(
-                        page_idx=inferred.page_idx,
-                        filename=inferred.filename,
-                        source_etag=inferred.source_etag,
-                        texts=[],
-                        error=str(e),
+                except Exception as e:
+                    logger.warning(f"[CTCDecoder] Failed to decode {inferred.filename}: {e}")
+                    await self.q_results.put(
+                        PageResult(
+                            page_idx=inferred.page_idx,
+                            filename=inferred.filename,
+                            source_etag=inferred.source_etag,
+                            texts=[],
+                            error=str(e),
+                        )
                     )
-                )
-                self.stats["errors"] += 1
+                    self.stats["errors"] += 1
 
         while True:
             msg = await self.q_inferred.get()

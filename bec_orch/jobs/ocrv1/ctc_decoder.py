@@ -3,18 +3,18 @@ import numpy.typing as npt
 
 # Global decoder instance for multiprocessing (avoids pickling issues)
 _GLOBAL_DECODER = None
-_GLOBAL_VOCAB = None
+_GLOBAL_VOCAB_LEN = None  # Use length for fast comparison
 _GLOBAL_BLANK_SIGN = "<blk>"
 
 
 def _init_global_decoder(vocab: list[str]) -> None:
     """Initialize the global decoder for use in worker processes."""
-    global _GLOBAL_DECODER, _GLOBAL_VOCAB
-    if _GLOBAL_DECODER is None or _GLOBAL_VOCAB != vocab:
+    global _GLOBAL_DECODER, _GLOBAL_VOCAB_LEN
+    if _GLOBAL_DECODER is None or _GLOBAL_VOCAB_LEN != len(vocab):
         from pyctcdecode.decoder import build_ctcdecoder
 
         _GLOBAL_DECODER = build_ctcdecoder(vocab)
-        _GLOBAL_VOCAB = vocab
+        _GLOBAL_VOCAB_LEN = len(vocab)
 
 
 def init_worker_process(vocab: list[str]) -> None:
@@ -33,10 +33,10 @@ def decode_logits_beam_search(logits: npt.NDArray, vocab: list[str]) -> str:
 
     This function can be pickled and sent to worker processes.
     """
-    global _GLOBAL_DECODER, _GLOBAL_VOCAB, _GLOBAL_BLANK_SIGN
+    global _GLOBAL_DECODER, _GLOBAL_VOCAB_LEN, _GLOBAL_BLANK_SIGN
 
-    # Initialize decoder in worker process if needed
-    if _GLOBAL_DECODER is None or _GLOBAL_VOCAB != vocab:
+    # Initialize decoder in worker process if needed (should already be done by initializer)
+    if _GLOBAL_DECODER is None or _GLOBAL_VOCAB_LEN != len(vocab):
         _init_global_decoder(vocab)
 
     # Ensure shape is (time, vocab)

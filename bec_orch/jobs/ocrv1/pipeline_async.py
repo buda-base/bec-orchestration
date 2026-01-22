@@ -151,10 +151,12 @@ class AsyncOCRPipeline:
         self._image_executor = ThreadPoolExecutor(max_workers=image_processor_workers, thread_name_prefix="img")
         # Process pool for CTC decoding (bypasses GIL for true parallelism)
         # Use initializer to build decoder once per worker process
+        # maxtasksperchild=50 restarts workers periodically to free memory
         self._ctc_executor = ProcessPoolExecutor(
             max_workers=ctc_workers,
             initializer=init_worker_process,
             initargs=(ctc_decoder.ctc_vocab,),
+            max_tasks_per_child=50,
         )
 
         logger.info(

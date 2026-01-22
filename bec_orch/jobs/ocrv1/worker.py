@@ -351,22 +351,57 @@ class OCRV1JobWorker:
         nb_lines = len(contours)
         logger.debug(f"Processing {nb_lines} line contours")
 
-        texts = []
-        current_k = 1.7  # Adaptive k_factor for morphological operations
+        if nb_lines == 0:
+            return []
 
-        # Pre-allocate mask buffer (reused for each line)
+        texts = [""] * nb_lines
+        current_k = 1.7  # Adaptive k_factor for morphological operations
         mask_buffer = np.zeros((image.shape[0], image.shape[1]), dtype=np.uint8)
 
-        for contour_points in contours:
+        # Process in batches to limit memory usage
+        batch_size = 8
+        batch_data: list[tuple[int, npt.NDArray, int]] = []
+
+        for idx, contour_points in enumerate(contours):
             line_img, current_k = self._extract_line_from_contour(image, contour_points, current_k, mask_buffer)
             if line_img is None:
-                texts.append("")
                 continue
 
-            text = self._ocr_line(line_img)
-            texts.append(text)
+            original_width = line_img.shape[1]
+            tensor = self._preprocess_line(line_img)
+            batch_data.append((idx, tensor, original_width))
+
+            # Process batch when full
+            if len(batch_data) >= batch_size:
+                self._process_batch(batch_data, texts)
+                batch_data = []
+
+        # Process remaining
+        if batch_data:
+            self._process_batch(batch_data, texts)
 
         return texts
+
+    def _process_batch(self, batch_data: list[tuple[int, npt.NDArray, int]], texts: list[str]) -> None:
+        """Process a batch of line tensors through GPU and CTC decoder."""
+        if not batch_data:
+            return
+
+        # Stack tensors
+        tensors = np.concatenate([t for _, t, _ in batch_data], axis=0)
+
+        # Run batched inference
+        batch_logits = self.ocr_model.predict(tensors)
+
+        # Handle single item batch
+        if len(batch_data) == 1:
+            batch_logits = [batch_logits]
+
+        # Decode each result
+        for (idx, _, original_width), logits in zip(batch_data, batch_logits):
+            cropped_logits = self._crop_logits(logits, original_width)
+            text = self.ctc_decoder.decode(cropped_logits)
+            texts[idx] = text.strip().replace("§", " ")
 
     def _extract_line_from_contour(
         self, image: npt.NDArray, contour_points: list[dict], k_factor: float, mask_buffer: npt.NDArray

@@ -647,8 +647,15 @@ class AsyncOCRPipeline:
         """Linux: Batch decode multiple pages using decode_batch with multiprocessing pool."""
         import multiprocessing
 
-        # Create a pool for decode_batch
-        pool = multiprocessing.Pool(processes=self.ctc_workers)
+        # Initialize decoder in main process first (for fork inheritance)
+        init_worker_process(self.ctc_decoder.ctc_vocab)
+
+        # Create a pool with initializer so workers have the decoder ready
+        pool = multiprocessing.Pool(
+            processes=self.ctc_workers,
+            initializer=init_worker_process,
+            initargs=(self.ctc_decoder.ctc_vocab,),
+        )
         batch_size = 16  # Decode this many pages at once
         pending_pages: list[InferredPage] = []
         pages_received = 0

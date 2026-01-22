@@ -1,6 +1,3 @@
-import multiprocessing
-import sys
-
 import numpy as np
 import numpy.typing as npt
 
@@ -16,9 +13,31 @@ BEAM_WIDTH = 50
 # Default is -5.0, more negative = less pruning, less negative = more pruning
 TOKEN_MIN_LOGP = -5.0
 
-# Enable decode_batch with pool on Linux (fork context)
-# macOS uses 'spawn' which doesn't work with decode_batch's internal pool
-CAN_USE_MP_POOL = sys.platform != "darwin" and multiprocessing.get_start_method() == "fork"
+# Blank index in vocabulary (blank is always first token)
+BLANK_IDX = 0
+
+
+def _collapse_blank_frames(logits: npt.NDArray) -> npt.NDArray:
+    """
+    Collapse consecutive frames where blank has the highest probability.
+
+    This reduces sequence length T, speeding up beam search which is O(T × beam × vocab).
+    We keep one frame per run of consecutive blank-dominant frames.
+    """
+    if len(logits) <= 1:
+        return logits
+
+    # logits shape: (time, vocab)
+    # Find frames where blank (index 0) has the highest probability
+    best_tokens = np.argmax(logits, axis=1)
+    is_blank = best_tokens == BLANK_IDX
+
+    # Keep frames where current is not blank OR previous was not blank
+    # This keeps the first frame of each blank run and all non-blank frames
+    prev_is_blank = np.concatenate([[False], is_blank[:-1]])
+    keep_mask = ~(is_blank & prev_is_blank)
+
+    return logits[keep_mask]
 
 
 def _init_global_decoder(vocab: list[str]) -> None:
@@ -46,6 +65,7 @@ def decode_logits_beam_search(logits: npt.NDArray, vocab: list[str]) -> str:
     Module-level beam search decode function for use with ProcessPoolExecutor.
 
     This function can be pickled and sent to worker processes.
+    Expects logits in (time, vocab) shape - caller must transpose if needed.
     """
     global _GLOBAL_DECODER, _GLOBAL_VOCAB_LEN
 
@@ -53,9 +73,8 @@ def decode_logits_beam_search(logits: npt.NDArray, vocab: list[str]) -> str:
     if _GLOBAL_DECODER is None or _GLOBAL_VOCAB_LEN != len(vocab):
         _init_global_decoder(vocab)
 
-    # Ensure shape is (time, vocab)
-    if logits.shape[0] == len(vocab):
-        logits = np.transpose(logits, axes=[1, 0])
+    # Collapse consecutive blank-dominant frames to reduce sequence length
+    logits = _collapse_blank_frames(logits)
 
     if _GLOBAL_DECODER is None:
         raise RuntimeError("CTC decoder not initialized")
@@ -63,42 +82,6 @@ def decode_logits_beam_search(logits: npt.NDArray, vocab: list[str]) -> str:
     return _GLOBAL_DECODER.decode(logits, beam_width=BEAM_WIDTH, token_min_logp=TOKEN_MIN_LOGP).replace(
         _GLOBAL_BLANK_SIGN, ""
     )
-
-
-def decode_logits_batch(logits_list: list[npt.NDArray], vocab: list[str], pool=None) -> list[str]:
-    """
-    Batch decode multiple logit arrays using pyctcdecode's decode_batch.
-
-    Args:
-        logits_list: List of logit arrays to decode
-        vocab: Vocabulary list
-        pool: Optional multiprocessing pool (only works on Linux with 'fork' context)
-    """
-    global _GLOBAL_DECODER, _GLOBAL_VOCAB_LEN
-
-    if _GLOBAL_DECODER is None or _GLOBAL_VOCAB_LEN != len(vocab):
-        _init_global_decoder(vocab)
-
-    if _GLOBAL_DECODER is None:
-        raise RuntimeError("CTC decoder not initialized")
-
-    # Ensure all logits are (time, vocab) shape
-    vocab_size = len(vocab)
-    prepared = []
-    for logits in logits_list:
-        if logits.shape[0] == vocab_size:
-            logits = np.transpose(logits, axes=[1, 0])
-        prepared.append(logits)
-
-    # Use decode_batch - pool enables parallel decoding on Linux
-    results = _GLOBAL_DECODER.decode_batch(
-        pool=pool,
-        logits_list=prepared,
-        beam_width=BEAM_WIDTH,
-        token_min_logp=TOKEN_MIN_LOGP,
-    )
-
-    return [text.replace(_GLOBAL_BLANK_SIGN, "") for text in results]
 
 
 class CTCDecoder:
@@ -129,6 +112,9 @@ class CTCDecoder:
         # Ensure shape is (time, vocab)
         if logits.shape[0] == len(self.ctc_vocab):
             logits = np.transpose(logits, axes=[1, 0])
+
+        # Collapse consecutive blank-dominant frames to reduce sequence length
+        logits = _collapse_blank_frames(logits)
 
         return self._beam_decoder.decode(logits, beam_width=BEAM_WIDTH, token_min_logp=TOKEN_MIN_LOGP).replace(
             self.blank_sign, ""

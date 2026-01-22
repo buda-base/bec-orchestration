@@ -25,7 +25,7 @@ import numpy.typing as npt
 if TYPE_CHECKING:
     pass
 
-from .ctc_decoder import CAN_USE_MP_POOL, CTCDecoder, decode_logits_batch, init_worker_process
+from .ctc_decoder import CTCDecoder, decode_logits_beam_search, init_worker_process
 from .line import get_line_image
 from .model import OCRModel
 from .parquet_writer import StreamingParquetWriter
@@ -33,39 +33,29 @@ from .parquet_writer import StreamingParquetWriter
 logger = logging.getLogger(__name__)
 
 
-def _decode_page_for_process_pool(
-    logits_list: list[tuple[npt.NDArray, int]],
+def _decode_single_line(
+    logits: npt.NDArray,
+    orig_w: int,
     vocab: list[str],
     input_width: int,
-) -> tuple[list[str], float, int]:
+    vocab_size: int,
+) -> str:
     """
-    Module-level decode function for ProcessPoolExecutor.
+    Decode a single line's logits. Used for parallel line decoding.
 
     This function can be pickled and sent to worker processes.
-    Returns (texts, decode_time_ms, num_lines).
     """
-    start_time = time.perf_counter()
-    vocab_size = len(vocab)
+    # Crop and transpose to (time, vocab) shape
+    needs_transpose = logits.shape[0] == vocab_size
+    if needs_transpose:
+        crop_timesteps = max(1, int(logits.shape[1] * orig_w / input_width))
+        cropped = logits[:, :crop_timesteps].T
+    else:
+        crop_timesteps = max(1, int(logits.shape[0] * orig_w / input_width))
+        cropped = logits[:crop_timesteps, :]
 
-    # Prepare cropped logits for batch decoding
-    cropped_logits = []
-    for logits, orig_w in logits_list:
-        time_axis = 1 if logits.shape[0] == vocab_size else 0
-        total_timesteps = logits.shape[time_axis]
-        crop_timesteps = max(1, int(total_timesteps * orig_w / input_width))
-
-        if time_axis == 1:
-            cropped = logits[:, :crop_timesteps]
-        else:
-            cropped = logits[:crop_timesteps, :]
-        cropped_logits.append(cropped)
-
-    # Batch decode all lines at once
-    decoded_texts = decode_logits_batch(cropped_logits, vocab)
-    texts = [text.strip().replace("§", " ") for text in decoded_texts]
-
-    decode_ms = (time.perf_counter() - start_time) * 1000
-    return texts, decode_ms, len(logits_list)
+    text = decode_logits_beam_search(cropped, vocab)
+    return text.strip().replace("§", " ")
 
 
 @dataclass
@@ -630,183 +620,75 @@ class AsyncOCRPipeline:
         logger.info(f"[GPUInference] Done, processed {lines_processed} lines, emitted {pages_emitted} pages")
 
     async def _ctc_decoder_stage(self) -> None:
-        """Decode logits to text using batched decoding with multiprocessing pool on Linux."""
-        logger.info(f"[CTCDecoder] Starting with {self.ctc_workers} workers, batch_pool={CAN_USE_MP_POOL}")
+        """Decode logits to text concurrently using ProcessPoolExecutor."""
+        logger.info(f"[CTCDecoder] Starting with {self.ctc_workers} workers")
         loop = asyncio.get_event_loop()
-
-        if CAN_USE_MP_POOL:
-            # Linux: use decode_batch with multiprocessing pool for better parallelism
-            await self._ctc_decoder_stage_batched(loop)
-        else:
-            # macOS: use ProcessPoolExecutor with per-page decoding
-            await self._ctc_decoder_stage_per_page(loop)
-
-        logger.info(f"[CTCDecoder] Done, decoded {self.stats['decoded']} pages")
-
-    async def _ctc_decoder_stage_batched(self, loop) -> None:
-        """Linux: Batch decode multiple pages using decode_batch with multiprocessing pool."""
-        import multiprocessing
-
-        # Initialize decoder in main process first (for fork inheritance)
-        init_worker_process(self.ctc_decoder.ctc_vocab)
-
-        # Create a pool with initializer so workers have the decoder ready
-        pool = multiprocessing.Pool(
-            processes=self.ctc_workers,
-            initializer=init_worker_process,
-            initargs=(self.ctc_decoder.ctc_vocab,),
-        )
-        batch_size = 4  # Decode this many pages at once (smaller = less latency)
-        pending_pages: list[InferredPage] = []
-        pages_received = 0
-
-        try:
-            while True:
-                msg = await self.q_inferred.get()
-                if isinstance(msg, EndOfStream):
-                    # Process remaining pages
-                    if pending_pages:
-                        await self._decode_batch_pages(pending_pages, pool, loop)
-                    await self.q_results.put(EOS)
-                    break
-
-                inferred: InferredPage = msg
-                pages_received += 1
-
-                if pages_received % 20 == 0:
-                    logger.info(f"[CTCDecoder] Received {pages_received} pages")
-
-                if inferred.error or not inferred.logits_list:
-                    await self.q_results.put(
-                        PageResult(
-                            page_idx=inferred.page_idx,
-                            filename=inferred.filename,
-                            source_etag=inferred.source_etag,
-                            texts=[],
-                            error=inferred.error,
-                        )
-                    )
-                    continue
-
-                pending_pages.append(inferred)
-
-                # Decode batch when we have enough pages
-                if len(pending_pages) >= batch_size:
-                    await self._decode_batch_pages(pending_pages, pool, loop)
-                    pending_pages = []
-        finally:
-            pool.close()
-            pool.join()
-
-    async def _decode_batch_pages(self, pages: list[InferredPage], pool, loop) -> None:
-        """Decode a batch of pages using decode_batch with pool."""
-        start_time = time.perf_counter()
-        vocab = self.ctc_decoder.ctc_vocab
-        vocab_size = len(vocab)
-
-        # Collect all logits from all pages, tracking which page each belongs to
-        all_logits = []
-        page_line_counts = []  # How many lines per page
-
-        for page in pages:
-            cropped_logits = []
-            for logits, orig_w in page.logits_list:
-                time_axis = 1 if logits.shape[0] == vocab_size else 0
-                total_timesteps = logits.shape[time_axis]
-                crop_timesteps = max(1, int(total_timesteps * orig_w / self.input_width))
-
-                if time_axis == 1:
-                    cropped = logits[:, :crop_timesteps]
-                else:
-                    cropped = logits[:crop_timesteps, :]
-                cropped_logits.append(cropped)
-
-            all_logits.extend(cropped_logits)
-            page_line_counts.append(len(cropped_logits))
-
-        # Decode all lines at once with pool
-        all_texts = await loop.run_in_executor(
-            None,  # Use default executor for the blocking call
-            lambda: decode_logits_batch(all_logits, vocab, pool),
-        )
-
-        decode_ms = (time.perf_counter() - start_time) * 1000
-        total_lines = len(all_logits)
-        logger.info(
-            f"[CTCDecoder] Batch decoded {len(pages)} pages, {total_lines} lines in {decode_ms:.0f}ms ({decode_ms / max(1, total_lines):.0f}ms/line)"
-        )
-
-        # Split results back to pages
-        text_idx = 0
-        for page, line_count in zip(pages, page_line_counts):
-            page_texts = [t.strip().replace("§", " ") for t in all_texts[text_idx : text_idx + line_count]]
-            text_idx += line_count
-
-            await self.q_results.put(
-                PageResult(
-                    page_idx=page.page_idx,
-                    filename=page.filename,
-                    source_etag=page.source_etag,
-                    texts=page_texts,
-                )
-            )
-            self.stats["decoded"] += 1
-
-    async def _ctc_decoder_stage_per_page(self, loop) -> None:
-        """macOS: Decode one page at a time using ProcessPoolExecutor."""
-        sem = asyncio.Semaphore(self.ctc_workers)
         pending_tasks: set[asyncio.Task] = set()
         pages_received = 0
 
         async def decode_one(inferred: InferredPage) -> None:
-            async with sem:
-                if inferred.error or not inferred.logits_list:
-                    await self.q_results.put(
-                        PageResult(
-                            page_idx=inferred.page_idx,
-                            filename=inferred.filename,
-                            source_etag=inferred.source_etag,
-                            texts=[],
-                            error=inferred.error,
-                        )
+            if inferred.error or not inferred.logits_list:
+                await self.q_results.put(
+                    PageResult(
+                        page_idx=inferred.page_idx,
+                        filename=inferred.filename,
+                        source_etag=inferred.source_etag,
+                        texts=[],
+                        error=inferred.error,
                     )
-                    return
+                )
+                return
 
-                try:
-                    texts, decode_ms, num_lines = await loop.run_in_executor(
+            try:
+                start_time = time.perf_counter()
+                vocab = self.ctc_decoder.ctc_vocab
+                vocab_size = len(vocab)
+                num_lines = len(inferred.logits_list)
+
+                # Submit all lines to executor in parallel
+                futures = []
+                for logits, orig_w in inferred.logits_list:
+                    future = loop.run_in_executor(
                         self._ctc_executor,
-                        _decode_page_for_process_pool,
-                        inferred.logits_list,
-                        self.ctc_decoder.ctc_vocab,
+                        _decode_single_line,
+                        logits,
+                        orig_w,
+                        vocab,
                         self.input_width,
+                        vocab_size,
                     )
+                    futures.append(future)
 
-                    logger.info(
-                        f"[CTCDecoder] Page {inferred.page_idx} decoded {num_lines} lines in {decode_ms:.0f}ms ({decode_ms / max(1, num_lines):.0f}ms/line)"
-                    )
+                # Wait for all lines to complete in parallel
+                texts = list(await asyncio.gather(*futures))
 
-                    await self.q_results.put(
-                        PageResult(
-                            page_idx=inferred.page_idx,
-                            filename=inferred.filename,
-                            source_etag=inferred.source_etag,
-                            texts=texts,
-                        )
-                    )
-                    self.stats["decoded"] += 1
+                decode_ms = (time.perf_counter() - start_time) * 1000
+                logger.info(
+                    f"[CTCDecoder] Page {inferred.page_idx} decoded {num_lines} lines in {decode_ms:.0f}ms ({decode_ms / max(1, num_lines):.0f}ms/line)"
+                )
 
-                except Exception as e:
-                    logger.warning(f"[CTCDecoder] Failed to decode {inferred.filename}: {e}")
-                    await self.q_results.put(
-                        PageResult(
-                            page_idx=inferred.page_idx,
-                            filename=inferred.filename,
-                            source_etag=inferred.source_etag,
-                            texts=[],
-                            error=str(e),
-                        )
+                await self.q_results.put(
+                    PageResult(
+                        page_idx=inferred.page_idx,
+                        filename=inferred.filename,
+                        source_etag=inferred.source_etag,
+                        texts=texts,
                     )
-                    self.stats["errors"] += 1
+                )
+                self.stats["decoded"] += 1
+
+            except Exception as e:
+                logger.warning(f"[CTCDecoder] Failed to decode {inferred.filename}: {e}")
+                await self.q_results.put(
+                    PageResult(
+                        page_idx=inferred.page_idx,
+                        filename=inferred.filename,
+                        source_etag=inferred.source_etag,
+                        texts=[],
+                        error=str(e),
+                    )
+                )
+                self.stats["errors"] += 1
 
         while True:
             msg = await self.q_inferred.get()
@@ -825,6 +707,8 @@ class AsyncOCRPipeline:
             task = asyncio.create_task(decode_one(inferred))
             pending_tasks.add(task)
             task.add_done_callback(pending_tasks.discard)
+
+        logger.info(f"[CTCDecoder] Done, decoded {self.stats['decoded']} pages")
 
     async def _parquet_writer(self, output_uri: str, total_pages: int) -> None:
         """Write results to parquet using streaming writer."""

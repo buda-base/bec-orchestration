@@ -5,17 +5,17 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from bec_orch.jobs.base import JobContext
     from bec_orch.core.models import TaskResult
+    from bec_orch.jobs.base import JobContext
 
 import cv2
 import numpy as np
 import numpy.typing as npt
 import pyarrow as pa
 import pyarrow.parquet as pq
-import pyewts
 import s3fs
 
+from .ctc_decoder import CTCDecoder
 from .line import get_line_image
 from .model import OCRModel
 
@@ -38,16 +38,18 @@ def ocr_build_schema() -> pa.Schema:
     point_struct = pa.struct([("x", pa.int16()), ("y", pa.int16())])
     contour = pa.list_(point_struct)
     contours = pa.list_(contour)
-    schema = pa.schema([
-        ("img_file_name", pa.string()),
-        ("source_etag", pa.string()),
-        ("contours", contours),
-        ("texts", pa.list_(pa.string())),
-        ("ok", pa.bool_()),
-        ("error_stage", pa.string()),
-        ("error_type", pa.string()),
-        ("error_message", pa.string()),
-    ])
+    schema = pa.schema(
+        [
+            ("img_file_name", pa.string()),
+            ("source_etag", pa.string()),
+            ("contours", contours),
+            ("texts", pa.list_(pa.string())),
+            ("ok", pa.bool_()),
+            ("error_stage", pa.string()),
+            ("error_type", pa.string()),
+            ("error_message", pa.string()),
+        ]
+    )
     return schema
 
 
@@ -63,7 +65,7 @@ class OCRV1JobWorker:
 
     def __init__(self):
         """Initialize the job worker and load the OCR model.
-        
+
         Reads model configuration from model_config.json in the model directory.
         Required env var: BEC_OCR_MODEL_DIR (path to directory containing model_config.json)
         """
@@ -80,8 +82,7 @@ class OCRV1JobWorker:
         model_dir_path = Path(model_dir)
         if not model_dir_path.exists():
             raise FileNotFoundError(
-                f"OCR model directory not found: {model_dir}\n"
-                f"Please check that BEC_OCR_MODEL_DIR is set correctly."
+                f"OCR model directory not found: {model_dir}\nPlease check that BEC_OCR_MODEL_DIR is set correctly."
             )
 
         if not model_dir_path.is_dir():
@@ -94,8 +95,7 @@ class OCRV1JobWorker:
         config_path = model_dir_path / "model_config.json"
         if not config_path.exists():
             raise FileNotFoundError(
-                f"model_config.json not found in {model_dir}\n"
-                f"Expected config file at: {config_path}"
+                f"model_config.json not found in {model_dir}\nExpected config file at: {config_path}"
             )
 
         logger.info(f"Loading OCR model config from: {config_path}")
@@ -120,23 +120,23 @@ class OCRV1JobWorker:
         add_blank = config["add_blank"] == "yes"
 
         logger.info(f"Loading OCR model: {onnx_model_file}")
-        logger.info(f"  Architecture: {config.get('architecture', 'unknown')}, Version: {config.get('version', 'unknown')}")
+        logger.info(
+            f"  Architecture: {config.get('architecture', 'unknown')}, Version: {config.get('version', 'unknown')}"
+        )
         logger.info(f"  Input: {input_width}x{input_height}, Charset length: {len(charset)}")
 
         self.ocr_model = OCRModel(
             model_file=str(onnx_model_file),
             input_layer=input_layer,
             output_layer=output_layer,
-            charset=charset,
             squeeze_channel=squeeze_channel,
             swap_hw=swap_hw,
-            add_blank=add_blank,
         )
+
+        self.ctc_decoder = CTCDecoder(charset=charset, add_blank=add_blank)
 
         self._input_width = input_width
         self._input_height = input_height
-
-        self.converter = pyewts.pyewts()
 
         self.ld_bucket = os.environ.get("BEC_LD_BUCKET", "bec.bdrc.io")
         self.source_image_bucket = os.environ.get("BEC_SOURCE_IMAGE_BUCKET", "archive.tbrc.org")
@@ -188,23 +188,18 @@ class OCRV1JobWorker:
         records = []
 
         try:
+            logger.info(f"Reading LD parquet from {ld_parquet_uri}")
             input_table = self._read_input_parquet(ld_parquet_uri)
+            logger.info(f"Read {len(input_table)} rows from parquet")
 
-            parquet_filenames = set()
-            parquet_rows_by_filename: dict[str, dict] = {}
-            for row_idx in range(len(input_table)):
-                row = {col: input_table[col][row_idx].as_py() for col in input_table.column_names}
-                filename = row.get("img_file_name", "")
-                parquet_filenames.add(filename)
-                parquet_rows_by_filename[filename] = row
+            parquet_rows_by_filename: dict[str, dict] = {row["img_file_name"]: row for row in input_table.to_pylist()}
+            logger.info(f"Indexed {len(parquet_rows_by_filename)} files from parquet")
 
             manifest_filenames: set[str] = {
-                str(item["filename"])
-                for item in ctx.volume_manifest.manifest
-                if item.get("filename")
+                str(item["filename"]) for item in ctx.volume_manifest.manifest if item.get("filename")
             }
 
-            missing_in_parquet = manifest_filenames - parquet_filenames
+            missing_in_parquet = manifest_filenames - set(parquet_rows_by_filename.keys())
             if missing_in_parquet:
                 raise TerminalTaskError(
                     f"LD parquet missing {len(missing_in_parquet)} images from manifest: "
@@ -239,9 +234,8 @@ class OCRV1JobWorker:
 
             error_type = type(e).__name__
             logger.error(
-                f"OCRV1 pipeline failed for volume {ctx.volume.w_id}/{ctx.volume.i_id}: "
-                f"{error_type}: {e}",
-                exc_info=True
+                f"OCRV1 pipeline failed for volume {ctx.volume.w_id}/{ctx.volume.i_id}: {error_type}: {e}",
+                exc_info=True,
             )
 
             from bec_orch.errors import RetryableTaskError, TerminalTaskError
@@ -265,17 +259,13 @@ class OCRV1JobWorker:
         log_memory_snapshot(f"[OCRV1] End volume {ctx.volume.w_id}/{ctx.volume.i_id}")
 
         logger.info(
-            f"OCRV1 job completed: {total_images} images, {nb_errors} errors, "
-            f"avg {avg_duration_per_page_ms:.2f}ms/page"
+            f"OCRV1 job completed: {total_images} images, {nb_errors} errors, avg {avg_duration_per_page_ms:.2f}ms/page"
         )
 
         from bec_orch.errors import TerminalTaskError
 
         if nb_errors > 0:
-            raise TerminalTaskError(
-                f"Volume had {nb_errors} processing errors. "
-                f"Errors by stage: {errors_by_stage}"
-            )
+            raise TerminalTaskError(f"Volume had {nb_errors} processing errors. Errors by stage: {errors_by_stage}")
 
         return TaskResult(
             total_images=total_images,
@@ -287,7 +277,7 @@ class OCRV1JobWorker:
 
     def _get_ld_artifacts_prefix(self, ctx: "JobContext") -> str:
         """Get the LD artifacts prefix for this volume/version.
-        
+
         LD artifacts are at: ldv1/{w_id}/{i_id}/{version}/
         OCR artifacts are at: ocrv1/{w_id}/{i_id}/{version}/
         We derive LD path from OCR path by replacing job name.
@@ -316,10 +306,7 @@ class OCRV1JobWorker:
         return self._s3.exists(s3_path)
 
     def _read_input_parquet(self, uri: str) -> pa.Table:
-        s3_path = uri.replace("s3://", "")
-        with self._s3.open(s3_path, "rb") as f:
-            table = pq.read_table(f)
-        return table
+        return pq.read_table(uri)
 
     def _write_output_parquet(self, records: list[dict], uri: str) -> None:
         schema = ocr_build_schema()
@@ -363,13 +350,13 @@ class OCRV1JobWorker:
     def _extract_and_ocr_lines(self, image: npt.NDArray, contours: list) -> list[str]:
         nb_lines = len(contours)
         logger.debug(f"Processing {nb_lines} line contours")
-        
+
         texts = []
         current_k = 1.7  # Adaptive k_factor for morphological operations
-        
+
         # Pre-allocate mask buffer (reused for each line)
         mask_buffer = np.zeros((image.shape[0], image.shape[1]), dtype=np.uint8)
-        
+
         for contour_points in contours:
             line_img, current_k = self._extract_line_from_contour(image, contour_points, current_k, mask_buffer)
             if line_img is None:
@@ -390,7 +377,7 @@ class OCRV1JobWorker:
 
         # Convert list of {x, y} dicts to numpy array for cv2
         pts = np.array([[p["x"], p["y"]] for p in contour_points], dtype=np.int32)
-        
+
         # Get bounding box height for adaptive extraction
         _, _, _, bbox_h = cv2.boundingRect(pts)
         if bbox_h <= 0:
@@ -402,7 +389,7 @@ class OCRV1JobWorker:
 
         # Extract line using morphological mask-based method
         line_img, adapted_k = get_line_image(image, mask_buffer, bbox_h, bbox_tolerance=3.0, k_factor=k_factor)
-        
+
         if line_img.size == 0:
             return None, adapted_k
 
@@ -410,14 +397,27 @@ class OCRV1JobWorker:
 
     def _ocr_line(self, line_img: npt.NDArray) -> str:
         """Preprocess line image and run OCR inference."""
+        original_width = line_img.shape[1]
         tensor = self._preprocess_line(line_img)
         logits = self.ocr_model.predict(tensor)
-        text = self.ocr_model.decode(logits)
+        logits = self._crop_logits(logits, original_width)
+        text = self.ctc_decoder.decode(logits)
         return text.strip().replace("§", " ")
+
+    def _crop_logits(self, logits: npt.NDArray, original_width: int) -> npt.NDArray:
+        """Crop logits timesteps to avoid CTC decoding on padding."""
+        vocab_size = len(self.ctc_decoder.ctc_vocab)
+        time_axis = 1 if logits.shape[0] == vocab_size else 0
+        total_timesteps = logits.shape[time_axis]
+        crop_timesteps = max(1, int(total_timesteps * original_width / self._input_width))
+
+        if time_axis == 1:
+            return logits[:, :crop_timesteps]
+        return logits[:crop_timesteps, :]
 
     def _preprocess_line(self, image: npt.NDArray) -> npt.NDArray:
         """Convert line image to model input tensor.
-        
+
         Steps: pad to aspect ratio -> binarize -> grayscale -> normalize
         """
         image = self._pad_to_model_size(image)
@@ -550,14 +550,18 @@ class OCRV1JobWorker:
 
         if len(img.shape) == 3:
             rotated = cv2.warpAffine(
-                img, M, (w, h),
+                img,
+                M,
+                (w, h),
                 flags=cv2.INTER_LINEAR,
                 borderMode=cv2.BORDER_CONSTANT,
                 borderValue=(0, 0, 0),
             )
         else:
             rotated = cv2.warpAffine(
-                img, M, (w, h),
+                img,
+                M,
+                (w, h),
                 flags=cv2.INTER_LINEAR,
                 borderMode=cv2.BORDER_CONSTANT,
                 borderValue=0,
@@ -588,9 +592,7 @@ class OCRV1JobWorker:
         if len(img.shape) == 3:
             out = np.empty_like(img)
             for ch in range(img.shape[2]):
-                warped = scipy.ndimage.map_coordinates(
-                    img[..., ch], coords, order=1, mode="constant", cval=0
-                )
+                warped = scipy.ndimage.map_coordinates(img[..., ch], coords, order=1, mode="constant", cval=0)
                 out[..., ch] = np.clip(warped, 0, 255).astype(np.uint8)
             return np.ascontiguousarray(out)
         else:

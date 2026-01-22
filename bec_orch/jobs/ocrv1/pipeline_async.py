@@ -652,20 +652,12 @@ class AsyncOCRPipeline:
 
                 try:
                     # Use module-level function for ProcessPoolExecutor
-                    num_lines = len(inferred.logits_list)
-                    start_time = time.perf_counter()
-
                     texts = await loop.run_in_executor(
                         self._ctc_executor,
                         _decode_page_for_process_pool,
                         inferred.logits_list,
                         self.ctc_decoder.ctc_vocab,
                         self.input_width,
-                    )
-
-                    decode_ms = (time.perf_counter() - start_time) * 1000
-                    logger.info(
-                        f"[CTCDecoder] Page {inferred.page_idx} decoded {num_lines} lines in {decode_ms:.0f}ms ({decode_ms / max(1, num_lines):.0f}ms/line)"
                     )
 
                     await self.q_results.put(

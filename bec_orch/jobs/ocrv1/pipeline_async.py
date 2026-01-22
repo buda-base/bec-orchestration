@@ -626,11 +626,13 @@ class AsyncOCRPipeline:
         pending_tasks: set[asyncio.Task] = set()
         pages_received = 0
 
-        # Limit concurrent page decodes to avoid overwhelming the executor
-        # With 8 workers and ~6 lines/page, allow 2 pages to decode simultaneously
-        # This prevents resource contention that causes progressive slowdown on Linux
-        max_concurrent_pages = max(1, self.ctc_workers // 4)
+        # Limit concurrent page decodes to balance parallelism vs resource contention
+        # Too many concurrent pages causes progressive slowdown on Linux
+        # Too few underutilizes the worker pool
+        # With N workers and ~6 lines/page, allow N/2 pages (3 lines per worker on average)
+        max_concurrent_pages = max(2, self.ctc_workers // 2)
         page_sem = asyncio.Semaphore(max_concurrent_pages)
+        logger.info(f"[CTCDecoder] Max concurrent page decodes: {max_concurrent_pages}")
 
         async def decode_one(inferred: InferredPage) -> None:
             if inferred.error or not inferred.logits_list:

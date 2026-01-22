@@ -1,6 +1,3 @@
-import multiprocessing
-import sys
-
 import numpy as np
 import numpy.typing as npt
 
@@ -16,9 +13,9 @@ BEAM_WIDTH = 50
 # Default is -5.0, more negative = less pruning, less negative = more pruning
 TOKEN_MIN_LOGP = -5.0
 
-# Check if we can use multiprocessing pool with decode_batch
-# Linux uses 'fork' which works, macOS uses 'spawn' which doesn't
-CAN_USE_MP_POOL = sys.platform != "darwin" and multiprocessing.get_start_method() == "fork"
+# Disable decode_batch with pool - it hangs because pool workers don't have decoder initialized.
+# The ProcessPoolExecutor approach works well on both Linux and macOS.
+CAN_USE_MP_POOL = False
 
 
 def _init_global_decoder(vocab: list[str]) -> None:

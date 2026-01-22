@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import Optional
+
 
 @dataclass(frozen=True)
 class OrchestrationConfig:
@@ -9,7 +9,7 @@ class OrchestrationConfig:
     job_name: str  # Job name (unique identifier, more user-friendly than ID)
 
     poll_wait_seconds: int = 20
-    max_messages: int = 1                 # sequential worker
+    max_messages: int = 1  # sequential worker
     visibility_timeout_seconds: int = 450  # 7.5 minutes - gives buffer for long volumes
     visibility_extend_every_seconds: int = 60  # Extend every 60s to prevent expiration
 

@@ -14,7 +14,7 @@ All stages connected by bounded asyncio.Queue for backpressure.
 import asyncio
 import logging
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
@@ -25,12 +25,43 @@ import numpy.typing as npt
 if TYPE_CHECKING:
     pass
 
-from .ctc_decoder import CTCDecoder
+from .ctc_decoder import CTCDecoder, decode_logits_beam_search, init_worker_process
 from .line import get_line_image
 from .model import OCRModel
 from .parquet_writer import StreamingParquetWriter
 
 logger = logging.getLogger(__name__)
+
+
+def _decode_page_for_process_pool(
+    logits_list: list[tuple[npt.NDArray, int]],
+    vocab: list[str],
+    input_width: int,
+) -> list[str]:
+    """
+    Module-level decode function for ProcessPoolExecutor.
+
+    This function can be pickled and sent to worker processes.
+    """
+    texts = []
+    vocab_size = len(vocab)
+
+    for logits, orig_w in logits_list:
+        # Crop logits
+        time_axis = 1 if logits.shape[0] == vocab_size else 0
+        total_timesteps = logits.shape[time_axis]
+        crop_timesteps = max(1, int(total_timesteps * orig_w / input_width))
+
+        if time_axis == 1:
+            cropped = logits[:, :crop_timesteps]
+        else:
+            cropped = logits[:crop_timesteps, :]
+
+        # Decode using module-level function
+        text = decode_logits_beam_search(cropped, vocab)
+        texts.append(text.strip().replace("§", " "))
+
+    return texts
 
 
 @dataclass
@@ -118,12 +149,13 @@ class AsyncOCRPipeline:
 
         # Thread pool for image processing (cv2 releases GIL)
         self._image_executor = ThreadPoolExecutor(max_workers=image_processor_workers, thread_name_prefix="img")
-        # Thread pool for CTC decoding
-        # Using ThreadPoolExecutor instead of ProcessPoolExecutor to:
-        # 1. Share single decoder instance (saves memory with large vocabs like 9887 chars)
-        # 2. Avoid process spawn overhead and repeated decoder initialization
-        # Note: pyctcdecode releases GIL during beam search, so threads can run in parallel
-        self._ctc_executor = ThreadPoolExecutor(max_workers=ctc_workers, thread_name_prefix="ctc")
+        # Process pool for CTC decoding (bypasses GIL for true parallelism)
+        # Use initializer to build decoder once per worker process
+        self._ctc_executor = ProcessPoolExecutor(
+            max_workers=ctc_workers,
+            initializer=init_worker_process,
+            initargs=(ctc_decoder.ctc_vocab,),
+        )
 
         logger.info(
             f"Pipeline config: prefetch={prefetch_concurrency}, img_workers={image_processor_workers}, ctc_workers={ctc_workers}, gpu_batch={gpu_batch_size}"
@@ -607,11 +639,13 @@ class AsyncOCRPipeline:
                     return
 
                 try:
-                    # Use instance method with shared decoder (ThreadPoolExecutor)
+                    # Use module-level function for ProcessPoolExecutor
                     texts = await loop.run_in_executor(
                         self._ctc_executor,
-                        self._decode_page_sync,
+                        _decode_page_for_process_pool,
                         inferred.logits_list,
+                        self.ctc_decoder.ctc_vocab,
+                        self.input_width,
                     )
 
                     await self.q_results.put(
@@ -659,32 +693,6 @@ class AsyncOCRPipeline:
             task.add_done_callback(pending_tasks.discard)
 
         logger.info(f"[CTCDecoder] Done, decoded {self.stats['decoded']} pages")
-
-    def _decode_page_sync(self, logits_list: list[tuple[npt.NDArray, int]]) -> list[str]:
-        """
-        Synchronous decode function for ThreadPoolExecutor.
-
-        Uses the shared CTCDecoder instance.
-        """
-        texts = []
-        vocab_size = len(self.ctc_decoder.ctc_vocab)
-
-        for logits, orig_w in logits_list:
-            # Crop logits based on original width
-            time_axis = 1 if logits.shape[0] == vocab_size else 0
-            total_timesteps = logits.shape[time_axis]
-            crop_timesteps = max(1, int(total_timesteps * orig_w / self.input_width))
-
-            if time_axis == 1:
-                cropped = logits[:, :crop_timesteps]
-            else:
-                cropped = logits[:crop_timesteps, :]
-
-            # Decode using shared decoder instance
-            text = self.ctc_decoder.decode(cropped)
-            texts.append(text.strip().replace("§", " "))
-
-        return texts
 
     async def _parquet_writer(self, output_uri: str, total_pages: int) -> None:
         """Write results to parquet using streaming writer."""

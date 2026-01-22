@@ -7,6 +7,10 @@ _GLOBAL_VOCAB_LEN = None  # Use length for fast comparison
 _GLOBAL_BLANK_SIGN = "<blk>"
 
 
+# Beam width for CTC decoding (default pyctcdecode is 100, but 20 is usually sufficient)
+BEAM_WIDTH = 20
+
+
 def _init_global_decoder(vocab: list[str]) -> None:
     """Initialize the global decoder for use in worker processes."""
     global _GLOBAL_DECODER, _GLOBAL_VOCAB_LEN
@@ -46,7 +50,7 @@ def decode_logits_beam_search(logits: npt.NDArray, vocab: list[str]) -> str:
     if _GLOBAL_DECODER is None:
         raise RuntimeError("CTC decoder not initialized")
 
-    return _GLOBAL_DECODER.decode(logits).replace(_GLOBAL_BLANK_SIGN, "")
+    return _GLOBAL_DECODER.decode(logits, beam_width=BEAM_WIDTH).replace(_GLOBAL_BLANK_SIGN, "")
 
 
 class CTCDecoder:
@@ -82,7 +86,7 @@ class CTCDecoder:
             logits = np.transpose(logits, axes=[1, 0])
 
         if self.use_beam_search and self._beam_decoder is not None:
-            return self._beam_decoder.decode(logits).replace(self.blank_sign, "")
+            return self._beam_decoder.decode(logits, beam_width=BEAM_WIDTH).replace(self.blank_sign, "")
 
         return self._greedy_decode(logits)
 

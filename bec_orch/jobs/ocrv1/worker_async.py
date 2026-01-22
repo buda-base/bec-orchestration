@@ -94,7 +94,7 @@ class OCRV1JobWorkerAsync:
         # Pipeline config
         self.prefetch_concurrency = 64
         self.image_processor_workers = 16
-        self.ctc_workers = 12  # ProcessPoolExecutor workers for CTC decoding
+        self.ctc_workers = 8
         self.gpu_batch_size = 16
 
         logger.info("OCR model loaded successfully")

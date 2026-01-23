@@ -97,6 +97,9 @@ class CTCDecoderNemo:
             )
             self._use_beam = False
 
+        # Set vocabulary - required by NeMo decoders
+        self._decoder.set_vocabulary(self.ctc_vocab)
+
         logger.info(
             f"[CTCDecoderNemo] Initialized: vocab_size={self.vocab_size}, device={device}, "
             f"beam_width={beam_width}, use_beam={self._use_beam}"

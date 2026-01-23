@@ -59,6 +59,7 @@ class CTCDecoderNemo:
         add_blank: bool,
         device: str = "cuda",
         beam_width: int = DEFAULT_BEAM_WIDTH,
+        kenlm_path: str | None = None,
     ):
         _check_nemo_available()
 
@@ -81,21 +82,43 @@ class CTCDecoderNemo:
         self.vocab_size = len(self.ctc_vocab)
 
         # Initialize NeMo beam search decoder
-        self._decoder = BeamCTCInfer(
-            blank_id=self.blank_idx,
-            beam_size=beam_width,
-            search_type="default",
-            return_best_hypothesis=True,
-        )
+        # Use KenLM language model if provided, otherwise use pyctcdecode without LM
+        if kenlm_path:
+            self._decoder = BeamCTCInfer(
+                blank_id=self.blank_idx,
+                beam_size=beam_width,
+                search_type="default",
+                return_best_hypothesis=True,
+                ngram_lm_model=kenlm_path,
+                ngram_lm_alpha=0.5,
+            )
+            logger.info(
+                f"[CTCDecoderNemo] Initialized with KenLM: vocab_size={self.vocab_size}, "
+                f"device={device}, beam_width={beam_width}, kenlm={kenlm_path}"
+            )
+        else:
+            from nemo.collections.asr.parts.submodules.ctc_beam_decoding import PyCTCDecodeConfig
+
+            pyctcdecode_cfg = PyCTCDecodeConfig(
+                beam_width=beam_width,
+                beam_prune_logp=-10.0,
+                token_min_logp=-5.0,
+            )
+            self._decoder = BeamCTCInfer(
+                blank_id=self.blank_idx,
+                beam_size=beam_width,
+                search_type="pyctcdecode",
+                return_best_hypothesis=True,
+                pyctcdecode_cfg=pyctcdecode_cfg,
+            )
+            logger.info(
+                f"[CTCDecoderNemo] Initialized without LM: vocab_size={self.vocab_size}, "
+                f"device={device}, beam_width={beam_width}"
+            )
 
         # Set vocabulary and decoding type - required by BeamCTCInfer
-        # decoding_type must be 'char' or 'subword', not 'beam'
         self._decoder.set_vocabulary(self.ctc_vocab)
         self._decoder.set_decoding_type("char")
-
-        logger.info(
-            f"[CTCDecoderNemo] Initialized: vocab_size={self.vocab_size}, device={device}, beam_width={beam_width}"
-        )
 
     def _indices_to_text(self, indices: list[int]) -> str:
         """Convert token indices to text string."""

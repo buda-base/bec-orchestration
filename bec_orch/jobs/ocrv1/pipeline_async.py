@@ -166,6 +166,7 @@ class AsyncOCRPipeline:
         token_min_logp: float | None = None,
         use_greedy_decode: bool = False,
         use_nemo_decoder: bool = False,
+        kenlm_path: str | None = None,
     ):
         self.ocr_model = ocr_model
         self.ctc_decoder = ctc_decoder
@@ -185,6 +186,7 @@ class AsyncOCRPipeline:
         self.vocab_prune_mode: str | None = None
         self.use_greedy_decode = use_greedy_decode
         self.use_nemo_decoder = use_nemo_decoder
+        self.kenlm_path = kenlm_path
         self._nemo_decoder = None  # Lazy init when needed
 
         # Bounded queues for backpressure
@@ -926,6 +928,7 @@ class AsyncOCRPipeline:
                                 add_blank=True,
                                 device="cuda",
                                 beam_width=self.beam_width or 10,
+                                kenlm_path=self.kenlm_path,
                             )
                         texts = self._nemo_decoder.decode_batch(cropped_logits_list)
                     elif self.use_greedy_decode:

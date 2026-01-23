@@ -231,6 +231,7 @@ def main():
     # Set to True to use GPU-accelerated CTC decoding instead of pyctcdecode
     worker.use_nemo_decoder = True
     worker.use_sequential_pipeline = False
+    worker.kenlm_path = os.path.join(os.environ.get("BEC_OCR_MODEL_DIR", "ocr_models"), "tibetan_5gram.binary")
 
     # Log actual settings that will be used
     logger.info("=== CTC Decoder Settings ===")

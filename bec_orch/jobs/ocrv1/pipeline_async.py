@@ -158,6 +158,7 @@ class AsyncOCRPipeline:
         beam_width: int | None = None,
         token_min_logp: float | None = None,
         use_greedy_decode: bool = False,
+        use_k2_decoder: bool = False,
     ):
         self.ocr_model = ocr_model
         self.ctc_decoder = ctc_decoder
@@ -176,6 +177,8 @@ class AsyncOCRPipeline:
         self.vocab_prune_threshold: float | None = None
         self.vocab_prune_mode: str | None = None
         self.use_greedy_decode = use_greedy_decode
+        self.use_k2_decoder = use_k2_decoder
+        self._k2_decoder = None  # Lazy init when needed
 
         # Bounded queues for backpressure
         self.q_fetched: asyncio.Queue = asyncio.Queue(maxsize=64)
@@ -722,7 +725,19 @@ class AsyncOCRPipeline:
                             cropped = logits[:crop_timesteps, :]
                         cropped_logits_list.append(cropped)
 
-                    if self.use_greedy_decode:
+                    if self.use_k2_decoder:
+                        # k2 GPU decoder - batch decode all lines on GPU
+                        if self._k2_decoder is None:
+                            from .ctc_decoder_k2 import CTCDecoderK2
+
+                            self._k2_decoder = CTCDecoderK2(
+                                self.ctc_decoder.charset,
+                                add_blank=True,
+                                device="cuda",
+                                beam_width=self.beam_width or 10,
+                            )
+                        texts = self._k2_decoder.decode_batch(cropped_logits_list)
+                    elif self.use_greedy_decode:
                         # Greedy decode is fast (~0.6ms/line), run directly without ProcessPoolExecutor
                         texts = []
                         for cropped in cropped_logits_list:

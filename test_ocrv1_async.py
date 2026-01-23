@@ -227,6 +227,10 @@ def main():
     # Greedy decode is 17x faster but loses ~1% accuracy - use beam search for production
     worker.use_greedy_decode = False
 
+    # k2 GPU decoder - requires k2 installed (pip install k2)
+    # Set to True to use GPU-accelerated CTC decoding instead of pyctcdecode
+    worker.use_k2_decoder = False
+
     # Log actual settings that will be used
     logger.info("=== CTC Decoder Settings ===")
     logger.info(f"  beam_width: {worker.beam_width} (None = module default 50)")
@@ -234,6 +238,7 @@ def main():
     logger.info(f"  vocab_prune_threshold: {worker.vocab_prune_threshold} (None = module default)")
     logger.info(f"  vocab_prune_mode: {worker.vocab_prune_mode} (None = module default 'line')")
     logger.info(f"  use_greedy_decode: {worker.use_greedy_decode}")
+    logger.info(f"  use_k2_decoder: {worker.use_k2_decoder}")
 
     logger.info("Running async OCR...")
     result = worker.run(ctx)

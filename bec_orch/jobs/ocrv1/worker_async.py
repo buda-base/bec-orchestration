@@ -101,6 +101,7 @@ class OCRV1JobWorkerAsync:
         self.vocab_prune_threshold: float | None = None  # None = use module default
         self.vocab_prune_mode: str | None = None  # None = use module default
         self.use_greedy_decode: bool = False  # Use fast greedy decode instead of beam search
+        self.use_k2_decoder: bool = True  # Use k2 GPU decoder instead of pyctcdecode
 
         logger.info("OCR model loaded successfully")
 
@@ -177,6 +178,7 @@ class OCRV1JobWorkerAsync:
             beam_width=self.beam_width,
             token_min_logp=self.token_min_logp,
             use_greedy_decode=self.use_greedy_decode,
+            use_k2_decoder=self.use_k2_decoder,
         )
         pipeline.vocab_prune_threshold = self.vocab_prune_threshold
         pipeline.vocab_prune_mode = self.vocab_prune_mode

@@ -89,8 +89,9 @@ class CTCDecoderNemo:
         )
 
         # Set vocabulary and decoding type - required by BeamCTCInfer
+        # decoding_type must be 'char' or 'subword', not 'beam'
         self._decoder.set_vocabulary(self.ctc_vocab)
-        self._decoder.set_decoding_type("beam")
+        self._decoder.set_decoding_type("char")
 
         logger.info(
             f"[CTCDecoderNemo] Initialized: vocab_size={self.vocab_size}, device={device}, beam_width={beam_width}"

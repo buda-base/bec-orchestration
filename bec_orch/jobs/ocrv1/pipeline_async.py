@@ -49,7 +49,7 @@ def _decode_single_line(
     token_min_logp: float | None = None,
     vocab_prune_threshold: float | None = None,
     vocab_prune_mode: str | None = None,
-) -> tuple[str, float, int]:
+) -> str:
     """
     Decode a single line's pre-cropped logits. Used for parallel line decoding.
 
@@ -61,18 +61,11 @@ def _decode_single_line(
         token_min_logp: Token min log prob (passed to worker)
         vocab_prune_threshold: Vocabulary pruning threshold (passed to worker)
         vocab_prune_mode: Vocabulary pruning mode (passed to worker)
-
-    Returns:
-        Tuple of (decoded_text, decode_time_ms, worker_pid)
     """
-    import os
-
-    start = time.perf_counter()
     text = decode_logits_beam_search(
         cropped_logits, vocab, keep_mask, beam_width, token_min_logp, vocab_prune_threshold, vocab_prune_mode
     )
-    elapsed_ms = (time.perf_counter() - start) * 1000
-    return text.strip().replace("§", " "), elapsed_ms, os.getpid()
+    return text.strip().replace("§", " ")
 
 
 def _decode_page_lines(
@@ -260,190 +253,6 @@ class AsyncOCRPipeline:
         elapsed = time.perf_counter() - start_time
         logger.info(
             f"[AsyncOCRPipeline] Completed in {elapsed:.2f}s - "
-            f"fetched={self.stats['fetched']}, processed={self.stats['processed']}, "
-            f"inferred={self.stats['inferred']}, decoded={self.stats['decoded']}, "
-            f"errors={self.stats['errors']}"
-        )
-
-        return self.stats
-
-    async def run_sequential(
-        self,
-        pages: list[tuple[int, str, dict]],  # (page_idx, filename, ld_row)
-        output_parquet_uri: str,
-    ) -> dict:
-        """
-        Run pipeline in two phases to eliminate CPU contention:
-        Phase 1: Prefetch + Image Processing + GPU Inference (collect all logits in memory)
-        Phase 2: CTC Decode all collected logits + Write to Parquet
-        """
-        start_time = time.perf_counter()
-        total_pages = len(pages)
-
-        logger.info(f"[AsyncOCRPipeline] Starting SEQUENTIAL pipeline for {total_pages} pages")
-
-        # Phase 1: Collect all inferred pages in memory
-        all_inferred: list[InferredPage] = []
-
-        async def collect_inferred():
-            """Collect all inferred pages instead of passing to CTC decoder."""
-            while True:
-                msg = await self.q_inferred.get()
-                if isinstance(msg, EndOfStream):
-                    break
-                all_inferred.append(msg)
-
-        # Queue depth monitor
-        async def monitor_queues():
-            while True:
-                await asyncio.sleep(5)
-                logger.info(
-                    f"[QueueDepth] fetched={self.q_fetched.qsize()}, processed={self.q_processed.qsize()}, "
-                    f"inferred={self.q_inferred.qsize()}, collected={len(all_inferred)}"
-                )
-
-        monitor_task = asyncio.create_task(monitor_queues(), name="monitor")
-
-        # Phase 1: Run prefetch + image processing + GPU inference
-        logger.info("[Phase 1] Starting GPU inference phase...")
-        phase1_tasks = [
-            asyncio.create_task(self._prefetcher(pages), name="prefetcher"),
-            asyncio.create_task(self._image_processor(), name="image_processor"),
-            asyncio.create_task(self._gpu_inference(), name="gpu_inference"),
-            asyncio.create_task(collect_inferred(), name="collector"),
-        ]
-
-        await asyncio.gather(*phase1_tasks, return_exceptions=True)
-        monitor_task.cancel()  # Stop monitor after Phase 1
-        phase1_time = time.perf_counter() - start_time
-        logger.info(f"[Phase 1] GPU inference complete in {phase1_time:.2f}s - collected {len(all_inferred)} pages")
-
-        # Phase 2: CTC decode all collected logits at once (max parallelism)
-        logger.info("[Phase 2] Starting CTC decode phase...")
-        phase2_start = time.perf_counter()
-
-        vocab = self.ctc_decoder.ctc_vocab
-        vocab_size = len(vocab)
-        loop = asyncio.get_event_loop()
-
-        # Prepare all lines from all pages for batch submission
-        # Each entry: (page_idx, line_idx, cropped_logits, inferred)
-        all_decode_tasks: list[tuple[int, int, npt.NDArray, InferredPage]] = []
-
-        for inferred in all_inferred:
-            if inferred.error or not inferred.logits_list:
-                # Handle error pages immediately
-                await self.q_results.put(
-                    PageResult(
-                        page_idx=inferred.page_idx,
-                        filename=inferred.filename,
-                        source_etag=inferred.source_etag,
-                        texts=[],
-                        error=inferred.error,
-                    )
-                )
-                continue
-
-            for line_idx, (logits, orig_w) in enumerate(inferred.logits_list):
-                # Handle transposed logits (vocab, time) -> (time, vocab)
-                needs_transpose = logits.shape[0] == vocab_size
-                if needs_transpose:
-                    crop_timesteps = max(1, int(logits.shape[1] * orig_w / self.input_width))
-                    cropped = logits[:, :crop_timesteps].T
-                else:
-                    crop_timesteps = max(1, int(logits.shape[0] * orig_w / self.input_width))
-                    cropped = logits[:crop_timesteps, :]
-                all_decode_tasks.append((inferred.page_idx, line_idx, cropped, inferred))
-
-        logger.info(f"[Phase 2] Submitting {len(all_decode_tasks)} lines to {self.ctc_workers} workers...")
-
-        # Submit ALL lines at once to ProcessPoolExecutor
-        futures = []
-        for page_idx, line_idx, cropped, inferred in all_decode_tasks:
-            future = loop.run_in_executor(
-                self._ctc_executor,
-                _decode_single_line,
-                cropped,
-                vocab,
-                None,  # keep_mask - disabled for simplicity
-                self.beam_width,
-                self.token_min_logp,
-                self.vocab_prune_threshold,
-                self.vocab_prune_mode,
-            )
-            futures.append((page_idx, line_idx, future, inferred))
-
-        # Wait for decodes with progress logging
-        decode_start = time.perf_counter()
-        total_lines = len(futures)
-        completed = 0
-        all_texts = []
-
-        # Wait for all decodes and log each line as it completes
-        pending = {f[2]: (f[0], f[1], f[3]) for f in futures}  # future -> (page_idx, line_idx, inferred)
-        results = [None] * total_lines
-
-        while pending:
-            done, _ = await asyncio.wait(pending.keys(), return_when=asyncio.FIRST_COMPLETED)
-            for future in done:
-                page_idx, line_idx, inferred = pending.pop(future)
-                text, decode_ms, worker_pid = future.result()
-                idx = next(i for i, f in enumerate(futures) if f[2] is future)
-                results[idx] = text
-                completed += 1
-                logger.info(
-                    f"[CTC] line {completed}/{total_lines} page={page_idx} line={line_idx} worker={worker_pid} {decode_ms:.1f}ms"
-                )
-
-        all_texts = results
-        decode_time = time.perf_counter() - decode_start
-        logger.info(
-            f"[Phase 2] All {len(all_texts)} lines decoded in {decode_time:.2f}s ({decode_time * 1000 / len(all_texts):.1f}ms/line)"
-        )
-
-        # Group results by page
-        page_results: dict[int, tuple[InferredPage, list[tuple[int, str]]]] = {}
-        for (page_idx, line_idx, _, inferred), text in zip(futures, all_texts):
-            if page_idx not in page_results:
-                page_results[page_idx] = (inferred, [])
-            page_results[page_idx][1].append((line_idx, text))
-
-        # Sort lines within each page and build PageResult objects
-        results_to_write = []
-        for page_idx in sorted(page_results.keys()):
-            inferred, line_texts = page_results[page_idx]
-            line_texts.sort(key=lambda x: x[0])
-            texts = [t for _, t in line_texts]
-            results_to_write.append(
-                PageResult(
-                    page_idx=page_idx,
-                    filename=inferred.filename,
-                    source_etag=inferred.source_etag,
-                    texts=texts,
-                    error=None,
-                )
-            )
-            self.stats["decoded"] += 1
-
-        # Emit results and write to parquet concurrently
-        async def emit_results():
-            for result in results_to_write:
-                await self.q_results.put(result)
-            await self.q_results.put(EOS)
-
-        await asyncio.gather(
-            emit_results(),
-            self._parquet_writer(output_parquet_uri, total_pages),
-        )
-
-        phase2_time = time.perf_counter() - phase2_start
-        logger.info(
-            f"[Phase 2] CTC decode + write complete in {phase2_time:.2f}s - decoded {self.stats['decoded']} pages"
-        )
-
-        elapsed = time.perf_counter() - start_time
-        logger.info(
-            f"[AsyncOCRPipeline] SEQUENTIAL completed in {elapsed:.2f}s - "
             f"fetched={self.stats['fetched']}, processed={self.stats['processed']}, "
             f"inferred={self.stats['inferred']}, decoded={self.stats['decoded']}, "
             f"errors={self.stats['errors']}"
@@ -937,9 +746,7 @@ class AsyncOCRPipeline:
                             futures.append(future)
 
                         # Wait for all lines to complete in parallel
-                        # _decode_single_line returns (text, decode_ms, worker_pid)
-                        results = list(await asyncio.gather(*futures))
-                        texts = [r[0] for r in results]
+                        texts = list(await asyncio.gather(*futures))
 
                     decode_ms = (time.perf_counter() - start_time) * 1000
                     logger.info(

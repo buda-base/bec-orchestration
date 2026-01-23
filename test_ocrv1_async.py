@@ -227,9 +227,6 @@ def main():
     # Greedy decode is 17x faster but loses ~1% accuracy - use beam search for production
     worker.use_greedy_decode = False
 
-    # Sequential pipeline: complete GPU inference first, then CTC decode
-    worker.use_sequential_pipeline = True
-
     # Log actual settings that will be used
     logger.info("=== CTC Decoder Settings ===")
     logger.info(f"  beam_width: {worker.beam_width} (None = module default 50)")

@@ -101,7 +101,6 @@ class OCRV1JobWorkerAsync:
         self.vocab_prune_threshold: float | None = None  # None = use module default
         self.vocab_prune_mode: str | None = None  # None = use module default
         self.use_greedy_decode: bool = False  # Use fast greedy decode instead of beam search
-        self.use_sequential_pipeline: bool = False  # Run GPU inference first, then CTC decode
 
         logger.info("OCR model loaded successfully")
 
@@ -183,10 +182,7 @@ class OCRV1JobWorkerAsync:
         pipeline.vocab_prune_mode = self.vocab_prune_mode
 
         try:
-            if self.use_sequential_pipeline:
-                stats = await pipeline.run_sequential(pages, output_parquet_uri)
-            else:
-                stats = await pipeline.run(pages, output_parquet_uri)
+            stats = await pipeline.run(pages, output_parquet_uri)
         finally:
             await pipeline.close()
 

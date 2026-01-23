@@ -4,14 +4,22 @@ Test script for async OCRV1JobWorker.
 
 Usage:
     BEC_OCR_MODEL_DIR=ocr_models/Woodblock python test_ocrv1_async.py
+
+To generate a reference parquet with max accuracy settings:
+    BEC_OCR_MODEL_DIR=ocr_models/Woodblock python test_ocrv1_async.py --reference
 """
 
+import argparse
 import gzip
 import hashlib
 import json
 import logging
 import os
+import shutil
+from difflib import SequenceMatcher
+from pathlib import Path
 
+import pandas as pd
 import s3fs
 
 from bec_orch.core.models import ArtifactLocation, VolumeManifest, VolumeRef
@@ -22,6 +30,96 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
 logger = logging.getLogger("test_ocrv1_async")
+
+# Path to reference parquet for accuracy comparison
+REFERENCE_PARQUET_PATH = Path("test/reference_output.parquet")
+
+
+def compare_with_reference(current_parquet_path: str) -> float | None:
+    """
+    Compare current OCR output with reference parquet.
+
+    Returns character-level accuracy as a percentage (0-100),
+    or None if reference file doesn't exist.
+    """
+    if not REFERENCE_PARQUET_PATH.exists():
+        logger.warning(
+            f"Reference parquet not found at {REFERENCE_PARQUET_PATH}. Run with --reference first to generate it."
+        )
+        return None
+
+    try:
+        reference_df = pd.read_parquet(REFERENCE_PARQUET_PATH)
+        current_df = pd.read_parquet(current_parquet_path)
+    except Exception as e:
+        logger.error(f"Failed to load parquet files for comparison: {e}")
+        return None
+
+    # Match by img_file_name
+    ref_by_file = {row.img_file_name: row for row in reference_df.itertuples()}
+    cur_by_file = {row.img_file_name: row for row in current_df.itertuples()}
+
+    total_chars = 0
+    matching_chars = 0
+    pages_compared = 0
+    pages_with_diff = 0
+
+    for filename in ref_by_file:
+        if filename not in cur_by_file:
+            continue
+
+        ref_row = ref_by_file[filename]
+        cur_row = cur_by_file[filename]
+
+        # Get text content (handle list/array of lines or single string)
+        ref_texts = ref_row.texts if hasattr(ref_row, "texts") else []
+        cur_texts = cur_row.texts if hasattr(cur_row, "texts") else []
+
+        # Convert to list if numpy array
+        if hasattr(ref_texts, "tolist"):
+            ref_texts = ref_texts.tolist()
+        if hasattr(cur_texts, "tolist"):
+            cur_texts = cur_texts.tolist()
+
+        # Join all lines into single string for comparison
+        if isinstance(ref_texts, list):
+            ref_text = "\n".join(str(t) for t in ref_texts if t)
+        else:
+            ref_text = str(ref_texts) if ref_texts else ""
+
+        if isinstance(cur_texts, list):
+            cur_text = "\n".join(str(t) for t in cur_texts if t)
+        else:
+            cur_text = str(cur_texts) if cur_texts else ""
+
+        if not ref_text:
+            continue
+
+        # Character-level similarity using SequenceMatcher
+        matcher = SequenceMatcher(None, ref_text, cur_text)
+        ratio = matcher.ratio()
+
+        total_chars += len(ref_text)
+        matching_chars += int(len(ref_text) * ratio)
+        pages_compared += 1
+
+        if ratio < 1.0:
+            pages_with_diff += 1
+
+    if total_chars == 0:
+        logger.warning("No characters to compare")
+        return None
+
+    accuracy = (matching_chars / total_chars) * 100
+
+    logger.info("=== ACCURACY COMPARISON ===")
+    logger.info(f"Pages compared: {pages_compared}")
+    logger.info(f"Pages with differences: {pages_with_diff}")
+    logger.info(f"Total characters: {total_chars}")
+    logger.info(f"Matching characters: {matching_chars}")
+    logger.info(f"Character accuracy: {accuracy:.2f}%")
+
+    return accuracy
 
 
 def get_volume_manifest_from_s3(w_id: str, i_id: str, bucket: str) -> VolumeManifest:
@@ -53,6 +151,23 @@ def get_volume_manifest_from_s3(w_id: str, i_id: str, bucket: str) -> VolumeMani
 
 
 def main():
+    parser = argparse.ArgumentParser(description="Test async OCRV1 job worker")
+    parser.add_argument(
+        "--reference",
+        action="store_true",
+        help="Generate reference parquet with max accuracy settings (beam=100, no pruning)",
+    )
+    args = parser.parse_args()
+
+    # Reference mode settings (will be applied to worker after initialization)
+    reference_beam_width = 100 if args.reference else None
+    reference_token_min_logp = -20.0 if args.reference else None
+
+    if args.reference:
+        logger.info("=== REFERENCE MODE: Max accuracy settings ===")
+        logger.info(f"  beam_width: {reference_beam_width}")
+        logger.info(f"  token_min_logp: {reference_token_min_logp}")
+
     w_id = "W1KG4313"
     i_id = "I1KG17496"
     version = "8eba7b"
@@ -103,10 +218,57 @@ def main():
 
     worker = OCRV1JobWorkerAsync()
 
+    # Apply reference mode settings to worker (these get passed to worker processes)
+    if args.reference:
+        worker.beam_width = reference_beam_width
+        worker.token_min_logp = reference_token_min_logp
+        worker.vocab_prune_threshold = None  # Explicitly disable pruning for max accuracy
+
+    # Greedy decode is 17x faster but loses ~1% accuracy - use beam search for production
+    worker.use_greedy_decode = False
+
+    # Sequential pipeline: complete GPU inference first, then CTC decode
+    worker.use_sequential_pipeline = True
+
+    # Log actual settings that will be used
+    logger.info("=== CTC Decoder Settings ===")
+    logger.info(f"  beam_width: {worker.beam_width} (None = module default 50)")
+    logger.info(f"  token_min_logp: {worker.token_min_logp} (None = module default -5.0)")
+    logger.info(f"  vocab_prune_threshold: {worker.vocab_prune_threshold} (None = module default)")
+    logger.info(f"  vocab_prune_mode: {worker.vocab_prune_mode} (None = module default 'line')")
+    logger.info(f"  use_greedy_decode: {worker.use_greedy_decode}")
+
     logger.info("Running async OCR...")
     result = worker.run(ctx)
 
     logger.info(f"Result: {result}")
+
+    # Download output parquet from S3
+    s3 = s3fs.S3FileSystem()
+    current_parquet_s3 = f"{ocr_dest_bucket}/{artifacts_location.prefix}/{artifacts_location.basename}.parquet"
+    temp_parquet = "temp_current_output.parquet"
+
+    try:
+        with s3.open(current_parquet_s3, "rb") as f_in:
+            with open(temp_parquet, "wb") as f_out:
+                shutil.copyfileobj(f_in, f_out)
+
+        if args.reference:
+            # Ensure directory exists and save as reference parquet
+            REFERENCE_PARQUET_PATH.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy(temp_parquet, REFERENCE_PARQUET_PATH)
+            logger.info(f"Reference parquet saved to: {REFERENCE_PARQUET_PATH}")
+        else:
+            # Compare with reference if available
+            accuracy = compare_with_reference(temp_parquet)
+            if accuracy is not None:
+                logger.info(f"\n>>> ACCURACY vs REFERENCE: {accuracy:.2f}% <<<\n")
+    except Exception as e:
+        logger.warning(f"Could not process output parquet: {e}")
+    finally:
+        if os.path.exists(temp_parquet):
+            os.remove(temp_parquet)
+
     logger.info("Done!")
 
 

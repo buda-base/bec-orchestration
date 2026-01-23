@@ -209,3 +209,6 @@ __marimo__/
 
 # OCR models
 ocr_models/
+
+# Test
+test/

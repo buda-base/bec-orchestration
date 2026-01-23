@@ -230,6 +230,8 @@ def main():
     # k2 GPU decoder - requires k2 installed (pip install k2)
     # Set to True to use GPU-accelerated CTC decoding instead of pyctcdecode
     worker.use_k2_decoder = False
+    # Sequential pipeline: complete GPU inference first, then CTC decode
+    worker.use_sequential_pipeline = False
 
     # Log actual settings that will be used
     logger.info("=== CTC Decoder Settings ===")
@@ -239,6 +241,7 @@ def main():
     logger.info(f"  vocab_prune_mode: {worker.vocab_prune_mode} (None = module default 'line')")
     logger.info(f"  use_greedy_decode: {worker.use_greedy_decode}")
     logger.info(f"  use_k2_decoder: {worker.use_k2_decoder}")
+    logger.info(f"  use_sequential_pipeline: {worker.use_sequential_pipeline}")
 
     logger.info("Running async OCR...")
     result = worker.run(ctx)

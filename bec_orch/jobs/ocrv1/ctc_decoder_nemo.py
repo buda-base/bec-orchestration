@@ -24,7 +24,6 @@ logger = logging.getLogger(__name__)
 
 try:
     from nemo.collections.asr.parts.submodules.ctc_beam_decoding import BeamCTCInfer
-    from nemo.collections.asr.parts.submodules.ctc_greedy_decoding import GreedyCTCInfer
 
     NEMO_AVAILABLE = True
 except ImportError:
@@ -81,28 +80,20 @@ class CTCDecoderNemo:
 
         self.vocab_size = len(self.ctc_vocab)
 
-        # Initialize NeMo decoder
-        # For beam search, use BeamCTCInfer; for greedy, use GreedyCTCInfer
-        if beam_width > 1:
-            self._decoder = BeamCTCInfer(
-                blank_id=self.blank_idx,
-                beam_size=beam_width,
-            )
-            self._use_beam = True
-        else:
-            self._decoder = GreedyCTCInfer(
-                blank_id=self.blank_idx,
-                preserve_alignments=False,
-                compute_timestamps=False,
-            )
-            self._use_beam = False
+        # Initialize NeMo beam search decoder
+        self._decoder = BeamCTCInfer(
+            blank_id=self.blank_idx,
+            beam_size=beam_width,
+            search_type="default",
+            return_best_hypothesis=True,
+        )
 
-        # Set vocabulary - required by NeMo decoders
+        # Set vocabulary and decoding type - required by BeamCTCInfer
         self._decoder.set_vocabulary(self.ctc_vocab)
+        self._decoder.set_decoding_type("beam")
 
         logger.info(
-            f"[CTCDecoderNemo] Initialized: vocab_size={self.vocab_size}, device={device}, "
-            f"beam_width={beam_width}, use_beam={self._use_beam}"
+            f"[CTCDecoderNemo] Initialized: vocab_size={self.vocab_size}, device={device}, beam_width={beam_width}"
         )
 
     def _indices_to_text(self, indices: list[int]) -> str:
@@ -133,35 +124,23 @@ class CTCDecoderNemo:
         # Create length tensor
         lengths = torch.tensor([log_probs.shape[1]], dtype=torch.long, device=self.device)
 
-        # Decode
+        # Decode using BeamCTCInfer
         with torch.no_grad():
-            if self._use_beam:
-                # BeamCTCInfer returns different format
-                hypotheses = self._decoder(
-                    decoder_output=log_probs,
-                    decoder_lengths=lengths,
-                )
-                # Get best hypothesis
-                if hypotheses and len(hypotheses) > 0:
-                    best_hyp = hypotheses[0]
-                    if hasattr(best_hyp, "y_sequence"):
-                        indices = best_hyp.y_sequence
-                    elif isinstance(best_hyp, (list, tuple)):
-                        indices = best_hyp[0] if best_hyp else []
-                    else:
-                        indices = []
+            hypotheses = self._decoder(
+                decoder_output=log_probs,
+                decoder_lengths=lengths,
+            )
+            if hypotheses and len(hypotheses) > 0:
+                hyp = hypotheses[0]
+                if hasattr(hyp, "y_sequence"):
+                    indices = hyp.y_sequence
+                elif hasattr(hyp, "text"):
+                    # Some versions return text directly
+                    return hyp.text.replace("§", " ")
                 else:
                     indices = []
             else:
-                # GreedyCTCInfer
-                hypotheses, _ = self._decoder(
-                    decoder_output=log_probs,
-                    decoder_lengths=lengths,
-                )
-                if hypotheses and len(hypotheses) > 0:
-                    indices = hypotheses[0].y_sequence if hasattr(hypotheses[0], "y_sequence") else hypotheses[0]
-                else:
-                    indices = []
+                indices = []
 
         # Convert indices to text
         if isinstance(indices, torch.Tensor):
@@ -211,18 +190,12 @@ class CTCDecoderNemo:
         # Create lengths tensor
         lengths_tensor = torch.tensor(lengths, dtype=torch.long, device=self.device)
 
-        # Batch decode
+        # Batch decode using BeamCTCInfer
         with torch.no_grad():
-            if self._use_beam:
-                hypotheses = self._decoder(
-                    decoder_output=padded,
-                    decoder_lengths=lengths_tensor,
-                )
-            else:
-                hypotheses, _ = self._decoder(
-                    decoder_output=padded,
-                    decoder_lengths=lengths_tensor,
-                )
+            hypotheses = self._decoder(
+                decoder_output=padded,
+                decoder_lengths=lengths_tensor,
+            )
 
         # Extract texts
         texts = []

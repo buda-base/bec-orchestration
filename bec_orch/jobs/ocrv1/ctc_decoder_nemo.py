@@ -63,7 +63,7 @@ class CTCDecoderNemo:
     ):
         _check_nemo_available()
 
-        self.blank_sign = "<blk>"
+        self.blank_sign = "<pad>"
         self.device = device
         self.beam_width = beam_width
 

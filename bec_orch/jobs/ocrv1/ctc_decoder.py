@@ -191,7 +191,7 @@ def _decode_logits_greedy_with_confidence_internal(
 
 
 def decode_logits_greedy_with_confidence(
-    logits: npt.NDArray, vocab: list[str]
+    logits: npt.NDArray, vocab: list[str], logits_are_log_probs: bool = True
 ) -> tuple[str, float]:
     """
     Greedy CTC decode with confidence score.
@@ -200,13 +200,17 @@ def decode_logits_greedy_with_confidence(
     non-blank timestep, normalized by the number of decoded characters.
 
     Args:
-        logits: shape (time, vocab) - raw logits (will be converted to log probs)
+        logits: shape (time, vocab) - log probabilities (or raw logits if logits_are_log_probs=False)
         vocab: vocabulary list (index 0 should be blank)
+        logits_are_log_probs: if True (default), logits are already log probabilities
 
     Returns:
         Tuple of (decoded text, confidence score as mean log prob)
     """
-    log_probs = _apply_log_softmax(logits)
+    if logits_are_log_probs:
+        log_probs = logits
+    else:
+        log_probs = _apply_log_softmax(logits)
     return _decode_logits_greedy_with_confidence_internal(log_probs, vocab)
 
 
@@ -216,6 +220,7 @@ def decode_logits_hybrid_global(
     confidence_threshold: float | None = None,
     beam_width: int | None = None,
     token_min_logp: float | None = None,
+    logits_are_log_probs: bool = True,
 ) -> str:
     """
     Hybrid decode: try greedy first, fall back to beam search if confidence is low.
@@ -225,12 +230,13 @@ def decode_logits_hybrid_global(
     use beam search only when needed.
 
     Args:
-        logits: shape (time, vocab) - raw logits (will be converted to log probs once)
+        logits: shape (time, vocab) - log probabilities (or raw logits if logits_are_log_probs=False)
         vocab: vocabulary list (index 0 should be blank)
         confidence_threshold: if greedy confidence is above this, use greedy result.
                               Defaults to GREEDY_CONFIDENCE_THRESHOLD.
         beam_width: beam width for fallback beam search (defaults to BEAM_WIDTH)
         token_min_logp: token min log prob for beam search (defaults to TOKEN_MIN_LOGP)
+        logits_are_log_probs: if True (default), logits are already log probabilities
 
     Returns:
         Decoded text string
@@ -238,8 +244,11 @@ def decode_logits_hybrid_global(
     if confidence_threshold is None:
         confidence_threshold = GREEDY_CONFIDENCE_THRESHOLD
 
-    # Apply log_softmax ONCE here - used for both greedy and beam search
-    log_probs = _apply_log_softmax(logits)
+    # Use log probs directly if already converted, otherwise apply log_softmax
+    if logits_are_log_probs:
+        log_probs = logits
+    else:
+        log_probs = _apply_log_softmax(logits)
 
     # Try greedy first (using already-converted log probs)
     text, confidence = _decode_logits_greedy_with_confidence_internal(log_probs, vocab)
@@ -334,9 +343,10 @@ def _decode_logits_beam_search_internal(
     t0 = time.perf_counter()
     orig_shape = log_probs.shape
 
-    # Collapse consecutive blank-dominant frames to reduce sequence length
-    log_probs = _collapse_blank_frames(log_probs)
-    collapsed_shape = log_probs.shape
+    # Skip collapse - vocab pruning already provides big gains, and collapse
+    # adds ~40-60ms overhead for modest T reduction (800->450)
+    # log_probs = _collapse_blank_frames(log_probs)
+    collapsed_shape = log_probs.shape  # Same as orig since we skip collapse
 
     t1 = time.perf_counter()
 
@@ -412,6 +422,7 @@ def decode_logits_beam_search(
     token_min_logp: float | None = None,
     vocab_prune_threshold: float | None = None,
     vocab_prune_mode: str | None = None,
+    logits_are_log_probs: bool = True,
 ) -> str:
     """
     Module-level beam search decode function for use with ProcessPoolExecutor.
@@ -420,7 +431,7 @@ def decode_logits_beam_search(
     Expects logits in (time, vocab) shape - caller must transpose if needed.
 
     Args:
-        logits: shape (time, vocab) - raw logits (will be converted to log probs)
+        logits: shape (time, vocab) - log probabilities (or raw logits if logits_are_log_probs=False)
         vocab: full vocabulary list
         keep_mask: optional pre-computed mask for per-page pruning mode.
                    If None and vocab_prune_mode is "line", computes per-line mask.
@@ -428,17 +439,20 @@ def decode_logits_beam_search(
         token_min_logp: token min log prob (defaults to module TOKEN_MIN_LOGP)
         vocab_prune_threshold: vocabulary pruning threshold (defaults to module VOCAB_PRUNE_THRESHOLD)
         vocab_prune_mode: "line" or "page" (defaults to module VOCAB_PRUNE_MODE)
+        logits_are_log_probs: if True (default), logits are already log probabilities from model.
+                              If False, apply log_softmax here.
     """
     import time
 
     t0 = time.perf_counter()
 
-    # Apply log_softmax ONCE here to convert raw logits to log probabilities
-    # This avoids pyctcdecode's expensive internal check and recomputation
-    log_probs = _apply_log_softmax(logits)
-
-    t_softmax = time.perf_counter()
-    logging.info(f"[CTC timing] softmax={1000*(t_softmax-t0):.1f}ms for shape {logits.shape}")
+    # Apply log_softmax only if not already done (e.g., model already applied it)
+    if logits_are_log_probs:
+        log_probs = logits
+    else:
+        log_probs = _apply_log_softmax(logits)
+        t_softmax = time.perf_counter()
+        logging.info(f"[CTC timing] softmax={1000*(t_softmax-t0):.1f}ms for shape {logits.shape}")
 
     return _decode_logits_beam_search_internal(
         log_probs, vocab, keep_mask, beam_width, token_min_logp,
@@ -467,19 +481,26 @@ class CTCDecoder:
         # Build beam search decoder
         self._beam_decoder = build_ctcdecoder(self.ctc_vocab)
 
-    def decode(self, logits: npt.NDArray, keep_mask: npt.NDArray | None = None) -> str:
+    def decode(
+        self, logits: npt.NDArray, keep_mask: npt.NDArray | None = None,
+        logits_are_log_probs: bool = True
+    ) -> str:
         """Decode logits to text using beam search.
 
         Args:
-            logits: shape (time, vocab) or (vocab, time) - raw logits
+            logits: shape (time, vocab) or (vocab, time) - log probabilities (or raw logits)
             keep_mask: optional pre-computed mask for per-page pruning mode
+            logits_are_log_probs: if True (default), logits are already log probabilities
         """
         # Ensure shape is (time, vocab)
         if logits.shape[0] == len(self.ctc_vocab):
             logits = np.transpose(logits, axes=[1, 0])
 
-        # Apply log_softmax once to convert raw logits to log probabilities
-        log_probs = _apply_log_softmax(logits)
+        # Apply log_softmax only if not already done
+        if logits_are_log_probs:
+            log_probs = logits
+        else:
+            log_probs = _apply_log_softmax(logits)
 
         # Collapse consecutive blank-dominant frames to reduce sequence length
         log_probs = _collapse_blank_frames(log_probs)

@@ -50,7 +50,8 @@ def _decode_single_line(
     token_min_logp: float | None = None,
     vocab_prune_threshold: float | None = None,
     vocab_prune_mode: str | None = None,
-) -> tuple[str, float, int]:
+    submit_time: float | None = None,
+) -> tuple[str, float, float, int]:
     """
     Decode a single line's pre-cropped logits. Used for parallel line decoding.
 
@@ -62,18 +63,22 @@ def _decode_single_line(
         token_min_logp: Token min log prob (passed to worker)
         vocab_prune_threshold: Vocabulary pruning threshold (passed to worker)
         vocab_prune_mode: Vocabulary pruning mode (passed to worker)
+        submit_time: Time when task was submitted (for IPC measurement)
 
     Returns:
-        Tuple of (decoded_text, decode_time_ms, worker_pid)
+        Tuple of (decoded_text, decode_time_ms, ipc_overhead_ms, worker_pid)
     """
     import os
+
+    arrival_time = time.perf_counter()
+    ipc_in_ms = (arrival_time - submit_time) * 1000 if submit_time else 0.0
 
     start = time.perf_counter()
     text = decode_logits_beam_search(
         cropped_logits, vocab, keep_mask, beam_width, token_min_logp, vocab_prune_threshold, vocab_prune_mode
     )
     elapsed_ms = (time.perf_counter() - start) * 1000
-    return text.strip().replace("§", " "), elapsed_ms, os.getpid()
+    return text.strip().replace("§", " "), elapsed_ms, ipc_in_ms, os.getpid()
 
 
 def _decode_page_lines(
@@ -368,6 +373,7 @@ class AsyncOCRPipeline:
         # Submit ALL lines at once to ProcessPoolExecutor
         futures = []
         for page_idx, line_idx, cropped, inferred in all_decode_tasks:
+            submit_time = time.perf_counter()
             future = loop.run_in_executor(
                 self._ctc_executor,
                 _decode_single_line,
@@ -378,8 +384,9 @@ class AsyncOCRPipeline:
                 self.token_min_logp,
                 self.vocab_prune_threshold,
                 self.vocab_prune_mode,
+                submit_time,
             )
-            futures.append((page_idx, line_idx, future, inferred))
+            futures.append((page_idx, line_idx, future, inferred, submit_time))
 
         # Wait for decodes with progress logging
         decode_start = time.perf_counter()
@@ -388,30 +395,41 @@ class AsyncOCRPipeline:
         all_texts = []
 
         # Wait for all decodes and log each line as it completes
-        pending = {f[2]: (f[0], f[1], f[3]) for f in futures}  # future -> (page_idx, line_idx, inferred)
+        pending = {f[2]: (f[0], f[1], f[3], f[4]) for f in futures}  # future -> (page_idx, line_idx, inferred, submit_time)
         results = [None] * total_lines
+        total_ipc_in = 0.0
+        total_ipc_out = 0.0
 
         while pending:
             done, _ = await asyncio.wait(pending.keys(), return_when=asyncio.FIRST_COMPLETED)
             for future in done:
-                page_idx, line_idx, inferred = pending.pop(future)
-                text, decode_ms, worker_pid = future.result()
+                page_idx, line_idx, inferred, submit_time = pending.pop(future)
+                result_time = time.perf_counter()
+                text, decode_ms, ipc_in_ms, worker_pid = future.result()
+                ipc_out_ms = (time.perf_counter() - result_time) * 1000  # Time to deserialize result
+                total_roundtrip_ms = (result_time - submit_time) * 1000
+                total_ipc_in += ipc_in_ms
+                total_ipc_out += ipc_out_ms
                 idx = next(i for i, f in enumerate(futures) if f[2] is future)
                 results[idx] = text
                 completed += 1
                 logger.info(
-                    f"[CTC] line {completed}/{total_lines} page={page_idx} line={line_idx} worker={worker_pid} {decode_ms:.1f}ms"
+                    f"[CTC] line {completed}/{total_lines} page={page_idx} line={line_idx} worker={worker_pid} "
+                    f"decode={decode_ms:.1f}ms ipc_in={ipc_in_ms:.1f}ms roundtrip={total_roundtrip_ms:.1f}ms"
                 )
 
         all_texts = results
         decode_time = time.perf_counter() - decode_start
+        avg_ipc_in = total_ipc_in / len(all_texts) if all_texts else 0
+        avg_ipc_out = total_ipc_out / len(all_texts) if all_texts else 0
         logger.info(
-            f"[Phase 2] All {len(all_texts)} lines decoded in {decode_time:.2f}s ({decode_time * 1000 / len(all_texts):.1f}ms/line)"
+            f"[Phase 2] All {len(all_texts)} lines decoded in {decode_time:.2f}s "
+            f"({decode_time * 1000 / len(all_texts):.1f}ms/line, avg_ipc_in={avg_ipc_in:.1f}ms, avg_ipc_out={avg_ipc_out:.1f}ms)"
         )
 
         # Group results by page
         page_results: dict[int, tuple[InferredPage, list[tuple[int, str]]]] = {}
-        for (page_idx, line_idx, _, inferred), text in zip(futures, all_texts):
+        for (page_idx, line_idx, _, inferred, _), text in zip(futures, all_texts):
             if page_idx not in page_results:
                 page_results[page_idx] = (inferred, [])
             page_results[page_idx][1].append((line_idx, text))

@@ -81,38 +81,41 @@ class CTCDecoderNemo:
 
         self.vocab_size = len(self.ctc_vocab)
 
-        # Initialize NeMo beam search decoder
-        # Use KenLM language model if provided, otherwise use pyctcdecode without LM
+        # Initialize NeMo beam search decoder using flashlight backend
+        # flashlight-text must be installed: pip install flashlight-text
+        from nemo.collections.asr.parts.submodules.ctc_beam_decoding import FlashlightConfig
+
+        flashlight_cfg = FlashlightConfig(
+            beam_size_token=beam_width,
+            beam_threshold=25.0,
+        )
+
         if kenlm_path:
+            flashlight_cfg.lexicon_path = None  # Lexicon-free decoding
+            flashlight_cfg.beam_size_token = beam_width
             self._decoder = BeamCTCInfer(
                 blank_id=self.blank_idx,
                 beam_size=beam_width,
-                search_type="default",
+                search_type="flashlight",
                 return_best_hypothesis=True,
                 ngram_lm_model=kenlm_path,
                 ngram_lm_alpha=0.5,
+                flashlight_cfg=flashlight_cfg,
             )
             logger.info(
-                f"[CTCDecoderNemo] Initialized with KenLM: vocab_size={self.vocab_size}, "
+                f"[CTCDecoderNemo] Initialized with flashlight+KenLM: vocab_size={self.vocab_size}, "
                 f"device={device}, beam_width={beam_width}, kenlm={kenlm_path}"
             )
         else:
-            from nemo.collections.asr.parts.submodules.ctc_beam_decoding import PyCTCDecodeConfig
-
-            pyctcdecode_cfg = PyCTCDecodeConfig(
-                beam_width=beam_width,
-                beam_prune_logp=-10.0,
-                token_min_logp=-5.0,
-            )
             self._decoder = BeamCTCInfer(
                 blank_id=self.blank_idx,
                 beam_size=beam_width,
-                search_type="pyctcdecode",
+                search_type="flashlight",
                 return_best_hypothesis=True,
-                pyctcdecode_cfg=pyctcdecode_cfg,
+                flashlight_cfg=flashlight_cfg,
             )
             logger.info(
-                f"[CTCDecoderNemo] Initialized without LM: vocab_size={self.vocab_size}, "
+                f"[CTCDecoderNemo] Initialized with flashlight (no LM): vocab_size={self.vocab_size}, "
                 f"device={device}, beam_width={beam_width}"
             )
 

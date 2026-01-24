@@ -2,6 +2,8 @@ import logging
 
 import numpy as np
 import numpy.typing as npt
+from scipy.special import log_softmax as scipy_log_softmax
+
 from pyctcdecode.decoder import build_ctcdecoder
 
 # Suppress noisy pyctcdecode warnings
@@ -10,7 +12,7 @@ logging.getLogger("pyctcdecode.alphabet").setLevel(logging.ERROR)
 # Global decoder instance for multiprocessing (avoids pickling issues)
 _GLOBAL_DECODER = None
 _GLOBAL_VOCAB_LEN = None  # Use length for fast comparison
-_GLOBAL_BLANK_SIGN = "<blk>"
+_GLOBAL_BLANK_SIGN = "<pad>"
 
 # Beam width for CTC decoding
 BEAM_WIDTH = 64
@@ -27,13 +29,30 @@ GREEDY_CONFIDENCE_THRESHOLD = -0.5
 BLANK_IDX = 0
 
 # Vocabulary pruning threshold - tokens with max log prob below this are removed
+# Tokens that never exceed this threshold at any timestep are pruned from vocabulary
 # Set to None to disable vocabulary pruning
-VOCAB_PRUNE_THRESHOLD = None  # Disabled - doesn't help performance and hurts accuracy
+VOCAB_PRUNE_THRESHOLD = -10.0  # Prune tokens with max log prob below -10
 
 # Pruning mode: "line" (per-line pruning) or "page" (shared across page)
 # Per-line gives smaller vocab but rebuilds decoder per line
 # Per-page shares one decoder across all lines in a page
 VOCAB_PRUNE_MODE = "line"
+
+
+def _apply_log_softmax(logits: npt.NDArray) -> npt.NDArray:
+    """
+    Apply log_softmax to convert raw logits to log probabilities.
+
+    This is done once here to avoid pyctcdecode doing it internally.
+    Uses scipy which is faster than numpy implementation.
+
+    Args:
+        logits: shape (time, vocab) - raw logits from OCR model
+
+    Returns:
+        log_probs: shape (time, vocab) - log probabilities (sum to 0 in log space per row)
+    """
+    return scipy_log_softmax(logits, axis=1).astype(np.float32)
 
 
 def _prune_vocabulary(
@@ -110,9 +129,10 @@ def decode_logits_greedy(logits: npt.NDArray, vocab: list[str]) -> str:
     Simple greedy CTC decode - take argmax at each timestep, collapse repeats.
 
     Much faster than beam search (~0.6ms vs ~11ms) but may be slightly less accurate.
+    Note: argmax works the same on raw logits or log probabilities.
 
     Args:
-        logits: shape (time, vocab) - log probabilities
+        logits: shape (time, vocab) - raw logits or log probabilities
         vocab: vocabulary list (index 0 should be blank)
 
     Returns:
@@ -131,6 +151,45 @@ def decode_logits_greedy(logits: npt.NDArray, vocab: list[str]) -> str:
     return "".join(decoded)
 
 
+def _decode_logits_greedy_with_confidence_internal(
+    log_probs: npt.NDArray, vocab: list[str]
+) -> tuple[str, float]:
+    """
+    Greedy CTC decode with confidence score (internal, expects log probabilities).
+
+    Args:
+        log_probs: shape (time, vocab) - log probabilities (already softmaxed)
+        vocab: vocabulary list (index 0 should be blank)
+
+    Returns:
+        Tuple of (decoded text, confidence score as mean log prob)
+    """
+    # Get best token at each timestep
+    best_path = np.argmax(log_probs, axis=1)
+    best_log_probs = log_probs[np.arange(len(log_probs)), best_path]
+
+    # Collapse repeats and remove blanks, accumulate log probs
+    decoded = []
+    scores = []
+    prev = -1
+    for i, idx in enumerate(best_path):
+        if idx != prev and idx != 0:  # 0 is blank
+            decoded.append(vocab[idx])
+            scores.append(best_log_probs[i])
+        prev = idx
+
+    text = "".join(decoded)
+
+    # Confidence is mean log probability of decoded tokens
+    if scores:
+        confidence = float(np.mean(scores))
+    else:
+        # Empty decode - low confidence
+        confidence = -float("inf")
+
+    return text, confidence
+
+
 def decode_logits_greedy_with_confidence(
     logits: npt.NDArray, vocab: list[str]
 ) -> tuple[str, float]:
@@ -141,36 +200,14 @@ def decode_logits_greedy_with_confidence(
     non-blank timestep, normalized by the number of decoded characters.
 
     Args:
-        logits: shape (time, vocab) - log probabilities
+        logits: shape (time, vocab) - raw logits (will be converted to log probs)
         vocab: vocabulary list (index 0 should be blank)
 
     Returns:
         Tuple of (decoded text, confidence score as mean log prob)
     """
-    # Get best token at each timestep
-    best_path = np.argmax(logits, axis=1)
-    best_log_probs = logits[np.arange(len(logits)), best_path]
-
-    # Collapse repeats and remove blanks, accumulate log probs
-    decoded = []
-    log_probs = []
-    prev = -1
-    for i, idx in enumerate(best_path):
-        if idx != prev and idx != 0:  # 0 is blank
-            decoded.append(vocab[idx])
-            log_probs.append(best_log_probs[i])
-        prev = idx
-
-    text = "".join(decoded)
-
-    # Confidence is mean log probability of decoded tokens
-    if log_probs:
-        confidence = float(np.mean(log_probs))
-    else:
-        # Empty decode - low confidence
-        confidence = -float("inf")
-
-    return text, confidence
+    log_probs = _apply_log_softmax(logits)
+    return _decode_logits_greedy_with_confidence_internal(log_probs, vocab)
 
 
 def decode_logits_hybrid_global(
@@ -188,7 +225,7 @@ def decode_logits_hybrid_global(
     use beam search only when needed.
 
     Args:
-        logits: shape (time, vocab) - log probabilities
+        logits: shape (time, vocab) - raw logits (will be converted to log probs once)
         vocab: vocabulary list (index 0 should be blank)
         confidence_threshold: if greedy confidence is above this, use greedy result.
                               Defaults to GREEDY_CONFIDENCE_THRESHOLD.
@@ -201,16 +238,22 @@ def decode_logits_hybrid_global(
     if confidence_threshold is None:
         confidence_threshold = GREEDY_CONFIDENCE_THRESHOLD
 
-    # Try greedy first
-    text, confidence = decode_logits_greedy_with_confidence(logits, vocab)
+    # Apply log_softmax ONCE here - used for both greedy and beam search
+    log_probs = _apply_log_softmax(logits)
+
+    # Try greedy first (using already-converted log probs)
+    text, confidence = _decode_logits_greedy_with_confidence_internal(log_probs, vocab)
 
     # If confidence is high enough, use greedy result
     if confidence >= confidence_threshold:
         return text
 
     # Fall back to beam search for low-confidence lines
-    return decode_logits_beam_search(
-        logits, vocab, beam_width=beam_width, token_min_logp=token_min_logp
+    # Pass log_probs directly - decode_logits_beam_search will NOT recompute softmax
+    # since we pass log_probs as logits and it will apply log_softmax again (which is idempotent-ish)
+    # Actually, we need to skip the log_softmax in beam_search since we already did it
+    return _decode_logits_beam_search_internal(
+        log_probs, vocab, beam_width=beam_width, token_min_logp=token_min_logp
     )
 
 
@@ -255,6 +298,112 @@ def init_worker_process(vocab: list[str]) -> None:
     _init_global_decoder(vocab)
 
 
+def _decode_logits_beam_search_internal(
+    log_probs: npt.NDArray,
+    vocab: list[str],
+    keep_mask: npt.NDArray | None = None,
+    beam_width: int | None = None,
+    token_min_logp: float | None = None,
+    vocab_prune_threshold: float | None = None,
+    vocab_prune_mode: str | None = None,
+) -> str:
+    """
+    Internal beam search decode function - expects log probabilities (already softmaxed).
+
+    Args:
+        log_probs: shape (time, vocab) - log probabilities (already converted via log_softmax)
+        vocab: full vocabulary list
+        keep_mask: optional pre-computed mask for per-page pruning mode
+        beam_width: beam width for decoding (defaults to module BEAM_WIDTH)
+        token_min_logp: token min log prob (defaults to module TOKEN_MIN_LOGP)
+        vocab_prune_threshold: vocabulary pruning threshold (defaults to module VOCAB_PRUNE_THRESHOLD)
+        vocab_prune_mode: "line" or "page" (defaults to module VOCAB_PRUNE_MODE)
+    """
+    import time
+
+    # Use passed values or fall back to module defaults
+    if beam_width is None:
+        beam_width = BEAM_WIDTH
+    if token_min_logp is None:
+        token_min_logp = TOKEN_MIN_LOGP
+    if vocab_prune_threshold is None:
+        vocab_prune_threshold = VOCAB_PRUNE_THRESHOLD
+    if vocab_prune_mode is None:
+        vocab_prune_mode = VOCAB_PRUNE_MODE
+
+    t0 = time.perf_counter()
+    orig_shape = log_probs.shape
+
+    # Collapse consecutive blank-dominant frames to reduce sequence length
+    log_probs = _collapse_blank_frames(log_probs)
+    collapsed_shape = log_probs.shape
+
+    t1 = time.perf_counter()
+
+    # Apply vocabulary pruning if enabled (on log-probabilities)
+    if vocab_prune_threshold is not None:
+        if vocab_prune_mode == "line" and keep_mask is None:
+            # Per-line pruning: compute mask for this line only
+            pruned_logits, pruned_vocab, _ = _prune_vocabulary(log_probs, vocab, vocab_prune_threshold)
+        elif keep_mask is not None:
+            # Per-page pruning: use pre-computed mask
+            pruned_logits = log_probs[:, keep_mask]
+            pruned_vocab = [vocab[i] for i in np.where(keep_mask)[0]]
+        else:
+            # Pruning disabled or invalid mode
+            pruned_logits = log_probs
+            pruned_vocab = vocab
+
+        t2 = time.perf_counter()
+
+        # Build a decoder for the pruned vocabulary and decode
+        # Pass logits_are_log_probs=True to skip pyctcdecode's internal log_softmax
+        decoder = build_ctcdecoder(pruned_vocab)
+        t3 = time.perf_counter()
+
+        result = decoder.decode(
+            pruned_logits, beam_width=beam_width, token_min_logp=token_min_logp,
+            logits_are_log_probs=True
+        )
+        t4 = time.perf_counter()
+
+        logging.info(
+            f"[CTC timing] orig={orig_shape}, collapsed={collapsed_shape}, pruned_vocab={len(pruned_vocab)}, "
+            f"collapse={1000*(t1-t0):.1f}ms, prune={1000*(t2-t1):.1f}ms, "
+            f"build_decoder={1000*(t3-t2):.1f}ms, decode={1000*(t4-t3):.1f}ms"
+        )
+        return result.replace(_GLOBAL_BLANK_SIGN, "")
+
+    t2 = time.perf_counter()
+
+    # No pruning - use global decoder
+    global _GLOBAL_DECODER, _GLOBAL_VOCAB_LEN
+
+    if _GLOBAL_DECODER is None or _GLOBAL_VOCAB_LEN != len(vocab):
+        _init_global_decoder(vocab)
+
+    if _GLOBAL_DECODER is None:
+        raise RuntimeError("CTC decoder not initialized")
+
+    t3 = time.perf_counter()
+
+    # Pass logits_are_log_probs=True to skip pyctcdecode's internal log_softmax
+    result = _GLOBAL_DECODER.decode(
+        log_probs, beam_width=beam_width, token_min_logp=token_min_logp,
+        logits_are_log_probs=True
+    )
+
+    t4 = time.perf_counter()
+
+    logging.info(
+        f"[CTC timing] orig={orig_shape}, collapsed={collapsed_shape}, "
+        f"collapse={1000*(t1-t0):.1f}ms, init={1000*(t3-t2):.1f}ms, "
+        f"decode={1000*(t4-t3):.1f}ms"
+    )
+
+    return result.replace(_GLOBAL_BLANK_SIGN, "")
+
+
 def decode_logits_beam_search(
     logits: npt.NDArray,
     vocab: list[str],
@@ -271,7 +420,7 @@ def decode_logits_beam_search(
     Expects logits in (time, vocab) shape - caller must transpose if needed.
 
     Args:
-        logits: shape (time, vocab) - log probabilities
+        logits: shape (time, vocab) - raw logits (will be converted to log probs)
         vocab: full vocabulary list
         keep_mask: optional pre-computed mask for per-page pruning mode.
                    If None and vocab_prune_mode is "line", computes per-line mask.
@@ -280,48 +429,20 @@ def decode_logits_beam_search(
         vocab_prune_threshold: vocabulary pruning threshold (defaults to module VOCAB_PRUNE_THRESHOLD)
         vocab_prune_mode: "line" or "page" (defaults to module VOCAB_PRUNE_MODE)
     """
-    # Use passed values or fall back to module defaults
-    if beam_width is None:
-        beam_width = BEAM_WIDTH
-    if token_min_logp is None:
-        token_min_logp = TOKEN_MIN_LOGP
-    if vocab_prune_threshold is None:
-        vocab_prune_threshold = VOCAB_PRUNE_THRESHOLD
-    if vocab_prune_mode is None:
-        vocab_prune_mode = VOCAB_PRUNE_MODE
-    # Collapse consecutive blank-dominant frames to reduce sequence length
-    logits = _collapse_blank_frames(logits)
+    import time
 
-    # Apply vocabulary pruning if enabled
-    if vocab_prune_threshold is not None:
-        if vocab_prune_mode == "line" and keep_mask is None:
-            # Per-line pruning: compute mask for this line only
-            pruned_logits, pruned_vocab, _ = _prune_vocabulary(logits, vocab, vocab_prune_threshold)
-        elif keep_mask is not None:
-            # Per-page pruning: use pre-computed mask
-            pruned_logits = logits[:, keep_mask]
-            pruned_vocab = [vocab[i] for i in np.where(keep_mask)[0]]
-        else:
-            # Pruning disabled or invalid mode
-            pruned_logits = logits
-            pruned_vocab = vocab
+    t0 = time.perf_counter()
 
-        # Build a decoder for the pruned vocabulary and decode
-        decoder = build_ctcdecoder(pruned_vocab)
-        result = decoder.decode(pruned_logits, beam_width=beam_width, token_min_logp=token_min_logp)
-        return result.replace(_GLOBAL_BLANK_SIGN, "")
+    # Apply log_softmax ONCE here to convert raw logits to log probabilities
+    # This avoids pyctcdecode's expensive internal check and recomputation
+    log_probs = _apply_log_softmax(logits)
 
-    # No pruning - use global decoder
-    global _GLOBAL_DECODER, _GLOBAL_VOCAB_LEN
+    t_softmax = time.perf_counter()
+    logging.info(f"[CTC timing] softmax={1000*(t_softmax-t0):.1f}ms for shape {logits.shape}")
 
-    if _GLOBAL_DECODER is None or _GLOBAL_VOCAB_LEN != len(vocab):
-        _init_global_decoder(vocab)
-
-    if _GLOBAL_DECODER is None:
-        raise RuntimeError("CTC decoder not initialized")
-
-    return _GLOBAL_DECODER.decode(logits, beam_width=beam_width, token_min_logp=token_min_logp).replace(
-        _GLOBAL_BLANK_SIGN, ""
+    return _decode_logits_beam_search_internal(
+        log_probs, vocab, keep_mask, beam_width, token_min_logp,
+        vocab_prune_threshold, vocab_prune_mode
     )
 
 
@@ -329,7 +450,7 @@ class CTCDecoder:
     """CTC decoder with beam search."""
 
     def __init__(self, charset: str | list[str], add_blank: bool):
-        self.blank_sign = "<blk>"
+        self.blank_sign = "<pad>"
 
         if isinstance(charset, str):
             self.charset = list(charset)
@@ -350,32 +471,37 @@ class CTCDecoder:
         """Decode logits to text using beam search.
 
         Args:
-            logits: shape (time, vocab) or (vocab, time) - log probabilities
+            logits: shape (time, vocab) or (vocab, time) - raw logits
             keep_mask: optional pre-computed mask for per-page pruning mode
         """
         # Ensure shape is (time, vocab)
         if logits.shape[0] == len(self.ctc_vocab):
             logits = np.transpose(logits, axes=[1, 0])
 
+        # Apply log_softmax once to convert raw logits to log probabilities
+        log_probs = _apply_log_softmax(logits)
+
         # Collapse consecutive blank-dominant frames to reduce sequence length
-        logits = _collapse_blank_frames(logits)
+        log_probs = _collapse_blank_frames(log_probs)
 
         # Apply vocabulary pruning if enabled
         if VOCAB_PRUNE_THRESHOLD is not None:
             if VOCAB_PRUNE_MODE == "line" and keep_mask is None:
-                pruned_logits, pruned_vocab, _ = _prune_vocabulary(logits, self.ctc_vocab, VOCAB_PRUNE_THRESHOLD)
+                pruned_logits, pruned_vocab, _ = _prune_vocabulary(log_probs, self.ctc_vocab, VOCAB_PRUNE_THRESHOLD)
             elif keep_mask is not None:
-                pruned_logits = logits[:, keep_mask]
+                pruned_logits = log_probs[:, keep_mask]
                 pruned_vocab = [self.ctc_vocab[i] for i in np.where(keep_mask)[0]]
             else:
-                pruned_logits = logits
+                pruned_logits = log_probs
                 pruned_vocab = self.ctc_vocab
 
             decoder = build_ctcdecoder(pruned_vocab)
-            return decoder.decode(pruned_logits, beam_width=BEAM_WIDTH, token_min_logp=TOKEN_MIN_LOGP).replace(
-                self.blank_sign, ""
-            )
+            return decoder.decode(
+                pruned_logits, beam_width=BEAM_WIDTH, token_min_logp=TOKEN_MIN_LOGP,
+                logits_are_log_probs=True
+            ).replace(self.blank_sign, "")
 
-        return self._beam_decoder.decode(logits, beam_width=BEAM_WIDTH, token_min_logp=TOKEN_MIN_LOGP).replace(
-            self.blank_sign, ""
-        )
+        return self._beam_decoder.decode(
+            log_probs, beam_width=BEAM_WIDTH, token_min_logp=TOKEN_MIN_LOGP,
+            logits_are_log_probs=True
+        ).replace(self.blank_sign, "")

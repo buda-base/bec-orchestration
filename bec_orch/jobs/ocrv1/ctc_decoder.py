@@ -13,11 +13,15 @@ _GLOBAL_VOCAB_LEN = None  # Use length for fast comparison
 _GLOBAL_BLANK_SIGN = "<blk>"
 
 # Beam width for CTC decoding
-BEAM_WIDTH = 80
+BEAM_WIDTH = 64
 
 # Token pruning - skip tokens with log probability below this threshold
-# Default is -5.0, more negative = less pruning, less negative = more pruning
-TOKEN_MIN_LOGP = -5.0
+# Default is -3.0, more negative = less pruning, less negative = more pruning
+TOKEN_MIN_LOGP = -3.0
+
+# Greedy confidence threshold for hybrid decoding
+# If greedy decode confidence is above this, skip beam search
+GREEDY_CONFIDENCE_THRESHOLD = -0.5
 
 # Blank index in vocabulary (blank is always first token)
 BLANK_IDX = 0
@@ -125,6 +129,89 @@ def decode_logits_greedy(logits: npt.NDArray, vocab: list[str]) -> str:
             decoded.append(vocab[idx])
         prev = idx
     return "".join(decoded)
+
+
+def decode_logits_greedy_with_confidence(
+    logits: npt.NDArray, vocab: list[str]
+) -> tuple[str, float]:
+    """
+    Greedy CTC decode with confidence score.
+
+    The confidence is the mean log probability of the best token at each
+    non-blank timestep, normalized by the number of decoded characters.
+
+    Args:
+        logits: shape (time, vocab) - log probabilities
+        vocab: vocabulary list (index 0 should be blank)
+
+    Returns:
+        Tuple of (decoded text, confidence score as mean log prob)
+    """
+    # Get best token at each timestep
+    best_path = np.argmax(logits, axis=1)
+    best_log_probs = logits[np.arange(len(logits)), best_path]
+
+    # Collapse repeats and remove blanks, accumulate log probs
+    decoded = []
+    log_probs = []
+    prev = -1
+    for i, idx in enumerate(best_path):
+        if idx != prev and idx != 0:  # 0 is blank
+            decoded.append(vocab[idx])
+            log_probs.append(best_log_probs[i])
+        prev = idx
+
+    text = "".join(decoded)
+
+    # Confidence is mean log probability of decoded tokens
+    if log_probs:
+        confidence = float(np.mean(log_probs))
+    else:
+        # Empty decode - low confidence
+        confidence = -float("inf")
+
+    return text, confidence
+
+
+def decode_logits_hybrid_global(
+    logits: npt.NDArray,
+    vocab: list[str],
+    confidence_threshold: float | None = None,
+    beam_width: int | None = None,
+    token_min_logp: float | None = None,
+) -> str:
+    """
+    Hybrid decode: try greedy first, fall back to beam search if confidence is low.
+
+    This provides a good speed/accuracy tradeoff - greedy is ~17x faster but
+    may be less accurate on difficult lines. By checking confidence, we can
+    use beam search only when needed.
+
+    Args:
+        logits: shape (time, vocab) - log probabilities
+        vocab: vocabulary list (index 0 should be blank)
+        confidence_threshold: if greedy confidence is above this, use greedy result.
+                              Defaults to GREEDY_CONFIDENCE_THRESHOLD.
+        beam_width: beam width for fallback beam search (defaults to BEAM_WIDTH)
+        token_min_logp: token min log prob for beam search (defaults to TOKEN_MIN_LOGP)
+
+    Returns:
+        Decoded text string
+    """
+    if confidence_threshold is None:
+        confidence_threshold = GREEDY_CONFIDENCE_THRESHOLD
+
+    # Try greedy first
+    text, confidence = decode_logits_greedy_with_confidence(logits, vocab)
+
+    # If confidence is high enough, use greedy result
+    if confidence >= confidence_threshold:
+        return text
+
+    # Fall back to beam search for low-confidence lines
+    return decode_logits_beam_search(
+        logits, vocab, beam_width=beam_width, token_min_logp=token_min_logp
+    )
 
 
 def _collapse_blank_frames(logits: npt.NDArray) -> npt.NDArray:

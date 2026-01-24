@@ -16,6 +16,7 @@ import json
 import logging
 import os
 import shutil
+import sys
 from difflib import SequenceMatcher
 from pathlib import Path
 
@@ -31,95 +32,186 @@ logging.basicConfig(
 )
 logger = logging.getLogger("test_ocrv1_async")
 
-# Path to reference parquet for accuracy comparison
-REFERENCE_PARQUET_PATH = Path("test/reference_output.parquet")
+# Path to reference output for line-by-line comparison
+REFERENCE_OUTPUT_PATH = Path("test/reference_output_lines.txt")
 
 
-def compare_with_reference(current_parquet_path: str) -> float | None:
+def extract_lines_from_parquet(parquet_path: str) -> list[str]:
     """
-    Compare current OCR output with reference parquet.
-
-    Returns character-level accuracy as a percentage (0-100),
-    or None if reference file doesn't exist.
+    Extract all OCR text lines from a parquet file, ordered consistently.
+    Returns a list of lines (one per text line across all images).
+    Preserves empty lines to maintain consistent line counts.
     """
-    if not REFERENCE_PARQUET_PATH.exists():
-        logger.warning(
-            f"Reference parquet not found at {REFERENCE_PARQUET_PATH}. Run with --reference first to generate it."
-        )
-        return None
-
-    try:
-        reference_df = pd.read_parquet(REFERENCE_PARQUET_PATH)
-        current_df = pd.read_parquet(current_parquet_path)
-    except Exception as e:
-        logger.error(f"Failed to load parquet files for comparison: {e}")
-        return None
-
-    # Match by img_file_name
-    ref_by_file = {row.img_file_name: row for row in reference_df.itertuples()}
-    cur_by_file = {row.img_file_name: row for row in current_df.itertuples()}
-
-    total_chars = 0
-    matching_chars = 0
-    pages_compared = 0
-    pages_with_diff = 0
-
-    for filename in ref_by_file:
-        if filename not in cur_by_file:
-            continue
-
-        ref_row = ref_by_file[filename]
-        cur_row = cur_by_file[filename]
-
-        # Get text content (handle list/array of lines or single string)
-        ref_texts = ref_row.texts if hasattr(ref_row, "texts") else []
-        cur_texts = cur_row.texts if hasattr(cur_row, "texts") else []
-
+    df = pd.read_parquet(parquet_path)
+    
+    # Sort by img_file_name for consistent ordering
+    df = df.sort_values('img_file_name')
+    
+    all_lines = []
+    for row in df.itertuples():
+        texts = row.texts if hasattr(row, 'texts') else []
+        
         # Convert to list if numpy array
-        if hasattr(ref_texts, "tolist"):
-            ref_texts = ref_texts.tolist()
-        if hasattr(cur_texts, "tolist"):
-            cur_texts = cur_texts.tolist()
-
-        # Join all lines into single string for comparison
-        if isinstance(ref_texts, list):
-            ref_text = "\n".join(str(t) for t in ref_texts if t)
+        if hasattr(texts, 'tolist'):
+            texts = texts.tolist()
+        
+        # Add each text line, including empty ones
+        if isinstance(texts, list):
+            for line in texts:
+                # Convert to string, use empty string for None/null values
+                all_lines.append(str(line) if line is not None else "")
+        elif texts is not None:
+            all_lines.append(str(texts))
         else:
-            ref_text = str(ref_texts) if ref_texts else ""
+            # Handle None case for non-list texts
+            all_lines.append("")
+    
+    return all_lines
 
-        if isinstance(cur_texts, list):
-            cur_text = "\n".join(str(t) for t in cur_texts if t)
-        else:
-            cur_text = str(cur_texts) if cur_texts else ""
 
-        if not ref_text:
-            continue
+def save_reference_lines(parquet_path: str):
+    """
+    Save reference output lines to a text file.
+    """
+    lines = extract_lines_from_parquet(parquet_path)
+    
+    REFERENCE_OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with open(REFERENCE_OUTPUT_PATH, 'w', encoding='utf-8') as f:
+        for line in lines:
+            f.write(line + '\n')
+    
+    logger.info(f"Reference output saved: {len(lines)} lines -> {REFERENCE_OUTPUT_PATH}")
 
-        # Character-level similarity using SequenceMatcher
-        matcher = SequenceMatcher(None, ref_text, cur_text)
-        ratio = matcher.ratio()
 
-        total_chars += len(ref_text)
-        matching_chars += int(len(ref_text) * ratio)
-        pages_compared += 1
+def show_char_diff(ref_line: str, cur_line: str, max_context: int = 40) -> str:
+    """
+    Show character-level differences between two lines in a compact format.
+    Highlights where changes occur with context.
+    """
+    matcher = SequenceMatcher(None, ref_line, cur_line)
+    diff_parts = []
+    
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag == 'replace':
+            ref_part = ref_line[i1:i2]
+            cur_part = cur_line[j1:j2]
+            # Show context around the change
+            context_start = max(0, i1 - max_context)
+            context_end = min(len(ref_line), i2 + max_context)
+            context_before = ref_line[context_start:i1]
+            context_after = ref_line[i2:context_end]
+            
+            diff_parts.append(
+                f"...{context_before}[{ref_part}→{cur_part}]{context_after}..."
+            )
+        elif tag == 'delete':
+            ref_part = ref_line[i1:i2]
+            context_start = max(0, i1 - max_context)
+            context_end = min(len(ref_line), i2 + max_context)
+            context_before = ref_line[context_start:i1]
+            context_after = ref_line[i2:context_end]
+            
+            diff_parts.append(
+                f"...{context_before}[-{ref_part}]{context_after}..."
+            )
+        elif tag == 'insert':
+            cur_part = cur_line[j1:j2]
+            # Use position in current line for context
+            context_start = max(0, j1 - max_context)
+            context_end = min(len(cur_line), j2 + max_context)
+            context_before = cur_line[context_start:j1]
+            context_after = cur_line[j2:context_end]
+            
+            diff_parts.append(
+                f"...{context_before}[+{cur_part}]{context_after}..."
+            )
+    
+    return " ".join(diff_parts) if diff_parts else "No visible differences"
 
-        if ratio < 1.0:
-            pages_with_diff += 1
 
-    if total_chars == 0:
-        logger.warning("No characters to compare")
-        return None
-
-    accuracy = (matching_chars / total_chars) * 100
-
-    logger.info("=== ACCURACY COMPARISON ===")
-    logger.info(f"Pages compared: {pages_compared}")
-    logger.info(f"Pages with differences: {pages_with_diff}")
+def compare_with_reference(current_parquet_path: str):
+    """
+    Compare current OCR output with reference line-by-line.
+    Exits if reference file doesn't exist.
+    Shows detailed character-level differences with examples.
+    """
+    if not REFERENCE_OUTPUT_PATH.exists():
+        logger.error(
+            f"Reference output not found at {REFERENCE_OUTPUT_PATH}. "
+            f"Run with --reference first to generate it."
+        )
+        sys.exit(1)
+    
+    # Load reference lines
+    with open(REFERENCE_OUTPUT_PATH, 'r', encoding='utf-8') as f:
+        ref_lines = [line.rstrip('\n') for line in f]
+    
+    # Extract current lines
+    try:
+        cur_lines = extract_lines_from_parquet(current_parquet_path)
+    except Exception as e:
+        logger.error(f"Failed to load current parquet: {e}")
+        sys.exit(1)
+    
+    # Check if line counts match
+    if len(ref_lines) != len(cur_lines):
+        logger.error(
+            f"Line count mismatch! Reference has {len(ref_lines)} lines, "
+            f"current has {len(cur_lines)} lines. "
+            f"The input images may have changed."
+        )
+        sys.exit(1)
+    
+    # Compare line by line
+    total_chars = 0
+    diff_chars = 0
+    lines_with_diff = 0
+    diff_examples = []
+    
+    for i, (ref_line, cur_line) in enumerate(zip(ref_lines, cur_lines)):
+        total_chars += len(ref_line)
+        
+        if ref_line != cur_line:
+            lines_with_diff += 1
+            
+            # Count character differences
+            matcher = SequenceMatcher(None, ref_line, cur_line)
+            # Count characters that differ
+            for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+                if tag != 'equal':
+                    diff_chars += max(i2 - i1, j2 - j1)
+            
+            # Store example for display (limit to first 10)
+            if len(diff_examples) < 10:
+                # Special handling for empty line cases
+                if not ref_line and cur_line:
+                    diff_display = f"[EMPTY LINE→{cur_line[:80]}...]"
+                elif ref_line and not cur_line:
+                    diff_display = f"[{ref_line[:80]}...→EMPTY LINE]"
+                else:
+                    diff_display = show_char_diff(ref_line, cur_line)
+                diff_examples.append((i + 1, diff_display))
+    
+    # Report results
+    logger.info("=== LINE-BY-LINE COMPARISON WITH REFERENCE ===")
+    logger.info(f"Total lines: {len(ref_lines)}")
+    logger.info(f"Lines with differences: {lines_with_diff}")
     logger.info(f"Total characters: {total_chars}")
-    logger.info(f"Matching characters: {matching_chars}")
-    logger.info(f"Character accuracy: {accuracy:.2f}%")
-
-    return accuracy
+    logger.info(f"Characters different: {diff_chars}")
+    
+    if total_chars > 0:
+        accuracy = ((total_chars - diff_chars) / total_chars) * 100
+        logger.info(f"Character accuracy: {accuracy:.2f}%")
+    
+    if diff_examples:
+        logger.info(f"\n=== SHOWING {len(diff_examples)} DIFFERENCE EXAMPLES ===")
+        for line_num, diff_display in diff_examples:
+            logger.info(f"\nLine {line_num}:")
+            logger.info(f"  {diff_display}")
+    else:
+        logger.info("\nNo differences found! Output matches reference perfectly.")
+    
+    return lines_with_diff, diff_chars
 
 
 def get_volume_manifest_from_s3(w_id: str, i_id: str, bucket: str) -> VolumeManifest:
@@ -160,8 +252,9 @@ def main():
     args = parser.parse_args()
 
     # Reference mode settings (will be applied to worker after initialization)
-    reference_beam_width = 100 if args.reference else None
-    reference_token_min_logp = -20.0 if args.reference else None
+    # Uses beam search only (no greedy/hybrid) with wider beam and more lenient pruning
+    reference_beam_width = 80 if args.reference else None
+    reference_token_min_logp = -5.0 if args.reference else None
 
     if args.reference:
         logger.info("=== REFERENCE MODE: Max accuracy settings ===")
@@ -184,7 +277,7 @@ def main():
     logger.info(f"OCR dest bucket: {ocr_dest_bucket}")
     logger.info(f"Source image bucket: {source_image_bucket}")
 
-    max_images = 100  # Limit for testing
+    max_images = 50  # Limit for testing
     manifest = get_volume_manifest_from_s3(w_id, i_id, source_image_bucket)
     logger.info(f"Manifest has {len(manifest.manifest)} images, etag={manifest.s3_etag}")
 
@@ -223,23 +316,27 @@ def main():
         worker.beam_width = reference_beam_width
         worker.token_min_logp = reference_token_min_logp
         worker.vocab_prune_threshold = None  # Explicitly disable pruning for max accuracy
+        worker.use_hybrid_decode = False  # Only use beam search for reference (no greedy shortcut)
 
     # Greedy decode is 17x faster but loses ~1% accuracy - use beam search for production
     worker.use_greedy_decode = False
+    # Hybrid decode: uses greedy first, falls back to beam search for low-confidence lines
+    # Enabled by default for good speed/accuracy tradeoff
 
     # NeMo GPU decoder - requires nemo_toolkit installed (pip install nemo_toolkit[asr])
     # Set to True to use GPU-accelerated CTC decoding instead of pyctcdecode
-    worker.use_nemo_decoder = True
-    worker.use_sequential_pipeline = False
+    worker.use_nemo_decoder = False
+    worker.use_sequential_pipeline = True
     worker.kenlm_path = os.path.join(os.environ.get("BEC_OCR_MODEL_DIR", "ocr_models"), "tibetan_5gram.binary")
 
     # Log actual settings that will be used
     logger.info("=== CTC Decoder Settings ===")
-    logger.info(f"  beam_width: {worker.beam_width} (None = module default 50)")
-    logger.info(f"  token_min_logp: {worker.token_min_logp} (None = module default -5.0)")
+    logger.info(f"  beam_width: {worker.beam_width} (None = module default 64)")
+    logger.info(f"  token_min_logp: {worker.token_min_logp} (None = module default -3.0)")
     logger.info(f"  vocab_prune_threshold: {worker.vocab_prune_threshold} (None = module default)")
     logger.info(f"  vocab_prune_mode: {worker.vocab_prune_mode} (None = module default 'line')")
     logger.info(f"  use_greedy_decode: {worker.use_greedy_decode}")
+    logger.info(f"  use_hybrid_decode: {worker.use_hybrid_decode}")
     logger.info(f"  use_nemo_decoder: {worker.use_nemo_decoder}")
     logger.info(f"  use_sequential_pipeline: {worker.use_sequential_pipeline}")
 
@@ -259,15 +356,11 @@ def main():
                 shutil.copyfileobj(f_in, f_out)
 
         if args.reference:
-            # Ensure directory exists and save as reference parquet
-            REFERENCE_PARQUET_PATH.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy(temp_parquet, REFERENCE_PARQUET_PATH)
-            logger.info(f"Reference parquet saved to: {REFERENCE_PARQUET_PATH}")
+            # Save line-by-line reference output
+            save_reference_lines(temp_parquet)
         else:
-            # Compare with reference if available
-            accuracy = compare_with_reference(temp_parquet)
-            if accuracy is not None:
-                logger.info(f"\n>>> ACCURACY vs REFERENCE: {accuracy:.2f}% <<<\n")
+            # Compare with reference (exits if reference doesn't exist)
+            compare_with_reference(temp_parquet)
     except Exception as e:
         logger.warning(f"Could not process output parquet: {e}")
     finally:

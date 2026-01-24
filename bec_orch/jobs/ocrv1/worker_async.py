@@ -101,6 +101,7 @@ class OCRV1JobWorkerAsync:
         self.vocab_prune_threshold: float | None = None  # None = use module default
         self.vocab_prune_mode: str | None = None  # None = use module default
         self.use_greedy_decode: bool = False  # Use fast greedy decode instead of beam search
+        self.use_hybrid_decode: bool = True  # Greedy + beam search fallback for low-confidence lines
         self.use_nemo_decoder: bool = False  # Use NeMo GPU decoder instead of pyctcdecode
         self.use_sequential_pipeline: bool = False  # Run GPU inference first, then CTC decode
         self.kenlm_path: str | None = None  # Path to KenLM language model for NeMo decoder
@@ -180,6 +181,7 @@ class OCRV1JobWorkerAsync:
             beam_width=self.beam_width,
             token_min_logp=self.token_min_logp,
             use_greedy_decode=self.use_greedy_decode,
+            use_hybrid_decode=self.use_hybrid_decode,
             use_nemo_decoder=self.use_nemo_decoder,
             kenlm_path=self.kenlm_path,
         )

@@ -32,6 +32,7 @@ from .ctc_decoder import (
     compute_page_keep_mask,
     decode_logits_beam_search,
     decode_logits_greedy,
+    decode_logits_hybrid_global,
     init_worker_process,
 )
 from .line import get_line_image
@@ -165,6 +166,7 @@ class AsyncOCRPipeline:
         beam_width: int | None = None,
         token_min_logp: float | None = None,
         use_greedy_decode: bool = False,
+        use_hybrid_decode: bool = True,
         use_nemo_decoder: bool = False,
         kenlm_path: str | None = None,
     ):
@@ -185,6 +187,7 @@ class AsyncOCRPipeline:
         self.vocab_prune_threshold: float | None = None
         self.vocab_prune_mode: str | None = None
         self.use_greedy_decode = use_greedy_decode
+        self.use_hybrid_decode = use_hybrid_decode
         self.use_nemo_decoder = use_nemo_decoder
         self.kenlm_path = kenlm_path
         self._nemo_decoder = None  # Lazy init when needed
@@ -936,6 +939,16 @@ class AsyncOCRPipeline:
                         texts = []
                         for cropped in cropped_logits_list:
                             text = decode_logits_greedy(cropped, vocab)
+                            texts.append(text.strip().replace("§", " "))
+                    elif self.use_hybrid_decode:
+                        # Hybrid decode: greedy first, beam search fallback for low-confidence lines
+                        texts = []
+                        for cropped in cropped_logits_list:
+                            text = decode_logits_hybrid_global(
+                                cropped, vocab,
+                                beam_width=self.beam_width,
+                                token_min_logp=self.token_min_logp,
+                            )
                             texts.append(text.strip().replace("§", " "))
                     else:
                         # Beam search via ProcessPoolExecutor - submit each line for parallel decode

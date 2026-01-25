@@ -167,23 +167,24 @@ class LineProcessor:
         ld_data = fetched.ld_data
         
         try:
-            # 1. Decode with page-level resize to 4096×2048
-            #    This prevents OOM on huge images (20000×5000)
+            # 1. Decode at full resolution (like original code)
+            #    Use large max dimensions to prevent downscaling for typical images
+            #    The _downscale functions won't upscale (they check s >= 1.0)
             frame, is_binary, orig_h, orig_w = bytes_to_frame(
                 fetched.filename,
                 fetched.file_bytes,
-                max_width=4096,
-                max_height=2048,
-                patch_size=512,  # Required param (not used when max_patch_rows is high)
+                max_width=6000,
+                max_height=3000,
+                patch_size=6000,  # Large value prevents wide-image special case from shrinking
                 linearize=True,
                 normalize_background=False,
                 patch_vertical_overlap_px=0,
                 snap_extra_patch_row_threshold_px=0,
-                max_patch_rows=100,  # Disables patch-based resize logic
+                max_patch_rows=100,
             )
-            # frame: 2D grayscale uint8, already resized to fit 4096×2048
+            # frame: 2D grayscale uint8, no resize for images under 10000×5000
             # is_binary: True if source was binary (TIFF Group4, etc.)
-            # orig_h, orig_w: Original image dimensions before resize
+            # orig_h, orig_w: Original image dimensions (same as frame dimensions unless resized)
             
             # Calculate scale factor for contours
             # Contours are in original image coordinates, need to scale to match resized frame

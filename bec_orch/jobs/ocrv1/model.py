@@ -89,7 +89,9 @@ class OCRModel:
                 max_per_token = max_per_token.max(dim=0).values
             
             # Create mask for tokens above threshold (always keep blank at index 0)
-            keep_mask = max_per_token > self._vocab_prune_threshold
+            # Round to 6 decimal places for deterministic comparison across GPU/CPU
+            max_per_token_rounded = _torch.round(max_per_token * 1e6) / 1e6
+            keep_mask = max_per_token_rounded > self._vocab_prune_threshold
             keep_mask[0] = True  # Always keep blank token
             
             # Get indices of kept tokens
@@ -131,7 +133,9 @@ class OCRModel:
                 max_per_token = max_per_token.max(axis=0)
             
             # Create mask for tokens above threshold (always keep blank at index 0)
-            keep_mask = max_per_token > self._vocab_prune_threshold
+            # Round to 6 decimal places for deterministic comparison across GPU/CPU
+            max_per_token_rounded = np.round(max_per_token, decimals=6)
+            keep_mask = max_per_token_rounded > self._vocab_prune_threshold
             keep_mask[0] = True  # Always keep blank token
             
             # Get indices of kept tokens
@@ -241,7 +245,9 @@ class OCRModel:
             global_max_per_token = stacked_max.max(dim=0).values
             
             # Create mask for tokens above threshold
-            keep_mask = global_max_per_token > self._vocab_prune_threshold
+            # Round to 6 decimal places for deterministic comparison across GPU/CPU
+            global_max_rounded = _torch.round(global_max_per_token * 1e6) / 1e6
+            keep_mask = global_max_rounded > self._vocab_prune_threshold
             keep_mask[0] = True  # Always keep blank token
             
             keep_indices = _torch.where(keep_mask)[0].cpu().numpy()
@@ -281,7 +287,9 @@ class OCRModel:
             global_max_per_token = stacked_max.max(axis=0)
             
             # Create mask for tokens above threshold
-            keep_mask = global_max_per_token > self._vocab_prune_threshold
+            # Round to 6 decimal places for deterministic comparison across GPU/CPU
+            global_max_rounded = np.round(global_max_per_token, decimals=6)
+            keep_mask = global_max_rounded > self._vocab_prune_threshold
             keep_mask[0] = True  # Always keep blank token
             
             keep_indices = np.where(keep_mask)[0]

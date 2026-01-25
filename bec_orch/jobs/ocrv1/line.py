@@ -96,6 +96,6 @@ def get_line_image(
     except (cv2.error, ValueError) as e:
         # Return a minimal valid image and the original k_factor in case of error
         print(f"Error in get_line_image: {e}")
-        # Create a small blank image as fallback
-        fallback_img = np.zeros((bbox_h, bbox_h * 2, 3), dtype=np.uint8)
+        # Create a small blank image as fallback (grayscale)
+        fallback_img = np.zeros((bbox_h, bbox_h * 2), dtype=np.uint8)
         return fallback_img, k_factor

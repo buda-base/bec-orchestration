@@ -69,6 +69,34 @@ def extract_lines_from_parquet(parquet_path: str) -> list[str]:
     return all_lines
 
 
+def build_reference_mapping(parquet_path: str) -> dict[tuple[str, int], str]:
+    """
+    Build a mapping from (filename, line_idx) to reference text.
+    Returns dict mapping (filename, line_idx) -> reference_text
+    """
+    df = pd.read_parquet(parquet_path)
+    
+    # Sort by img_file_name for consistent ordering
+    df = df.sort_values('img_file_name')
+    
+    mapping = {}
+    for row in df.itertuples():
+        filename = row.img_file_name
+        texts = row.texts if hasattr(row, 'texts') else []
+        
+        # Convert to list if numpy array
+        if hasattr(texts, 'tolist'):
+            texts = texts.tolist()
+        
+        # Add each text line with its index
+        if isinstance(texts, list):
+            for line_idx, line_text in enumerate(texts):
+                text = str(line_text) if line_text is not None else ""
+                mapping[(filename, line_idx)] = text
+    
+    return mapping
+
+
 def save_reference_lines(parquet_path: str):
     """
     Save reference output lines to a text file.
@@ -249,6 +277,11 @@ def main():
         action="store_true",
         help="Generate reference parquet with max accuracy settings (beam=100, no pruning)",
     )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Save debug line images to debug_output/ directory",
+    )
     args = parser.parse_args()
 
     # Reference mode settings (will be applied to worker after initialization)
@@ -310,6 +343,21 @@ def main():
     from bec_orch.jobs.ocrv1.worker_async import OCRV1JobWorkerAsync
 
     worker = OCRV1JobWorkerAsync()
+    
+    # Enable debug mode if requested
+    if args.debug:
+        logger.info("=== DEBUG MODE: Saving line images to debug_output/ ===")
+        worker.debug_output_dir = "debug_output"
+        
+        # Load reference lines if they exist
+        if REFERENCE_OUTPUT_PATH.exists():
+            logger.info(f"Loading reference output from {REFERENCE_OUTPUT_PATH} for diff comparison")
+            with open(REFERENCE_OUTPUT_PATH, 'r', encoding='utf-8') as f:
+                worker.debug_reference_lines = [line.rstrip('\n') for line in f]
+            logger.info(f"Loaded {len(worker.debug_reference_lines)} reference lines")
+        else:
+            logger.warning(f"Reference file not found at {REFERENCE_OUTPUT_PATH}, diffs will be skipped")
+            worker.debug_reference_lines = None
 
     # Apply reference mode settings to worker (these get passed to worker processes)
     if args.reference:

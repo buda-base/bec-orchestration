@@ -118,6 +118,8 @@ class OCRV1JobWorkerAsync:
         self.use_nemo_decoder: bool = False  # Use NeMo GPU decoder instead of pyctcdecode
         self.use_sequential_pipeline: bool = False  # Run GPU inference first, then CTC decode
         self.kenlm_path: str | None = None  # Path to KenLM language model for NeMo decoder
+        self.debug_output_dir: str | None = None  # Directory to save debug line images (None = disabled)
+        self.debug_reference_lines: list[str] | None = None  # Reference text lines for diff comparison
 
         logger.info("OCR model loaded successfully")
 
@@ -198,6 +200,8 @@ class OCRV1JobWorkerAsync:
             greedy_confidence_threshold=self.greedy_confidence_threshold,
             use_nemo_decoder=self.use_nemo_decoder,
             kenlm_path=self.kenlm_path,
+            debug_output_dir=self.debug_output_dir,
+            debug_reference_lines=self.debug_reference_lines,
         )
         pipeline.vocab_prune_threshold = self.vocab_prune_threshold
         pipeline.vocab_prune_mode = self.vocab_prune_mode

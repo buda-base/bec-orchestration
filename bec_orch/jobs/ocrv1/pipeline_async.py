@@ -3,27 +3,23 @@ Async OCR pipeline with backpressure.
 
 Pipeline stages:
 1. S3 Prefetcher (async, high concurrency) → FetchedBytes
-2. Image Processor (thread pool) → LineTensor batches
-3. GPU Forward (single async task, batched) → Logits
-4. CTC Decoder (thread pool) → PageResult
-5. Parquet Writer (single async task) → S3
+2. LineProcessor (thread pool) → ProcessedPage (preprocessed line tensors)
+3. GPU Batcher (async+GPU, batched) → InferredPage (logits)
+4. CTC Decoder (process pool) → PageResult (text)
+5. Parquet Writer (async) → S3
 
 All stages connected by bounded asyncio.Queue for backpressure.
+Following ldv1 pattern with proper typed messages.
 """
 
 import asyncio
 import logging
 import time
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
-from dataclasses import dataclass
-from typing import TYPE_CHECKING, Optional
+from concurrent.futures import ProcessPoolExecutor
+from typing import Optional
 
-import cv2
 import numpy as np
 import numpy.typing as npt
-
-if TYPE_CHECKING:
-    pass
 
 from .ctc_decoder import (
     CTCDecoder,
@@ -32,9 +28,23 @@ from .ctc_decoder import (
     decode_logits_hybrid_global,
     init_worker_process,
 )
-from .line import get_line_image
+from .line_processor import LineProcessor
 from .model import OCRModel
 from .parquet_writer import StreamingParquetWriter
+from .types_ocrv1 import (
+    EndOfStream,
+    FetchedBytes,
+    FetchedBytesMsg,
+    InferredPage,
+    InferredPageMsg,
+    LDResult,
+    LineLogits,
+    PageResult,
+    PageResultMsg,
+    PipelineError,
+    ProcessedPage,
+    ProcessedPageMsg,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -93,49 +103,6 @@ def _decode_page_lines(
     return texts
 
 
-@dataclass
-class FetchedBytes:
-    page_idx: int
-    filename: str
-    source_etag: str
-    file_bytes: bytes
-    ld_row: dict
-
-
-@dataclass
-class ProcessedPage:
-    page_idx: int
-    filename: str
-    source_etag: str
-    line_tensors: list[tuple[npt.NDArray, int]]  # (tensor, original_width)
-    error: Optional[str] = None
-
-
-@dataclass
-class InferredPage:
-    page_idx: int
-    filename: str
-    source_etag: str
-    logits_list: list[tuple[npt.NDArray, int, npt.NDArray | None]]  # (logits, original_width, keep_indices)
-    error: Optional[str] = None
-
-
-@dataclass
-class PageResult:
-    page_idx: int
-    filename: str
-    source_etag: str
-    texts: list[str]
-    error: Optional[str] = None
-
-
-class EndOfStream:
-    pass
-
-
-EOS = EndOfStream()
-
-
 class AsyncOCRPipeline:
     """
     Async OCR pipeline with bounded queues for backpressure.
@@ -163,6 +130,8 @@ class AsyncOCRPipeline:
         greedy_confidence_threshold: float | None = None,
         use_nemo_decoder: bool = False,
         kenlm_path: str | None = None,
+        debug_output_dir: str | None = None,
+        debug_reference_lines: list[str] | None = None,
     ):
         self.ocr_model = ocr_model
         self.ctc_decoder = ctc_decoder
@@ -173,7 +142,7 @@ class AsyncOCRPipeline:
         self.volume_prefix = volume_prefix
 
         self.prefetch_concurrency = prefetch_concurrency
-        self.image_processor_workers = image_processor_workers
+        self.line_processor_workers = image_processor_workers  # Renamed for clarity
         self.ctc_workers = ctc_workers
         self.gpu_batch_size = gpu_batch_size
         self.beam_width = beam_width
@@ -184,17 +153,27 @@ class AsyncOCRPipeline:
         self.use_nemo_decoder = use_nemo_decoder
         self.kenlm_path = kenlm_path
         self._nemo_decoder = None  # Lazy init when needed
+        self.debug_output_dir = debug_output_dir
+        self.debug_reference_lines = debug_reference_lines
+        self._debug_line_counter = 0  # Track global line index for reference matching
 
-        # Bounded queues for backpressure
-        self.q_fetched: asyncio.Queue = asyncio.Queue(maxsize=64)
-        self.q_processed: asyncio.Queue = asyncio.Queue(maxsize=32)
-        self.q_inferred: asyncio.Queue = asyncio.Queue(maxsize=32)
-        self.q_results: asyncio.Queue = asyncio.Queue(maxsize=64)
+        # Bounded queues for backpressure (typed following ldv1 pattern)
+        self.q_fetched: asyncio.Queue[FetchedBytesMsg] = asyncio.Queue(maxsize=64)
+        self.q_processed: asyncio.Queue[ProcessedPageMsg] = asyncio.Queue(maxsize=16)  # Reduced for memory
+        self.q_inferred: asyncio.Queue[InferredPageMsg] = asyncio.Queue(maxsize=32)
+        self.q_results: asyncio.Queue[PageResultMsg] = asyncio.Queue(maxsize=64)
 
-        # Thread pool for image processing (cv2 releases GIL)
-        self._image_executor = ThreadPoolExecutor(max_workers=image_processor_workers, thread_name_prefix="img")
-        # Process pool for CTC decoding - IPC overhead (~190ms/call) is acceptable tradeoff
-        # to avoid blocking the async event loop (which starves GPU inference)
+        # LineProcessor component (replaces inline _image_processor)
+        self.line_processor = LineProcessor(
+            input_width=input_width,
+            input_height=input_height,
+            q_in=self.q_fetched,
+            q_out=self.q_processed,
+            num_workers=self.line_processor_workers,
+            debug_output_dir=self.debug_output_dir,
+        )
+
+        # Process pool for CTC decoding
         self._ctc_executor = ProcessPoolExecutor(
             max_workers=ctc_workers,
             initializer=init_worker_process,
@@ -202,7 +181,8 @@ class AsyncOCRPipeline:
         )
 
         logger.info(
-            f"Pipeline config: prefetch={prefetch_concurrency}, img_workers={image_processor_workers}, ctc_workers={ctc_workers}, gpu_batch={gpu_batch_size}"
+            f"Pipeline config: prefetch={prefetch_concurrency}, line_workers={self.line_processor_workers}, "
+            f"ctc_workers={ctc_workers}, gpu_batch={gpu_batch_size}"
         )
 
         # Semaphore for S3 concurrency
@@ -242,7 +222,7 @@ class AsyncOCRPipeline:
         # Start all stages as concurrent tasks
         tasks = [
             asyncio.create_task(self._prefetcher(pages), name="prefetcher"),
-            asyncio.create_task(self._image_processor(), name="image_processor"),
+            asyncio.create_task(self.line_processor.run(), name="line_processor"),
             asyncio.create_task(self._gpu_inference(), name="gpu_inference"),
             asyncio.create_task(self._ctc_decoder_stage(), name="ctc_decoder"),
             asyncio.create_task(self._parquet_writer(output_parquet_uri, total_pages), name="writer"),
@@ -253,7 +233,7 @@ class AsyncOCRPipeline:
         monitor_task.cancel()
 
         # Check for errors
-        stage_names = ["prefetcher", "image_processor", "gpu_inference", "ctc_decoder", "writer"]
+        stage_names = ["prefetcher", "line_processor", "gpu_inference", "ctc_decoder", "writer"]
         for name, result in zip(stage_names, results):
             if isinstance(result, Exception):
                 logger.error(f"Pipeline stage '{name}' failed: {result}", exc_info=result)
@@ -309,7 +289,7 @@ class AsyncOCRPipeline:
         logger.info("[Phase 1] Starting GPU inference phase...")
         phase1_tasks = [
             asyncio.create_task(self._prefetcher(pages), name="prefetcher"),
-            asyncio.create_task(self._image_processor(), name="image_processor"),
+            asyncio.create_task(self.line_processor.run(), name="line_processor"),
             asyncio.create_task(self._gpu_inference(), name="gpu_inference"),
             asyncio.create_task(collect_inferred(), name="collector"),
         ]
@@ -332,7 +312,7 @@ class AsyncOCRPipeline:
         all_decode_tasks: list[tuple[int, int, npt.NDArray, InferredPage]] = []
 
         for inferred in all_inferred:
-            if inferred.error or not inferred.logits_list:
+            if inferred.error or not inferred.logits:
                 # Handle error pages immediately
                 await self.q_results.put(
                     PageResult(
@@ -345,16 +325,16 @@ class AsyncOCRPipeline:
                 )
                 continue
 
-            for line_idx, (logits, orig_w, keep_indices) in enumerate(inferred.logits_list):
+            for line_idx, line_logits in enumerate(inferred.logits):
                 # Logits are already cropped to remove padding (done in model before softmax)
                 # Just need to transpose from (vocab, time) -> (time, vocab) if needed
-                actual_vocab_size = vocab_size if keep_indices is None else len(keep_indices)
-                needs_transpose = logits.shape[0] == actual_vocab_size
+                actual_vocab_size = vocab_size if line_logits.keep_indices is None else len(line_logits.keep_indices)
+                needs_transpose = line_logits.logits.shape[0] == actual_vocab_size
                 if needs_transpose:
-                    cropped = logits.T
+                    cropped = line_logits.logits.T
                 else:
-                    cropped = logits
-                all_decode_tasks.append((inferred.page_idx, line_idx, cropped, inferred, keep_indices))
+                    cropped = line_logits.logits
+                all_decode_tasks.append((inferred.page_idx, line_idx, cropped, inferred, line_logits.keep_indices))
 
         # Count how many have GPU pruning
         gpu_pruned_count = sum(1 for _, _, _, _, ki in all_decode_tasks if ki is not None)
@@ -456,7 +436,7 @@ class AsyncOCRPipeline:
         async def emit_results():
             for result in results_to_write:
                 await self.q_results.put(result)
-            await self.q_results.put(EOS)
+            await self.q_results.put(EndOfStream(stream="written", producer="SequentialEmitter"))
 
         await asyncio.gather(
             emit_results(),
@@ -494,13 +474,21 @@ class AsyncOCRPipeline:
 
                     source_etag, file_bytes = await loop.run_in_executor(None, _fetch)
 
+                    # Convert ld_row dict to typed LDResult
+                    ld_data = LDResult(
+                        rotation_angle=ld_row.get("rotation_angle", 0.0),
+                        tps_points=ld_row.get("tps_points"),
+                        tps_alpha=ld_row.get("tps_alpha", 0.5),
+                        contours=ld_row.get("contours", []),
+                    )
+
                     await self.q_fetched.put(
                         FetchedBytes(
                             page_idx=page_idx,
                             filename=filename,
                             source_etag=source_etag,
                             file_bytes=file_bytes,
-                            ld_row=ld_row,
+                            ld_data=ld_data,
                         )
                     )
                     self.stats["fetched"] += 1
@@ -510,13 +498,17 @@ class AsyncOCRPipeline:
 
                 except Exception as e:
                     logger.warning(f"[Prefetcher] Failed to fetch {filename}: {e}")
+                    # Emit error instead of empty FetchedBytes
                     await self.q_fetched.put(
-                        FetchedBytes(
+                        PipelineError(
+                            stage="Prefetcher",
                             page_idx=page_idx,
                             filename=filename,
                             source_etag="",
-                            file_bytes=b"",
-                            ld_row=ld_row,
+                            error_type=type(e).__name__,
+                            message=str(e),
+                            traceback=None,
+                            retryable=True,
                         )
                     )
                     self.stats["errors"] += 1
@@ -530,204 +522,8 @@ class AsyncOCRPipeline:
         await asyncio.gather(*fetch_tasks)
 
         # Signal end of stream
-        await self.q_fetched.put(EOS)
+        await self.q_fetched.put(EndOfStream(stream="prefetched", producer="Prefetcher"))
         logger.info(f"[Prefetcher] Done, fetched {self.stats['fetched']} pages")
-
-    async def _image_processor(self) -> None:
-        """Process images concurrently using semaphore for backpressure."""
-        logger.info(f"[ImageProcessor] Starting with {self.image_processor_workers} concurrent workers")
-        loop = asyncio.get_event_loop()
-
-        # Semaphore limits concurrent processing
-        sem = asyncio.Semaphore(self.image_processor_workers)
-        pending_tasks: set[asyncio.Task] = set()
-
-        async def process_one(fetched: FetchedBytes) -> None:
-            async with sem:
-                if not fetched.file_bytes:
-                    await self.q_processed.put(
-                        ProcessedPage(
-                            page_idx=fetched.page_idx,
-                            filename=fetched.filename,
-                            source_etag=fetched.source_etag,
-                            line_tensors=[],
-                            error="Failed to fetch image",
-                        )
-                    )
-                    return
-
-                try:
-                    processed = await loop.run_in_executor(
-                        self._image_executor,
-                        self._process_image_sync,
-                        fetched,
-                    )
-                    await self.q_processed.put(processed)
-                    self.stats["processed"] += 1
-
-                except Exception as e:
-                    logger.warning(f"[ImageProcessor] Failed to process {fetched.filename}: {e}")
-                    await self.q_processed.put(
-                        ProcessedPage(
-                            page_idx=fetched.page_idx,
-                            filename=fetched.filename,
-                            source_etag=fetched.source_etag,
-                            line_tensors=[],
-                            error=str(e),
-                        )
-                    )
-                    self.stats["errors"] += 1
-
-        while True:
-            msg = await self.q_fetched.get()
-            if isinstance(msg, EndOfStream):
-                # Wait for all pending tasks
-                if pending_tasks:
-                    await asyncio.gather(*pending_tasks, return_exceptions=True)
-                await self.q_processed.put(EOS)
-                break
-
-            fetched: FetchedBytes = msg
-            task = asyncio.create_task(process_one(fetched))
-            pending_tasks.add(task)
-            task.add_done_callback(pending_tasks.discard)
-
-        logger.info(f"[ImageProcessor] Done, processed {self.stats['processed']} pages")
-
-    def _process_image_sync(self, fetched: FetchedBytes) -> ProcessedPage:
-        """Synchronous image processing (runs in thread pool)."""
-        ld_row = fetched.ld_row
-
-        # Decode image
-        img_array = np.frombuffer(fetched.file_bytes, dtype=np.uint8)
-        image = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
-        if image is None:
-            raise ValueError("Failed to decode image")
-
-        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-
-        # Apply transforms
-        rotation_angle = ld_row.get("rotation_angle", 0.0)
-        tps_points = ld_row.get("tps_points")
-        tps_alpha = ld_row.get("tps_alpha", 0.5)
-
-        if rotation_angle and abs(rotation_angle) > 0.01:
-            h, w = image.shape[:2]
-            center = (w / 2, h / 2)
-            M = cv2.getRotationMatrix2D(center, rotation_angle, 1.0)
-            image = cv2.warpAffine(image, M, (w, h), borderMode=cv2.BORDER_REPLICATE)
-
-        if tps_points:
-            image = self._apply_tps(image, tps_points, tps_alpha)
-
-        # Extract lines
-        contours = ld_row.get("contours", [])
-        if not contours:
-            return ProcessedPage(
-                page_idx=fetched.page_idx,
-                filename=fetched.filename,
-                source_etag=fetched.source_etag,
-                line_tensors=[],
-            )
-
-        line_tensors = []
-        mask_buffer = np.zeros((image.shape[0], image.shape[1]), dtype=np.uint8)
-        current_k = 1.7
-
-        for contour_points in contours:
-            line_img, current_k = self._extract_line(image, contour_points, current_k, mask_buffer)
-            if line_img is None:
-                line_tensors.append((np.zeros((1, self.input_height, self.input_width), dtype=np.float32), 1))
-                continue
-
-            original_width = line_img.shape[1]
-            tensor = self._preprocess_line(line_img)
-            line_tensors.append((tensor, original_width))
-
-        return ProcessedPage(
-            page_idx=fetched.page_idx,
-            filename=fetched.filename,
-            source_etag=fetched.source_etag,
-            line_tensors=line_tensors,
-        )
-
-    def _extract_line(
-        self, image: npt.NDArray, contour_points: list[dict], k_factor: float, mask_buffer: npt.NDArray
-    ) -> tuple[Optional[npt.NDArray], float]:
-        """Extract line image from contour."""
-        if not contour_points:
-            return None, k_factor
-
-        pts = np.array([[p["x"], p["y"]] for p in contour_points], dtype=np.int32)
-        _, _, _, bbox_h = cv2.boundingRect(pts)
-        if bbox_h <= 0:
-            return None, k_factor
-
-        mask_buffer.fill(0)
-        cv2.drawContours(mask_buffer, [pts], -1, 255, -1)
-
-        line_img, adapted_k = get_line_image(image, mask_buffer, bbox_h, bbox_tolerance=3.0, k_factor=k_factor)
-
-        if line_img.size == 0:
-            return None, adapted_k
-
-        return line_img, adapted_k
-
-    def _preprocess_line(self, image: npt.NDArray) -> npt.NDArray:
-        """Preprocess line image to tensor."""
-        # Pad to model size
-        h, w = image.shape[:2]
-        target_h = self.input_height
-        target_w = self.input_width
-        aspect = w / h
-
-        if aspect > (target_w / target_h):
-            new_w = target_w
-            new_h = max(1, int(target_w / aspect))
-        else:
-            new_h = target_h
-            new_w = max(1, int(target_h * aspect))
-
-        resized = cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_AREA)
-
-        padded = np.ones((target_h, target_w, 3), dtype=np.uint8) * 255
-        y_offset = (target_h - new_h) // 2
-        x_offset = 0
-        padded[y_offset : y_offset + new_h, x_offset : x_offset + new_w] = resized
-
-        # Binarize
-        gray = cv2.cvtColor(padded, cv2.COLOR_RGB2GRAY)
-        binary = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 31, 15)
-
-        # Normalize
-        tensor = binary.reshape((1, target_h, target_w)).astype(np.float32)
-        tensor = (tensor / 127.5) - 1.0
-
-        return tensor
-
-    def _apply_tps(self, image: npt.NDArray, tps_points: tuple, alpha: float) -> npt.NDArray:
-        """Apply TPS transform (simplified)."""
-        try:
-            input_pts, output_pts = tps_points
-            if input_pts is None or output_pts is None:
-                return image
-
-            input_pts = np.array(input_pts, dtype=np.float32)
-            output_pts = np.array(output_pts, dtype=np.float32)
-
-            tps = cv2.createThinPlateSplineShapeTransformer()  # type: ignore[attr-defined]
-            tps.estimateTransformation(
-                output_pts.reshape(1, -1, 2),
-                input_pts.reshape(1, -1, 2),
-                list(range(len(input_pts))),
-            )
-
-            h, w = image.shape[:2]
-            result = tps.warpImage(image)
-            return result if result is not None else image
-
-        except Exception:
-            return image
 
     async def _gpu_inference(self) -> None:
         """Run GPU inference with batching - emit pages as soon as all lines are done."""
@@ -795,20 +591,30 @@ class AsyncOCRPipeline:
             for page_idx in completed:
                 page, expected, logits_dict = pages_in_flight.pop(page_idx)
 
-                # Build logits list in order
+                # Build logits list in order using LineLogits objects
                 logits_list = []
                 for i in range(expected):
                     if i in logits_dict:
-                        logits_list.append(logits_dict[i])
+                        logits, orig_w, keep_indices = logits_dict[i]
+                        logits_list.append(LineLogits(
+                            logits=logits,
+                            original_width=orig_w,
+                            keep_indices=keep_indices
+                        ))
                     else:
-                        logits_list.append((np.zeros((1, 84), dtype=np.float32), 1, None))
+                        # Empty line
+                        logits_list.append(LineLogits(
+                            logits=np.zeros((1, 84), dtype=np.float32),
+                            original_width=1,
+                            keep_indices=None
+                        ))
 
                 await self.q_inferred.put(
                     InferredPage(
                         page_idx=page.page_idx,
                         filename=page.filename,
                         source_etag=page.source_etag,
-                        logits_list=logits_list,
+                        logits=logits_list,
                         error=page.error,
                     )
                 )
@@ -826,26 +632,35 @@ class AsyncOCRPipeline:
                 # Emit any remaining pages (shouldn't happen normally)
                 if pages_in_flight:
                     logger.info(f"[GPUInference] Emitting {len(pages_in_flight)} remaining pages")
-                for page_idx, (page, expected, logits_dict) in pages_in_flight.items():
-                    logits_list = []
-                    for i in range(expected):
-                        if i in logits_dict:
-                            logits_list.append(logits_dict[i])
-                        else:
-                            logits_list.append((np.zeros((1, 84), dtype=np.float32), 1, None))
+                    for page_idx, (page, expected, logits_dict) in pages_in_flight.items():
+                        logits_list = []
+                        for i in range(expected):
+                            if i in logits_dict:
+                                logits, orig_w, keep_indices = logits_dict[i]
+                                logits_list.append(LineLogits(
+                                    logits=logits,
+                                    original_width=orig_w,
+                                    keep_indices=keep_indices
+                                ))
+                            else:
+                                logits_list.append(LineLogits(
+                                    logits=np.zeros((1, 84), dtype=np.float32),
+                                    original_width=1,
+                                    keep_indices=None
+                                ))
 
-                    await self.q_inferred.put(
-                        InferredPage(
-                            page_idx=page.page_idx,
-                            filename=page.filename,
-                            source_etag=page.source_etag,
-                            logits_list=logits_list,
-                            error=page.error,
+                        await self.q_inferred.put(
+                            InferredPage(
+                                page_idx=page.page_idx,
+                                filename=page.filename,
+                                source_etag=page.source_etag,
+                                logits=logits_list,
+                                error=page.error,
+                            )
                         )
-                    )
-                    self.stats["inferred"] += 1
+                        self.stats["inferred"] += 1
 
-                await self.q_inferred.put(EOS)
+                await self.q_inferred.put(EndOfStream(stream="inferred", producer="GPUBatcher"))
                 break
 
             processed: ProcessedPage = msg
@@ -857,13 +672,13 @@ class AsyncOCRPipeline:
                 )
 
             # Handle error/empty pages immediately
-            if processed.error or not processed.line_tensors:
+            if processed.error or not processed.lines:
                 await self.q_inferred.put(
                     InferredPage(
                         page_idx=processed.page_idx,
                         filename=processed.filename,
                         source_etag=processed.source_etag,
-                        logits_list=[],
+                        logits=[],
                         error=processed.error,
                     )
                 )
@@ -872,12 +687,17 @@ class AsyncOCRPipeline:
                 continue
 
             # Register page
-            expected_lines = len(processed.line_tensors)
+            expected_lines = len(processed.lines)
             pages_in_flight[processed.page_idx] = (processed, expected_lines, {})
 
             # Add tensors to batch
-            for line_idx, (tensor, orig_w) in enumerate(processed.line_tensors):
-                pending_tensors.append((processed.page_idx, line_idx, tensor, orig_w))
+            for line_idx, line_tensor in enumerate(processed.lines):
+                pending_tensors.append((
+                    processed.page_idx,
+                    line_idx,
+                    line_tensor.tensor,
+                    line_tensor.original_width
+                ))
 
                 if len(pending_tensors) >= self.gpu_batch_size:
                     await flush_batch()
@@ -899,7 +719,7 @@ class AsyncOCRPipeline:
         logger.info(f"[CTCDecoder] Max concurrent page decodes: {max_concurrent_pages}")
 
         async def decode_one(inferred: InferredPage) -> None:
-            if inferred.error or not inferred.logits_list:
+            if inferred.error or not inferred.logits:
                 await self.q_results.put(
                     PageResult(
                         page_idx=inferred.page_idx,
@@ -916,22 +736,22 @@ class AsyncOCRPipeline:
                     start_time = time.perf_counter()
                     vocab = self.ctc_decoder.ctc_vocab
                     vocab_size = len(vocab)
-                    num_lines = len(inferred.logits_list)
+                    num_lines = len(inferred.logits)
 
                     # Logits are already cropped to remove padding (done in model before softmax)
                     # Just need to transpose from (vocab, time) -> (time, vocab) if needed
                     # NOTE: Each line may have different keep_indices if they were in different GPU batches
                     cropped_logits_list = []
                     keep_indices_list = []
-                    for logits, orig_w, _keep_indices in inferred.logits_list:
-                        actual_vocab_size = vocab_size if _keep_indices is None else len(_keep_indices)
-                        needs_transpose = logits.shape[0] == actual_vocab_size
+                    for line_logits in inferred.logits:
+                        actual_vocab_size = vocab_size if line_logits.keep_indices is None else len(line_logits.keep_indices)
+                        needs_transpose = line_logits.logits.shape[0] == actual_vocab_size
                         if needs_transpose:
-                            cropped = logits.T
+                            cropped = line_logits.logits.T
                         else:
-                            cropped = logits
+                            cropped = line_logits.logits
                         cropped_logits_list.append(cropped)
-                        keep_indices_list.append(_keep_indices)
+                        keep_indices_list.append(line_logits.keep_indices)
 
                     if self.use_nemo_decoder:
                         # NeMo GPU decoder - batch decode all lines on GPU
@@ -1019,7 +839,7 @@ class AsyncOCRPipeline:
             if isinstance(msg, EndOfStream):
                 if pending_tasks:
                     await asyncio.gather(*pending_tasks, return_exceptions=True)
-                await self.q_results.put(EOS)
+                await self.q_results.put(EndOfStream(stream="decoded", producer="CTCDecoder"))
                 break
 
             inferred: InferredPage = msg
@@ -1055,6 +875,10 @@ class AsyncOCRPipeline:
                     error=result.error,
                 )
                 pages_written += 1
+                
+                # Write debug diffs if enabled
+                if self.debug_output_dir and self.debug_reference_lines:
+                    self._write_debug_diffs(result)
 
                 if pages_written % 100 == 0:
                     logger.info(f"[ParquetWriter] Progress: {pages_written}/{total_pages}")
@@ -1063,7 +887,53 @@ class AsyncOCRPipeline:
 
         logger.info(f"[ParquetWriter] Done, wrote {pages_written} pages")
 
+    def _write_debug_diffs(self, result: PageResult) -> None:
+        """Write diff files for lines that differ from reference."""
+        import os
+        from difflib import SequenceMatcher
+        
+        for line_idx, output_text in enumerate(result.texts):
+            # Check if we have a reference line for this position
+            if self._debug_line_counter >= len(self.debug_reference_lines):
+                logger.warning(f"[Debug] No reference line for {result.filename} line {line_idx}")
+                self._debug_line_counter += 1
+                continue
+            
+            reference_text = self.debug_reference_lines[self._debug_line_counter]
+            self._debug_line_counter += 1
+            
+            # Skip if texts match
+            if output_text == reference_text:
+                continue
+            
+            # Generate diff display
+            matcher = SequenceMatcher(None, reference_text, output_text)
+            diff_parts = []
+            
+            for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+                if tag == 'equal':
+                    diff_parts.append(reference_text[i1:i2])
+                elif tag == 'replace':
+                    diff_parts.append(f"[-{reference_text[i1:i2]}-]")
+                    diff_parts.append(f"[+{output_text[j1:j2]}+]")
+                elif tag == 'delete':
+                    diff_parts.append(f"[-{reference_text[i1:i2]}-]")
+                elif tag == 'insert':
+                    diff_parts.append(f"[+{output_text[j1:j2]}+]")
+            
+            diff_display = ''.join(diff_parts)
+            
+            # Write diff file
+            base_name = result.filename.replace('/', '_').replace('.', '_')
+            diff_path = os.path.join(self.debug_output_dir, f"{base_name}_line{line_idx:03d}_diff.txt")
+            
+            with open(diff_path, 'w', encoding='utf-8') as f:
+                f.write(f"output: {output_text}\n")
+                f.write(f"reference: {reference_text}\n")
+                f.write(f"diff: {diff_display}\n")
+            
+            logger.info(f"[Debug] Wrote diff for {result.filename} line {line_idx}")
+
     async def close(self) -> None:
         """Cleanup resources."""
-        self._image_executor.shutdown(wait=False)
         self._ctc_executor.shutdown(wait=False)

@@ -25,7 +25,7 @@ import numpy.typing as npt
 if TYPE_CHECKING:
     pass
 
-from ..ldv1.img_helpers import apply_transform_1
+from ..ldv1.img_helpers import adaptive_binarize, apply_transform_1
 from ..shared.decoder import bytes_to_frame
 from .ctc_decoder import (
     CTCDecoder,
@@ -644,6 +644,13 @@ class AsyncOCRPipeline:
         # Apply rotation and TPS in one call (grayscale)
         image = apply_transform_1(image, rotation_angle, tps_input_pts, tps_output_pts, tps_alpha)
 
+        # Track if any transformation was applied (affects binarization decision)
+        was_transformed = (
+            scale_factor != 1.0 or  # resized/downscaled
+            (rotation_angle is not None and abs(rotation_angle) > 0.01) or  # rotated
+            tps_input_pts is not None  # TPS applied
+        )
+
         # Extract lines
         contours = ld_row.get("contours", [])
         if not contours:
@@ -669,6 +676,10 @@ class AsyncOCRPipeline:
         mask_buffer = np.zeros((image.shape[0], image.shape[1]), dtype=np.uint8)
         current_k = 1.7
 
+        # Determine if we should skip binarization (already binary and not transformed)
+        # weirdly, not rebinarizing already binary images gives different results...
+        skip_binarization = False # is_binary and not was_transformed
+
         for contour_points in contours:
             line_img, current_k = self._extract_line(image, contour_points, current_k, mask_buffer)
             if line_img is None:
@@ -676,7 +687,7 @@ class AsyncOCRPipeline:
                 continue
 
             original_width = line_img.shape[1]
-            tensor = self._preprocess_line(line_img)
+            tensor = self._preprocess_line(line_img, skip_binarization=skip_binarization)
             line_tensors.append((tensor, original_width))
 
         return ProcessedPage(
@@ -708,8 +719,13 @@ class AsyncOCRPipeline:
 
         return line_img, adapted_k
 
-    def _preprocess_line(self, image: npt.NDArray) -> npt.NDArray:
-        """Preprocess line image to tensor."""
+    def _preprocess_line(self, image: npt.NDArray, skip_binarization: bool = False) -> npt.NDArray:
+        """Preprocess line image to tensor.
+        
+        Args:
+            image: Line image (grayscale, may be 2D or 3D with 1 channel)
+            skip_binarization: If True, skip binarization (image is already binary and untransformed)
+        """
         # Ensure we have a 2D grayscale image
         if image.ndim == 3:
             # get_line_image returns (H, W, 1) for grayscale input
@@ -736,8 +752,11 @@ class AsyncOCRPipeline:
         x_offset = 0
         padded[y_offset : y_offset + new_h, x_offset : x_offset + new_w] = resized
 
-        # Binarize (already grayscale)
-        binary = cv2.adaptiveThreshold(padded, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 31, 15)
+        # Binarize unless image was already binary and untransformed
+        if skip_binarization:
+            binary = padded
+        else:
+            binary = adaptive_binarize(padded)
 
         # Normalize
         tensor = binary.reshape((1, target_h, target_w)).astype(np.float32)

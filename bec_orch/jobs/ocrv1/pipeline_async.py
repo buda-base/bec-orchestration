@@ -25,7 +25,7 @@ import numpy.typing as npt
 if TYPE_CHECKING:
     pass
 
-from ..ldv1.img_helpers import apply_transform_3
+from ..ldv1.img_helpers import apply_transform_1
 from ..shared.decoder import bytes_to_frame
 from .ctc_decoder import (
     CTCDecoder,
@@ -600,22 +600,19 @@ class AsyncOCRPipeline:
         """Synchronous image processing (runs in thread pool)."""
         ld_row = fetched.ld_row
 
-        # Decode image using shared decoder
+        # Decode image using shared decoder (returns grayscale)
         # Parameters: max_width=6000, max_height=3000, patch_size=6000 (no patching)
-        gray, is_binary, orig_h, orig_w = bytes_to_frame(
+        image, is_binary, orig_h, orig_w = bytes_to_frame(
             fetched.filename,
             fetched.file_bytes,
             max_width=6000,
             max_height=3000,
             patch_size=6000,
-            linearize=True,  # Keep original behavior for now
+            linearize=True,
         )
 
-        # Convert grayscale to RGB for compatibility with rest of pipeline
-        image = cv2.cvtColor(gray, cv2.COLOR_GRAY2RGB)
-
         # Check if downscaling occurred and compute scale factor
-        actual_h, actual_w = gray.shape[:2]
+        actual_h, actual_w = image.shape[:2]
         scale_factor = 1.0
         if orig_h > 0 and orig_w > 0:
             scale_h = actual_h / orig_h
@@ -644,8 +641,8 @@ class AsyncOCRPipeline:
                 if tps_output_pts is not None:
                     tps_output_pts = [[p[0] * scale_factor, p[1] * scale_factor] for p in tps_output_pts]
 
-        # Apply rotation and TPS in one call
-        image = apply_transform_3(image, rotation_angle, tps_input_pts, tps_output_pts, tps_alpha)
+        # Apply rotation and TPS in one call (grayscale)
+        image = apply_transform_1(image, rotation_angle, tps_input_pts, tps_output_pts, tps_alpha)
 
         # Extract lines
         contours = ld_row.get("contours", [])
@@ -713,6 +710,11 @@ class AsyncOCRPipeline:
 
     def _preprocess_line(self, image: npt.NDArray) -> npt.NDArray:
         """Preprocess line image to tensor."""
+        # Ensure we have a 2D grayscale image
+        if image.ndim == 3:
+            # get_line_image returns (H, W, 1) for grayscale input
+            image = image.squeeze(axis=-1)
+
         # Pad to model size
         h, w = image.shape[:2]
         target_h = self.input_height
@@ -728,14 +730,14 @@ class AsyncOCRPipeline:
 
         resized = cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_AREA)
 
-        padded = np.ones((target_h, target_w, 3), dtype=np.uint8) * 255
+        # Pad with white (255) for grayscale
+        padded = np.ones((target_h, target_w), dtype=np.uint8) * 255
         y_offset = (target_h - new_h) // 2
         x_offset = 0
         padded[y_offset : y_offset + new_h, x_offset : x_offset + new_w] = resized
 
-        # Binarize
-        gray = cv2.cvtColor(padded, cv2.COLOR_RGB2GRAY)
-        binary = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 31, 15)
+        # Binarize (already grayscale)
+        binary = cv2.adaptiveThreshold(padded, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 31, 15)
 
         # Normalize
         tensor = binary.reshape((1, target_h, target_w)).astype(np.float32)

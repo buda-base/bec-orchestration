@@ -150,7 +150,8 @@ class OCRModel:
     def predict(
         self,
         tensor: npt.NDArray,
-        original_widths: list[int] | None = None,
+        content_widths: list[int] | None = None,
+        left_pad_widths: list[int] | None = None,
         input_width: int | None = None,
     ) -> tuple[list[npt.NDArray], list[npt.NDArray | None]]:
         """Run ONNX inference on preprocessed tensor, return log probabilities.
@@ -158,17 +159,18 @@ class OCRModel:
         Applies log_softmax immediately after inference.
         Also applies per-line vocabulary pruning to reduce IPC bandwidth.
         
-        If original_widths and input_width are provided, crops the time dimension
-        BEFORE softmax/pruning to remove padding and save computation.
+        If content_widths, left_pad_widths and input_width are provided, crops the time dimension
+        BEFORE softmax/pruning to remove left and right padding and save computation.
         
         Args:
             tensor: Input tensor of shape (batch, height, width) or (batch, channels, height, width)
-            original_widths: List of original image widths (before padding), one per batch item
+            content_widths: List of content widths (actual text region), one per batch item
+            left_pad_widths: List of left padding widths, one per batch item
             input_width: The padded model input width
         
         Returns:
             Tuple of (list of log_probs arrays, list of keep_indices per line) where:
-            - Each log_probs array has shape (pruned_vocab, time) with time cropped to original width
+            - Each log_probs array has shape (pruned_vocab, time) with time cropped to content only
             - keep_indices list contains vocabulary indices kept for each line (or None if no pruning)
         """
         tensor = tensor.astype(np.float32)
@@ -187,22 +189,28 @@ class OCRModel:
         if logits.ndim == 2:
             # Single item: (vocab, time)
             logits_list = [logits]
-            if original_widths is None:
-                original_widths = [logits.shape[1]]
+            if content_widths is None:
+                content_widths = [logits.shape[1]]
+            if left_pad_widths is None:
+                left_pad_widths = [0]
         else:
             # Batch: (batch, vocab, time)
             logits_list = [logits[i] for i in range(logits.shape[0])]
-            if original_widths is None:
-                original_widths = [logits.shape[2]] * logits.shape[0]
+            if content_widths is None:
+                content_widths = [logits.shape[2]] * logits.shape[0]
+            if left_pad_widths is None:
+                left_pad_widths = [0] * logits.shape[0]
         
-        # Crop time dimension to remove padding BEFORE softmax/pruning
+        # Crop time dimension to remove left and right padding BEFORE softmax/pruning
         # This saves computation by not processing padding frames
         if input_width is not None:
             full_time = logits_list[0].shape[1]  # All items have same full time
             cropped_list = []
-            for item_logits, orig_w in zip(logits_list, original_widths):
-                crop_timesteps = max(1, int(full_time * orig_w / input_width))
-                cropped_list.append(item_logits[:, :crop_timesteps])
+            for item_logits, content_w, left_pad_w in zip(logits_list, content_widths, left_pad_widths):
+                # Calculate start and end timesteps based on pixel positions
+                start_timestep = max(0, int(full_time * left_pad_w / input_width))
+                end_timestep = max(start_timestep + 1, int(full_time * (left_pad_w + content_w) / input_width))
+                cropped_list.append(item_logits[:, start_timestep:end_timestep])
             logits_list = cropped_list
         
         # Apply log_softmax (and optionally vocab pruning per-line)

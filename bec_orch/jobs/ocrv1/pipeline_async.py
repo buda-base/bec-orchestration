@@ -109,7 +109,7 @@ class ProcessedPage:
     page_idx: int
     filename: str
     source_etag: str
-    line_tensors: list[tuple[npt.NDArray, int]]  # (tensor, original_width)
+    line_tensors: list[tuple[npt.NDArray, int, int]]  # (tensor, content_width, left_pad_width)
     error: Optional[str] = None
 
 
@@ -118,7 +118,7 @@ class InferredPage:
     page_idx: int
     filename: str
     source_etag: str
-    logits_list: list[tuple[npt.NDArray, int, npt.NDArray | None]]  # (logits, original_width, keep_indices)
+    logits_list: list[tuple[npt.NDArray, int, int, npt.NDArray | None]]  # (logits, content_width, left_pad_width, keep_indices)
     error: Optional[str] = None
 
 
@@ -165,6 +165,7 @@ class AsyncOCRPipeline:
         greedy_confidence_threshold: float | None = None,
         use_nemo_decoder: bool = False,
         kenlm_path: str | None = None,
+        use_line_prepadding: bool = True,
     ):
         self.ocr_model = ocr_model
         self.ctc_decoder = ctc_decoder
@@ -185,6 +186,7 @@ class AsyncOCRPipeline:
         self.greedy_confidence_threshold = greedy_confidence_threshold
         self.use_nemo_decoder = use_nemo_decoder
         self.kenlm_path = kenlm_path
+        self.use_line_prepadding = use_line_prepadding
         self._nemo_decoder = None  # Lazy init when needed
 
         # Bounded queues for backpressure
@@ -347,7 +349,7 @@ class AsyncOCRPipeline:
                 )
                 continue
 
-            for line_idx, (logits, orig_w, keep_indices) in enumerate(inferred.logits_list):
+            for line_idx, (logits, content_w, left_pad_w, keep_indices) in enumerate(inferred.logits_list):
                 # Logits are already cropped to remove padding (done in model before softmax)
                 # Just need to transpose from (vocab, time) -> (time, vocab) if needed
                 actual_vocab_size = vocab_size if keep_indices is None else len(keep_indices)
@@ -683,12 +685,15 @@ class AsyncOCRPipeline:
         for contour_points in contours:
             line_img, current_k = self._extract_line(image, contour_points, current_k, mask_buffer)
             if line_img is None:
-                line_tensors.append((np.zeros((1, self.input_height, self.input_width), dtype=np.float32), 1))
+                line_tensors.append((np.zeros((1, self.input_height, self.input_width), dtype=np.float32), 1, 0))
                 continue
 
-            original_width = line_img.shape[1]
-            tensor = self._preprocess_line(line_img, skip_binarization=skip_binarization)
-            line_tensors.append((tensor, original_width))
+            tensor, content_width, left_pad_width = self._preprocess_line(
+                line_img,
+                skip_binarization=skip_binarization,
+                use_prepadding=self.use_line_prepadding,
+            )
+            line_tensors.append((tensor, content_width, left_pad_width))
 
         return ProcessedPage(
             page_idx=fetched.page_idx,
@@ -719,34 +724,71 @@ class AsyncOCRPipeline:
 
         return line_img, adapted_k
 
-    def _preprocess_line(self, image: npt.NDArray, skip_binarization: bool = False) -> npt.NDArray:
+    def _preprocess_line(
+        self, image: npt.NDArray, skip_binarization: bool = False, use_prepadding: bool = True
+    ) -> tuple[npt.NDArray, int, int]:
         """Preprocess line image to tensor.
         
         Args:
             image: Line image (grayscale, may be 2D or 3D with 1 channel)
             skip_binarization: If True, skip binarization (image is already binary and untransformed)
+            use_prepadding: If True, add h pixels of padding on left and right before resizing
+            
+        Returns:
+            Tuple of (tensor, content_width, left_pad_width) where:
+            - tensor: preprocessed image tensor
+            - content_width: width of actual content in the final padded image
+            - left_pad_width: width of left padding in the final padded image
         """
         # Ensure we have a 2D grayscale image
         if image.ndim == 3:
             # get_line_image returns (H, W, 1) for grayscale input
             image = image.squeeze(axis=-1)
 
-        # Pad to model size
         h, w = image.shape[:2]
         target_h = self.input_height
         target_w = self.input_width
-        aspect = w / h
 
-        if aspect > (target_w / target_h):
-            new_w = target_w
-            new_h = max(1, int(target_w / aspect))
+        if use_prepadding:
+            # Add square padding (h x h) on left and right before resizing
+            left_pad = h
+            right_pad = h
+            padded_w = w + left_pad + right_pad
+            
+            # Create padded image with white (255) padding
+            with_lr_pad = np.ones((h, padded_w), dtype=np.uint8) * 255
+            with_lr_pad[:, left_pad:left_pad + w] = image
+
+            # Calculate resize dimensions to fit target while maintaining aspect ratio
+            aspect = padded_w / h
+            if aspect > (target_w / target_h):
+                new_w = target_w
+                new_h = max(1, int(target_w / aspect))
+            else:
+                new_h = target_h
+                new_w = max(1, int(target_h * aspect))
+
+            resized = cv2.resize(with_lr_pad, (new_w, new_h), interpolation=cv2.INTER_AREA)
+
+            # Calculate content and left_pad widths in resized image coordinates
+            scale = new_w / padded_w
+            left_pad_resized = int(left_pad * scale)
+            content_width_resized = int(w * scale)
         else:
-            new_h = target_h
-            new_w = max(1, int(target_h * aspect))
+            # No prepadding - just resize to fit target
+            left_pad_resized = 0
+            aspect = w / h
+            if aspect > (target_w / target_h):
+                new_w = target_w
+                new_h = max(1, int(target_w / aspect))
+            else:
+                new_h = target_h
+                new_w = max(1, int(target_h * aspect))
 
-        resized = cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_AREA)
+            resized = cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_AREA)
+            content_width_resized = new_w
 
-        # Pad with white (255) for grayscale
+        # Pad to target size with white (255)
         padded = np.ones((target_h, target_w), dtype=np.uint8) * 255
         y_offset = (target_h - new_h) // 2
         x_offset = 0
@@ -762,7 +804,7 @@ class AsyncOCRPipeline:
         tensor = binary.reshape((1, target_h, target_w)).astype(np.float32)
         tensor = (tensor / 127.5) - 1.0
 
-        return tensor
+        return tensor, content_width_resized, left_pad_resized
 
     def _apply_tps(self, image: npt.NDArray, tps_points: tuple, alpha: float) -> npt.NDArray:
         """Apply TPS transform (simplified)."""
@@ -797,8 +839,8 @@ class AsyncOCRPipeline:
         pages_in_flight: dict[int, tuple[ProcessedPage, int, dict[int, tuple]]] = {}
 
         # Batch of tensors waiting to be processed
-        # (page_idx, line_idx, tensor, orig_w)
-        pending_tensors: list[tuple[int, int, npt.NDArray, int]] = []
+        # (page_idx, line_idx, tensor, content_w, left_pad_w)
+        pending_tensors: list[tuple[int, int, npt.NDArray, int, int]] = []
 
         lines_processed = 0
         pages_emitted = 0
@@ -812,28 +854,29 @@ class AsyncOCRPipeline:
             batch_size = len(pending_tensors)
             start_time = time.perf_counter()
 
-            # Stack tensors and collect original widths
+            # Stack tensors and collect content widths and left pad widths
             tensors = np.concatenate([t[2] for t in pending_tensors], axis=0)
-            original_widths = [t[3] for t in pending_tensors]
+            content_widths = [t[3] for t in pending_tensors]
+            left_pad_widths = [t[4] for t in pending_tensors]
 
-            # Run inference with original widths for early cropping
+            # Run inference with content widths and left pad widths for proper cropping
             # Model crops time dimension BEFORE softmax/pruning to save computation
             # Returns per-line keep_indices for deterministic pruning
             loop = asyncio.get_event_loop()
             batch_logits, keep_indices_list = await loop.run_in_executor(
                 None, 
-                lambda: self.ocr_model.predict(tensors, original_widths, self.input_width)
+                lambda: self.ocr_model.predict(tensors, content_widths, left_pad_widths, self.input_width)
             )
 
             # batch_logits is now a list of arrays (one per item), already cropped
             # keep_indices_list is a list of keep_indices (one per item), or None per item
             # Distribute results back to pages
-            for (page_idx, line_idx, _, orig_w), logits, keep_indices in zip(pending_tensors, batch_logits, keep_indices_list):
+            for (page_idx, line_idx, _, content_w, left_pad_w), logits, keep_indices in zip(pending_tensors, batch_logits, keep_indices_list):
                 if page_idx in pages_in_flight:
                     _, _, logits_dict = pages_in_flight[page_idx]
                     # Store logits along with per-line keep_indices
-                    # Note: logits are already cropped to remove padding
-                    logits_dict[line_idx] = (logits, orig_w, keep_indices)
+                    # Note: logits are already cropped to remove left and right padding
+                    logits_dict[line_idx] = (logits, content_w, left_pad_w, keep_indices)
                 lines_processed += 1
 
             pending_tensors.clear()
@@ -860,7 +903,7 @@ class AsyncOCRPipeline:
                     if i in logits_dict:
                         logits_list.append(logits_dict[i])
                     else:
-                        logits_list.append((np.zeros((1, 84), dtype=np.float32), 1, None))
+                        logits_list.append((np.zeros((1, 84), dtype=np.float32), 1, 0, None))
 
                 await self.q_inferred.put(
                     InferredPage(
@@ -891,7 +934,7 @@ class AsyncOCRPipeline:
                         if i in logits_dict:
                             logits_list.append(logits_dict[i])
                         else:
-                            logits_list.append((np.zeros((1, 84), dtype=np.float32), 1, None))
+                            logits_list.append((np.zeros((1, 84), dtype=np.float32), 1, 0, None))
 
                     await self.q_inferred.put(
                         InferredPage(
@@ -935,8 +978,8 @@ class AsyncOCRPipeline:
             pages_in_flight[processed.page_idx] = (processed, expected_lines, {})
 
             # Add tensors to batch
-            for line_idx, (tensor, orig_w) in enumerate(processed.line_tensors):
-                pending_tensors.append((processed.page_idx, line_idx, tensor, orig_w))
+            for line_idx, (tensor, content_w, left_pad_w) in enumerate(processed.line_tensors):
+                pending_tensors.append((processed.page_idx, line_idx, tensor, content_w, left_pad_w))
 
                 if len(pending_tensors) >= self.gpu_batch_size:
                     await flush_batch()
@@ -982,7 +1025,7 @@ class AsyncOCRPipeline:
                     # NOTE: Each line may have different keep_indices if they were in different GPU batches
                     cropped_logits_list = []
                     keep_indices_list = []
-                    for logits, orig_w, _keep_indices in inferred.logits_list:
+                    for logits, content_w, left_pad_w, _keep_indices in inferred.logits_list:
                         actual_vocab_size = vocab_size if _keep_indices is None else len(_keep_indices)
                         needs_transpose = logits.shape[0] == actual_vocab_size
                         if needs_transpose:

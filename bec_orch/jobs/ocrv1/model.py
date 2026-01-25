@@ -54,12 +54,12 @@ class OCRModel:
         if self._use_gpu:
             logger.info(
                 f"[OCRModel] Using PyTorch GPU for log_softmax + vocab pruning "
-                f"(threshold={vocab_prune_threshold})"
+                f"(threshold={vocab_prune_threshold}, per-line pruning)"
             )
         else:
             logger.info(
                 f"[OCRModel] Using scipy/numpy CPU for log_softmax + vocab pruning "
-                f"(threshold={vocab_prune_threshold})"
+                f"(threshold={vocab_prune_threshold}, per-line pruning)"
             )
 
     def _process_logits_gpu(
@@ -89,9 +89,7 @@ class OCRModel:
                 max_per_token = max_per_token.max(dim=0).values
             
             # Create mask for tokens above threshold (always keep blank at index 0)
-            # Round to 6 decimal places for deterministic comparison across GPU/CPU
-            max_per_token_rounded = _torch.round(max_per_token * 1e6) / 1e6
-            keep_mask = max_per_token_rounded > self._vocab_prune_threshold
+            keep_mask = max_per_token > self._vocab_prune_threshold
             keep_mask[0] = True  # Always keep blank token
             
             # Get indices of kept tokens
@@ -133,9 +131,7 @@ class OCRModel:
                 max_per_token = max_per_token.max(axis=0)
             
             # Create mask for tokens above threshold (always keep blank at index 0)
-            # Round to 6 decimal places for deterministic comparison across GPU/CPU
-            max_per_token_rounded = np.round(max_per_token, decimals=6)
-            keep_mask = max_per_token_rounded > self._vocab_prune_threshold
+            keep_mask = max_per_token > self._vocab_prune_threshold
             keep_mask[0] = True  # Always keep blank token
             
             # Get indices of kept tokens
@@ -156,11 +152,11 @@ class OCRModel:
         tensor: npt.NDArray,
         original_widths: list[int] | None = None,
         input_width: int | None = None,
-    ) -> tuple[list[npt.NDArray], npt.NDArray | None]:
+    ) -> tuple[list[npt.NDArray], list[npt.NDArray | None]]:
         """Run ONNX inference on preprocessed tensor, return log probabilities.
         
         Applies log_softmax immediately after inference.
-        Also applies vocabulary pruning to reduce IPC bandwidth.
+        Also applies per-line vocabulary pruning to reduce IPC bandwidth.
         
         If original_widths and input_width are provided, crops the time dimension
         BEFORE softmax/pruning to remove padding and save computation.
@@ -171,9 +167,9 @@ class OCRModel:
             input_width: The padded model input width
         
         Returns:
-            Tuple of (list of log_probs arrays, keep_indices) where:
-            - Each log_probs array has shape (vocab, time) with time cropped to original width
-            - keep_indices contains the vocabulary indices kept after pruning, or None
+            Tuple of (list of log_probs arrays, list of keep_indices per line) where:
+            - Each log_probs array has shape (pruned_vocab, time) with time cropped to original width
+            - keep_indices list contains vocabulary indices kept for each line (or None if no pruning)
         """
         tensor = tensor.astype(np.float32)
 
@@ -209,21 +205,24 @@ class OCRModel:
                 cropped_list.append(item_logits[:, :crop_timesteps])
             logits_list = cropped_list
         
-        # Apply log_softmax (and optionally vocab pruning)
+        # Apply log_softmax (and optionally vocab pruning per-line)
         if self._apply_log_softmax:
-            # Process each item individually since they may have different time lengths
-            # But compute vocab pruning mask across all items for consistency
             if self._use_gpu:
                 return self._process_logits_batch_gpu(logits_list)
             else:
                 return self._process_logits_batch_cpu(logits_list)
         
-        return logits_list, None
+        # No log_softmax - return unpruned with None keep_indices
+        return logits_list, [None] * len(logits_list)
     
     def _process_logits_batch_gpu(
         self, logits_list: list[npt.NDArray]
-    ) -> tuple[list[npt.NDArray], npt.NDArray | None]:
-        """Apply log_softmax and vocab pruning on GPU for a batch of variable-length items."""
+    ) -> tuple[list[npt.NDArray], list[npt.NDArray | None]]:
+        """Apply log_softmax and per-line vocab pruning on GPU.
+        
+        Returns:
+            Tuple of (list of log_probs arrays, list of keep_indices per line)
+        """
         # Apply log_softmax to each item
         log_probs_list = []
         for logits in logits_list:
@@ -231,75 +230,66 @@ class OCRModel:
             log_probs_tensor = _F.log_softmax(logits_tensor, dim=0)  # vocab axis
             log_probs_list.append(log_probs_tensor)
         
-        # Compute vocab pruning mask across all items
-        keep_indices = None
+        # Prune vocabulary per-line for deterministic results
+        keep_indices_list = []
         if self._vocab_prune_threshold is not None:
-            # Find max log prob per vocab token across all items and all timesteps
-            all_max_per_token = []
-            for log_probs_tensor in log_probs_list:
-                max_per_token = log_probs_tensor.max(dim=1).values  # max over time
-                all_max_per_token.append(max_per_token)
-            
-            # Stack and take max across batch
-            stacked_max = _torch.stack(all_max_per_token, dim=0)
-            global_max_per_token = stacked_max.max(dim=0).values
-            
-            # Create mask for tokens above threshold
-            # Round to 6 decimal places for deterministic comparison across GPU/CPU
-            global_max_rounded = _torch.round(global_max_per_token * 1e6) / 1e6
-            keep_mask = global_max_rounded > self._vocab_prune_threshold
-            keep_mask[0] = True  # Always keep blank token
-            
-            keep_indices = _torch.where(keep_mask)[0].cpu().numpy()
-            
-            # Prune each item
             pruned_list = []
             for log_probs_tensor in log_probs_list:
+                # Find max log prob per vocab token for this line only
+                max_per_token = log_probs_tensor.max(dim=1).values  # max over time
+                
+                # Create mask for tokens above threshold
+                keep_mask = max_per_token > self._vocab_prune_threshold
+                keep_mask[0] = True  # Always keep blank token
+                
+                keep_indices = _torch.where(keep_mask)[0].cpu().numpy()
+                keep_indices_list.append(keep_indices)
+                
+                # Prune this line
                 pruned = log_probs_tensor[keep_mask, :]
                 pruned_list.append(pruned.cpu().numpy().astype(np.float32))
             
-            return pruned_list, keep_indices
+            return pruned_list, keep_indices_list
         
-        # No pruning - just return log probs
-        return [lp.cpu().numpy().astype(np.float32) for lp in log_probs_list], None
+        # No pruning - return None for each line's keep_indices
+        keep_indices_list = [None] * len(log_probs_list)
+        return [lp.cpu().numpy().astype(np.float32) for lp in log_probs_list], keep_indices_list
     
     def _process_logits_batch_cpu(
         self, logits_list: list[npt.NDArray]
-    ) -> tuple[list[npt.NDArray], npt.NDArray | None]:
-        """Apply log_softmax and vocab pruning on CPU for a batch of variable-length items."""
+    ) -> tuple[list[npt.NDArray], list[npt.NDArray | None]]:
+        """Apply log_softmax and per-line vocab pruning on CPU.
+        
+        Returns:
+            Tuple of (list of log_probs arrays, list of keep_indices per line)
+        """
         # Apply log_softmax to each item
         log_probs_list = []
         for logits in logits_list:
             log_probs = scipy_log_softmax(logits, axis=0).astype(np.float32)
             log_probs_list.append(log_probs)
         
-        # Compute vocab pruning mask across all items
-        keep_indices = None
+        # Prune vocabulary per-line for deterministic results
+        keep_indices_list = []
         if self._vocab_prune_threshold is not None:
-            # Find max log prob per vocab token across all items and all timesteps
-            all_max_per_token = []
-            for log_probs in log_probs_list:
-                max_per_token = log_probs.max(axis=1)  # max over time
-                all_max_per_token.append(max_per_token)
-            
-            # Stack and take max across batch
-            stacked_max = np.stack(all_max_per_token, axis=0)
-            global_max_per_token = stacked_max.max(axis=0)
-            
-            # Create mask for tokens above threshold
-            # Round to 6 decimal places for deterministic comparison across GPU/CPU
-            global_max_rounded = np.round(global_max_per_token, decimals=6)
-            keep_mask = global_max_rounded > self._vocab_prune_threshold
-            keep_mask[0] = True  # Always keep blank token
-            
-            keep_indices = np.where(keep_mask)[0]
-            
-            # Prune each item
             pruned_list = []
             for log_probs in log_probs_list:
+                # Find max log prob per vocab token for this line only
+                max_per_token = log_probs.max(axis=1)  # max over time
+                
+                # Create mask for tokens above threshold
+                keep_mask = max_per_token > self._vocab_prune_threshold
+                keep_mask[0] = True  # Always keep blank token
+                
+                keep_indices = np.where(keep_mask)[0]
+                keep_indices_list.append(keep_indices)
+                
+                # Prune this line
                 pruned = log_probs[keep_mask, :]
                 pruned_list.append(pruned)
             
-            return pruned_list, keep_indices
+            return pruned_list, keep_indices_list
         
-        return log_probs_list, None
+        # No pruning - return None for each line's keep_indices
+        keep_indices_list = [None] * len(log_probs_list)
+        return log_probs_list, keep_indices_list

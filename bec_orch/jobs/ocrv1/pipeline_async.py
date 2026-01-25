@@ -757,18 +757,20 @@ class AsyncOCRPipeline:
 
             # Run inference with original widths for early cropping
             # Model crops time dimension BEFORE softmax/pruning to save computation
+            # Returns per-line keep_indices for deterministic pruning
             loop = asyncio.get_event_loop()
-            batch_logits, keep_indices = await loop.run_in_executor(
+            batch_logits, keep_indices_list = await loop.run_in_executor(
                 None, 
                 lambda: self.ocr_model.predict(tensors, original_widths, self.input_width)
             )
 
             # batch_logits is now a list of arrays (one per item), already cropped
+            # keep_indices_list is a list of keep_indices (one per item), or None per item
             # Distribute results back to pages
-            for (page_idx, line_idx, _, orig_w), logits in zip(pending_tensors, batch_logits):
+            for (page_idx, line_idx, _, orig_w), logits, keep_indices in zip(pending_tensors, batch_logits, keep_indices_list):
                 if page_idx in pages_in_flight:
                     _, _, logits_dict = pages_in_flight[page_idx]
-                    # Store logits along with keep_indices for GPU-pruned vocab
+                    # Store logits along with per-line keep_indices
                     # Note: logits are already cropped to remove padding
                     logits_dict[line_idx] = (logits, orig_w, keep_indices)
                 lines_processed += 1

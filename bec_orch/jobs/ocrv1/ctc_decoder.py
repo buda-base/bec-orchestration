@@ -1,4 +1,5 @@
 import logging
+from dataclasses import dataclass
 from functools import lru_cache
 from typing import Collection
 
@@ -7,6 +8,49 @@ import numpy.typing as npt
 from scipy.special import log_softmax as scipy_log_softmax
 
 from pyctcdecode.decoder import build_ctcdecoder
+
+
+@dataclass
+class SyllableSegment:
+    """A decoded syllable/word segment with position and confidence.
+    
+    Attributes:
+        start_pixel: Starting pixel position (x-coordinate) in the line image
+        end_pixel: Ending pixel position (x-coordinate) in the line image
+        text: The clean decoded text (syllable without trailing delimiters)
+        trailing_delimiters: Delimiter(s) that follow this syllable (e.g., "་" or "།")
+        confidence: Confidence score (normalized log probability, typically -inf to 0)
+    """
+    start_pixel: int
+    end_pixel: int
+    text: str
+    trailing_delimiters: str
+    confidence: float
+    
+    @property
+    def full_text(self) -> str:
+        """Return text with trailing delimiters included."""
+        return self.text + self.trailing_delimiters
+    
+    def as_tuple(self) -> tuple[int, int, str, float]:
+        """Return (start_pixel, end_pixel, full_text, confidence) tuple."""
+        return (self.start_pixel, self.end_pixel, self.full_text, self.confidence)
+
+
+@dataclass
+class LineDecodeResult:
+    """Complete decode result for a line including text and segment details.
+    
+    Attributes:
+        text: Full decoded text for the line
+        segments: List of syllable/word segments with positions and confidence
+        line_confidence: Overall confidence for the entire line
+        logit_score: Raw cumulative logit score from beam search
+    """
+    text: str
+    segments: list[SyllableSegment]
+    line_confidence: float
+    logit_score: float
 
 # Suppress noisy pyctcdecode warnings
 logging.getLogger("pyctcdecode.alphabet").setLevel(logging.ERROR)
@@ -357,6 +401,229 @@ def decode_logits_beam_search(
     )
 
 
+def _split_into_syllables(
+    text: str,
+    delimiters: frozenset[str],
+) -> list[tuple[str, str]]:
+    """
+    Split text into syllables, returning (clean_syllable, trailing_delimiters) pairs.
+    
+    This handles Tibetan text where delimiters follow syllables:
+    "བཀྲ་ཤིས།" -> [("བཀྲ", "་"), ("ཤིས", "།")]
+    
+    Args:
+        text: Full decoded text
+        delimiters: Set of delimiter characters
+    
+    Returns:
+        List of (syllable, trailing_delimiters) tuples
+    """
+    if not text:
+        return []
+    
+    result = []
+    current_syllable = ""
+    current_delimiters = ""
+    
+    for char in text:
+        if char in delimiters:
+            # This is a delimiter
+            if current_syllable:
+                # Accumulate delimiter after the syllable
+                current_delimiters += char
+            else:
+                # Delimiter at start or consecutive - add to previous or skip
+                if result:
+                    # Add to previous syllable's delimiters
+                    prev_syl, prev_delim = result[-1]
+                    result[-1] = (prev_syl, prev_delim + char)
+                else:
+                    # Leading delimiter - skip or treat as part of first syllable
+                    current_delimiters += char
+        else:
+            # This is a regular character
+            if current_syllable and current_delimiters:
+                # We have a complete syllable with delimiters, save it
+                result.append((current_syllable, current_delimiters))
+                current_syllable = char
+                current_delimiters = ""
+            else:
+                # Continue building current syllable
+                current_syllable += char
+    
+    # Don't forget the last syllable
+    if current_syllable or current_delimiters:
+        result.append((current_syllable, current_delimiters))
+    
+    return result
+
+
+def _compute_segment_confidences(
+    log_probs: npt.NDArray,
+    text_frames: list[tuple[str, tuple[int, int]]],
+) -> list[float]:
+    """
+    Compute per-segment confidence from frame log probabilities.
+    
+    For each segment, computes the mean of the maximum log probability
+    at each frame. This represents "how confident was the model about
+    its best choice at each timestep within this segment?"
+    
+    Args:
+        log_probs: shape (num_frames, vocab_size) - log probabilities
+        text_frames: list of (word_text, (start_frame, end_frame)) from decoder
+    
+    Returns:
+        List of confidence scores (one per segment), each is mean log prob
+    """
+    confidences = []
+    for _word_text, (start_frame, end_frame) in text_frames:
+        if end_frame <= start_frame:
+            confidences.append(float("-inf"))
+            continue
+        
+        # Get the log probs for frames in this segment
+        segment_log_probs = log_probs[start_frame:end_frame]
+        
+        # Max log prob at each frame (confidence in best token)
+        max_per_frame = segment_log_probs.max(axis=1)
+        
+        # Average log probability for this segment
+        segment_confidence = float(max_per_frame.mean())
+        confidences.append(segment_confidence)
+    
+    return confidences
+
+
+def decode_logits_with_segments(
+    logits: npt.NDArray,
+    vocab: list[str],
+    original_width: int,
+    beam_width: int | None = None,
+    token_min_logp: float | None = None,
+    logits_are_log_probs: bool = True,
+    word_delimiters: frozenset[str] | None = None,
+) -> LineDecodeResult:
+    """
+    Module-level beam search decode with syllable/word segments.
+
+    Returns structured output with each segment containing:
+    - start_pixel, end_pixel: position in the original line image
+    - text: the decoded text for this segment
+    - confidence: per-segment confidence score
+
+    Args:
+        logits: shape (time, vocab) - log probabilities (or raw logits)
+        vocab: vocabulary list (already pruned by model)
+        original_width: width of original line image in pixels
+        beam_width: beam width for decoding (defaults to module BEAM_WIDTH)
+        token_min_logp: token min log prob (defaults to module TOKEN_MIN_LOGP)
+        logits_are_log_probs: if True (default), logits are already log probabilities
+        word_delimiters: characters that trigger word/syllable boundaries
+
+    Returns:
+        LineDecodeResult with text, segments, and confidence scores
+    """
+    if beam_width is None:
+        beam_width = BEAM_WIDTH
+    if token_min_logp is None:
+        token_min_logp = TOKEN_MIN_LOGP
+    if word_delimiters is None:
+        word_delimiters = DEFAULT_WORD_DELIMITERS
+
+    # Apply log_softmax only if not already done
+    if logits_are_log_probs:
+        log_probs = logits
+    else:
+        log_probs = _apply_log_softmax(logits)
+
+    num_frames = log_probs.shape[0]
+
+    # Get cached decoder
+    vocab_tuple = tuple(vocab)
+    decoder = _get_cached_decoder(vocab_tuple, word_delimiters)
+
+    # Use decode_beams to get frame information
+    output_beams = decoder.decode_beams(
+        log_probs,
+        beam_width=beam_width,
+        token_min_logp=token_min_logp,
+        logits_are_log_probs=True,
+    )
+
+    if not output_beams:
+        return LineDecodeResult(
+            text="",
+            segments=[],
+            line_confidence=float("-inf"),
+            logit_score=0.0,
+        )
+
+    # Take the best beam
+    best_beam = output_beams[0]
+    full_text = best_beam.text.replace(_GLOBAL_BLANK_SIGN, "")
+    logit_score = best_beam.logit_score
+
+    # Calculate overall line confidence (normalized by number of frames)
+    line_confidence = logit_score / num_frames if num_frames > 0 else float("-inf")
+
+    # Parse syllables from the full text using our delimiters
+    # This handles Tibetan properly (pyctcdecode's whitespace split doesn't work)
+    syllables = _split_into_syllables(full_text, word_delimiters)
+    
+    # Get frame ranges - pyctcdecode stores these without the word text for non-space delimiters
+    # text_frames is List[(word, (start, end))] but the words may be wrong for non-space delimited text
+    frame_ranges = [frames for _, frames in best_beam.text_frames]
+    
+    # If frame count doesn't match syllable count, fall back to distributing evenly
+    if len(frame_ranges) != len(syllables) and syllables:
+        # Distribute frames proportionally across syllables
+        total_frames = num_frames
+        syllable_lengths = [len(syl) + len(delim) for syl, delim in syllables]
+        total_chars = sum(syllable_lengths)
+        if total_chars > 0:
+            frame_ranges = []
+            current_frame = 0
+            for length in syllable_lengths:
+                frames_for_syllable = max(1, int(total_frames * length / total_chars))
+                frame_ranges.append((current_frame, current_frame + frames_for_syllable))
+                current_frame += frames_for_syllable
+    
+    # Compute per-segment confidence from frame probabilities
+    # Create fake text_frames for confidence computation
+    fake_text_frames = [(syl, frames) for (syl, _), frames in zip(syllables, frame_ranges)]
+    segment_confidences = _compute_segment_confidences(log_probs, fake_text_frames)
+
+    # Convert frames to pixels
+    pixels_per_frame = original_width / num_frames if num_frames > 0 else 1.0
+
+    segments: list[SyllableSegment] = []
+    for (syllable, trailing), (start_frame, end_frame), seg_conf in zip(
+        syllables, frame_ranges, segment_confidences
+    ):
+        if not syllable and not trailing:
+            continue
+
+        # Convert frames to pixels
+        start_pixel = int(start_frame * pixels_per_frame)
+        end_pixel = int(end_frame * pixels_per_frame)
+
+        segments.append(SyllableSegment(
+            start_pixel=start_pixel,
+            end_pixel=end_pixel,
+            text=syllable,
+            trailing_delimiters=trailing,
+            confidence=seg_conf,
+        ))
+
+    return LineDecodeResult(
+        text=full_text,
+        segments=segments,
+        line_confidence=line_confidence,
+        logit_score=logit_score,
+    )
+
+
 class CTCDecoder:
     """CTC decoder with beam search."""
 
@@ -425,3 +692,122 @@ class CTCDecoder:
             log_probs, beam_width=BEAM_WIDTH, token_min_logp=TOKEN_MIN_LOGP,
             logits_are_log_probs=True
         ).replace(self.blank_sign, "")
+
+    def decode_with_segments(
+        self,
+        logits: npt.NDArray,
+        original_width: int,
+        logits_are_log_probs: bool = True,
+        beam_width: int | None = None,
+        token_min_logp: float | None = None,
+    ) -> LineDecodeResult:
+        """Decode logits to text with syllable/word segments including positions and confidence.
+
+        Returns structured output with each syllable/word segment containing:
+        - start_pixel, end_pixel: position in the original line image
+        - text: the decoded text for this segment
+        - confidence: per-segment confidence score
+
+        Args:
+            logits: shape (time, vocab) or (vocab, time) - log probabilities (or raw logits)
+            original_width: width of the original line image in pixels (for frame-to-pixel conversion)
+            logits_are_log_probs: if True (default), logits are already log probabilities
+            beam_width: beam width for decoding (defaults to module BEAM_WIDTH)
+            token_min_logp: minimum token log probability (defaults to module TOKEN_MIN_LOGP)
+
+        Returns:
+            LineDecodeResult with text, segments, and confidence scores
+        """
+        if beam_width is None:
+            beam_width = BEAM_WIDTH
+        if token_min_logp is None:
+            token_min_logp = TOKEN_MIN_LOGP
+
+        # Ensure shape is (time, vocab)
+        if logits.shape[0] == len(self.ctc_vocab):
+            logits = np.transpose(logits, axes=[1, 0])
+
+        # Apply log_softmax only if not already done
+        if logits_are_log_probs:
+            log_probs = logits
+        else:
+            log_probs = _apply_log_softmax(logits)
+
+        num_frames = log_probs.shape[0]
+
+        # Use decode_beams to get frame information
+        output_beams = self._beam_decoder.decode_beams(
+            log_probs,
+            beam_width=beam_width,
+            token_min_logp=token_min_logp,
+            logits_are_log_probs=True,
+        )
+
+        if not output_beams:
+            return LineDecodeResult(
+                text="",
+                segments=[],
+                line_confidence=float("-inf"),
+                logit_score=0.0,
+            )
+
+        # Take the best beam
+        best_beam = output_beams[0]
+        full_text = best_beam.text.replace(self.blank_sign, "")
+        logit_score = best_beam.logit_score
+
+        # Calculate overall line confidence (normalized by number of frames)
+        # logit_score is cumulative log probability; normalize by frames for comparability
+        line_confidence = logit_score / num_frames if num_frames > 0 else float("-inf")
+
+        # Parse syllables from the full text using our delimiters
+        syllables = _split_into_syllables(full_text, self.word_delimiters)
+        
+        # Get frame ranges from pyctcdecode output
+        frame_ranges = [frames for _, frames in best_beam.text_frames]
+        
+        # If frame count doesn't match syllable count, distribute evenly
+        if len(frame_ranges) != len(syllables) and syllables:
+            total_frames = num_frames
+            syllable_lengths = [len(syl) + len(delim) for syl, delim in syllables]
+            total_chars = sum(syllable_lengths)
+            if total_chars > 0:
+                frame_ranges = []
+                current_frame = 0
+                for length in syllable_lengths:
+                    frames_for_syllable = max(1, int(total_frames * length / total_chars))
+                    frame_ranges.append((current_frame, current_frame + frames_for_syllable))
+                    current_frame += frames_for_syllable
+        
+        # Compute per-segment confidence from frame probabilities
+        fake_text_frames = [(syl, frames) for (syl, _), frames in zip(syllables, frame_ranges)]
+        segment_confidences = _compute_segment_confidences(log_probs, fake_text_frames)
+
+        # Convert frames to pixels
+        pixels_per_frame = original_width / num_frames if num_frames > 0 else 1.0
+
+        segments: list[SyllableSegment] = []
+        for (syllable, trailing), (start_frame, end_frame), seg_conf in zip(
+            syllables, frame_ranges, segment_confidences
+        ):
+            if not syllable and not trailing:
+                continue
+
+            # Convert frames to pixels
+            start_pixel = int(start_frame * pixels_per_frame)
+            end_pixel = int(end_frame * pixels_per_frame)
+
+            segments.append(SyllableSegment(
+                start_pixel=start_pixel,
+                end_pixel=end_pixel,
+                text=syllable,
+                trailing_delimiters=trailing,
+                confidence=seg_conf,
+            ))
+
+        return LineDecodeResult(
+            text=full_text,
+            segments=segments,
+            line_confidence=line_confidence,
+            logit_score=logit_score,
+        )

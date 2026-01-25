@@ -916,14 +916,10 @@ class AsyncOCRPipeline:
 
                     # Logits are already cropped to remove padding (done in model before softmax)
                     # Just need to transpose from (vocab, time) -> (time, vocab) if needed
-                    # Also handle vocabulary pruning - get keep_indices from first line
+                    # NOTE: Each line may have different keep_indices if they were in different GPU batches
                     cropped_logits_list = []
-                    keep_indices_for_page = None
+                    keep_indices_list = []
                     for logits, orig_w, _keep_indices in inferred.logits_list:
-                        # Track keep_indices (should be same for all lines in page)
-                        if _keep_indices is not None:
-                            keep_indices_for_page = _keep_indices
-                        
                         actual_vocab_size = vocab_size if _keep_indices is None else len(_keep_indices)
                         needs_transpose = logits.shape[0] == actual_vocab_size
                         if needs_transpose:
@@ -931,12 +927,7 @@ class AsyncOCRPipeline:
                         else:
                             cropped = logits
                         cropped_logits_list.append(cropped)
-                    
-                    # Get pruned vocabulary if applicable
-                    if keep_indices_for_page is not None:
-                        pruned_vocab = [vocab[i] for i in keep_indices_for_page]
-                    else:
-                        pruned_vocab = vocab
+                        keep_indices_list.append(_keep_indices)
 
                     if self.use_nemo_decoder:
                         # NeMo GPU decoder - batch decode all lines on GPU
@@ -954,13 +945,15 @@ class AsyncOCRPipeline:
                     elif self.use_greedy_decode:
                         # Greedy decode is fast (~0.6ms/line), run directly without ProcessPoolExecutor
                         texts = []
-                        for cropped in cropped_logits_list:
+                        for cropped, keep_indices in zip(cropped_logits_list, keep_indices_list):
+                            pruned_vocab = [vocab[i] for i in keep_indices] if keep_indices is not None else vocab
                             text = decode_logits_greedy(cropped, pruned_vocab)
                             texts.append(text.strip().replace("§", " "))
                     elif self.use_hybrid_decode:
                         # Hybrid decode: greedy first, beam search fallback for low-confidence lines
                         texts = []
-                        for cropped in cropped_logits_list:
+                        for cropped, keep_indices in zip(cropped_logits_list, keep_indices_list):
+                            pruned_vocab = [vocab[i] for i in keep_indices] if keep_indices is not None else vocab
                             text = decode_logits_hybrid_global(
                                 cropped, pruned_vocab,
                                 beam_width=self.beam_width,
@@ -970,7 +963,8 @@ class AsyncOCRPipeline:
                     else:
                         # Beam search via ProcessPoolExecutor - submit each line for parallel decode
                         futures = []
-                        for cropped in cropped_logits_list:
+                        for cropped, keep_indices in zip(cropped_logits_list, keep_indices_list):
+                            pruned_vocab = [vocab[i] for i in keep_indices] if keep_indices is not None else vocab
                             future = loop.run_in_executor(
                                 self._ctc_executor,
                                 _decode_single_line,

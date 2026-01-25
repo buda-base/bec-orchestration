@@ -1,5 +1,6 @@
 import logging
 from functools import lru_cache
+from typing import Collection
 
 import numpy as np
 import numpy.typing as npt
@@ -15,15 +16,57 @@ _GLOBAL_DECODER = None
 _GLOBAL_VOCAB_LEN = None  # Use length for fast comparison
 _GLOBAL_BLANK_SIGN = "<pad>"
 
+# Tibetan word/syllable delimiters
+# These characters trigger word boundaries for language model scoring and frame tracking.
+# Includes: tsheg (་), tsheg-like (༌), space, shad (།), sbrul-shad (༴), visarga (ཿ),
+# head mark (࿒), brackets (༼༽), and other punctuation (࿙࿚༔)
+TIBETAN_WORD_DELIMITERS: frozenset[str] = frozenset({
+    "་",  # tsheg (most common syllable separator)
+    "༌",  # tsheg-like / non-breaking tsheg
+    " ",  # space
+    "།",  # shad (sentence/phrase delimiter)
+    "༴",  # sbrul-shad (repetition mark)
+    "ཿ",  # visarga / rnam-bcad
+    "࿒",  # head mark
+    "༼",  # opening bracket
+    "༽",  # closing bracket
+    "࿙",  # leading ornament
+    "࿚",  # trailing ornament
+    "༔",  # ter-tsheg / gter-tsheg
+})
+
+# Space-only delimiters - original behavior for backward compatibility
+# Use this for stable reference outputs that match previous decoder behavior
+SPACE_ONLY_DELIMITERS: frozenset[str] = frozenset({" "})
+
+# Default word delimiters - use Tibetan delimiters for syllable-level decoding
+# This enables proper syllable boundaries for:
+# - Per-syllable timing (text_frames)
+# - Per-syllable LM scoring (when using KenLM trained on syllables)
+# - Per-syllable confidence scores
+# Note: This changes beam search dynamics compared to space-only delimiters
+DEFAULT_WORD_DELIMITERS: frozenset[str] = TIBETAN_WORD_DELIMITERS
+
 
 @lru_cache(maxsize=32)
-def _get_cached_decoder(vocab_tuple: tuple[str, ...]):
+def _get_cached_decoder(
+    vocab_tuple: tuple[str, ...],
+    word_delimiters: frozenset[str] | None = None,
+):
     """Get or create a cached CTC decoder for a given vocabulary.
     
     Caches decoders by vocabulary to avoid rebuilding for lines with the same
     pruned vocabulary (common in batch processing with model-side pruning).
+    
+    Args:
+        vocab_tuple: vocabulary as a tuple (hashable for caching)
+        word_delimiters: characters that trigger word boundaries.
+                        Default is space-only for backward compatibility.
+                        Use TIBETAN_WORD_DELIMITERS for syllable-level decoding.
     """
-    return build_ctcdecoder(list(vocab_tuple))
+    if word_delimiters is None:
+        word_delimiters = DEFAULT_WORD_DELIMITERS
+    return build_ctcdecoder(list(vocab_tuple), word_delimiters=word_delimiters)
 
 
 # Beam width for CTC decoding
@@ -196,11 +239,23 @@ def decode_logits_hybrid_global(
     )
 
 
-def _init_global_decoder(vocab: list[str]) -> None:
-    """Initialize the global decoder for use in worker processes."""
+def _init_global_decoder(
+    vocab: list[str],
+    word_delimiters: Collection[str] | None = None,
+) -> None:
+    """Initialize the global decoder for use in worker processes.
+    
+    Args:
+        vocab: vocabulary list
+        word_delimiters: characters that trigger word boundaries.
+                        Default is space-only for backward compatibility.
+                        Use TIBETAN_WORD_DELIMITERS for syllable-level decoding.
+    """
     global _GLOBAL_DECODER, _GLOBAL_VOCAB_LEN
     if _GLOBAL_DECODER is None or _GLOBAL_VOCAB_LEN != len(vocab):
-        _GLOBAL_DECODER = build_ctcdecoder(vocab)
+        if word_delimiters is None:
+            word_delimiters = DEFAULT_WORD_DELIMITERS
+        _GLOBAL_DECODER = build_ctcdecoder(vocab, word_delimiters=word_delimiters)
         _GLOBAL_VOCAB_LEN = len(vocab)
 
 
@@ -305,7 +360,21 @@ def decode_logits_beam_search(
 class CTCDecoder:
     """CTC decoder with beam search."""
 
-    def __init__(self, charset: str | list[str], add_blank: bool):
+    def __init__(
+        self,
+        charset: str | list[str],
+        add_blank: bool,
+        word_delimiters: Collection[str] | None = None,
+    ):
+        """Initialize CTC decoder.
+        
+        Args:
+            charset: character set as string or list
+            add_blank: whether to add blank token at index 0
+            word_delimiters: characters that trigger word boundaries for LM scoring
+                           and frame tracking. Default is space-only for backward
+                           compatibility. Use TIBETAN_WORD_DELIMITERS for syllable-level.
+        """
         self.blank_sign = "<pad>"
 
         if isinstance(charset, str):
@@ -320,8 +389,16 @@ class CTCDecoder:
         else:
             self.blank_idx = -1
 
-        # Build beam search decoder
-        self._beam_decoder = build_ctcdecoder(self.ctc_vocab)
+        # Store word delimiters for reference
+        if word_delimiters is None:
+            self.word_delimiters = DEFAULT_WORD_DELIMITERS
+        else:
+            self.word_delimiters = frozenset(word_delimiters)
+
+        # Build beam search decoder with word delimiters
+        self._beam_decoder = build_ctcdecoder(
+            self.ctc_vocab, word_delimiters=self.word_delimiters
+        )
 
     def decode(
         self, logits: npt.NDArray, logits_are_log_probs: bool = True

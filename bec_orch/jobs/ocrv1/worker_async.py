@@ -20,7 +20,7 @@ if TYPE_CHECKING:
     from bec_orch.core.models import TaskResult
     from bec_orch.jobs.base import JobContext
 
-from .ctc_decoder import CTCDecoder
+from .ctc_decoder import CTCDecoder, DEFAULT_WORD_DELIMITERS, SPACE_ONLY_DELIMITERS, TIBETAN_WORD_DELIMITERS
 from .model import OCRModel
 from .pipeline_async import AsyncOCRPipeline
 
@@ -35,7 +35,15 @@ class OCRV1JobWorkerAsync:
     CPU-bound image processing and CTC decoding.
     """
 
-    def __init__(self):
+    def __init__(self, word_delimiters: frozenset[str] | None = None):
+        """Initialize the OCR worker.
+        
+        Args:
+            word_delimiters: Characters that trigger word boundaries for CTC decoding.
+                           - None (default): Use TIBETAN_WORD_DELIMITERS for syllable-level decoding
+                           - SPACE_ONLY_DELIMITERS: Original behavior for backward compatibility
+                           - TIBETAN_WORD_DELIMITERS: Explicit syllable-level decoding
+        """
         model_dir = os.environ.get("BEC_OCR_MODEL_DIR")
         if not model_dir:
             raise ValueError("BEC_OCR_MODEL_DIR environment variable not set.")
@@ -79,7 +87,11 @@ class OCRV1JobWorkerAsync:
             swap_hw=swap_hw,
         )
 
-        self.ctc_decoder = CTCDecoder(charset=charset, add_blank=add_blank)
+        # Store word_delimiters for reference
+        self.word_delimiters = word_delimiters if word_delimiters is not None else DEFAULT_WORD_DELIMITERS
+        logger.info(f"  Word delimiters: {len(self.word_delimiters)} chars ({'Tibetan syllable' if self.word_delimiters == TIBETAN_WORD_DELIMITERS else 'space-only'})")
+        
+        self.ctc_decoder = CTCDecoder(charset=charset, add_blank=add_blank, word_delimiters=self.word_delimiters)
 
         self.ld_bucket = os.environ.get("BEC_LD_BUCKET", "bec.bdrc.io")
         self.source_image_bucket = os.environ.get("BEC_SOURCE_IMAGE_BUCKET", "archive.tbrc.org")

@@ -25,6 +25,7 @@ import numpy.typing as npt
 if TYPE_CHECKING:
     pass
 
+from ..ldv1.img_helpers import apply_transform_3
 from ..shared.decoder import bytes_to_frame
 from .ctc_decoder import (
     CTCDecoder,
@@ -626,27 +627,25 @@ class AsyncOCRPipeline:
                     f"Image {fetched.filename} was downscaled: {orig_w}x{orig_h} -> {actual_w}x{actual_h} (scale={scale_factor:.3f})"
                 )
 
-        # Apply transforms
-        rotation_angle = ld_row.get("rotation_angle", 0.0)
+        # Apply transforms (rotation + TPS) using shared helper
+        rotation_angle = ld_row.get("rotation_angle", 0.0) or 0.0
         tps_points = ld_row.get("tps_points")
         tps_alpha = ld_row.get("tps_alpha", 0.5)
 
-        if rotation_angle and abs(rotation_angle) > 0.01:
-            h, w = image.shape[:2]
-            center = (w / 2, h / 2)
-            M = cv2.getRotationMatrix2D(center, rotation_angle, 1.0)
-            image = cv2.warpAffine(image, M, (w, h), borderMode=cv2.BORDER_REPLICATE)
-
+        # Extract and scale TPS points if present
+        tps_input_pts = None
+        tps_output_pts = None
         if tps_points:
+            tps_input_pts, tps_output_pts = tps_points
             # Scale TPS points if image was downscaled
             if scale_factor != 1.0:
-                input_pts, output_pts = tps_points
-                if input_pts is not None:
-                    input_pts = [[p[0] * scale_factor, p[1] * scale_factor] for p in input_pts]
-                if output_pts is not None:
-                    output_pts = [[p[0] * scale_factor, p[1] * scale_factor] for p in output_pts]
-                tps_points = (input_pts, output_pts)
-            image = self._apply_tps(image, tps_points, tps_alpha)
+                if tps_input_pts is not None:
+                    tps_input_pts = [[p[0] * scale_factor, p[1] * scale_factor] for p in tps_input_pts]
+                if tps_output_pts is not None:
+                    tps_output_pts = [[p[0] * scale_factor, p[1] * scale_factor] for p in tps_output_pts]
+
+        # Apply rotation and TPS in one call
+        image = apply_transform_3(image, rotation_angle, tps_input_pts, tps_output_pts, tps_alpha)
 
         # Extract lines
         contours = ld_row.get("contours", [])

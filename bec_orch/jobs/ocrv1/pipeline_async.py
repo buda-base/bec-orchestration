@@ -25,6 +25,7 @@ import numpy.typing as npt
 if TYPE_CHECKING:
     pass
 
+from ..shared.decoder import bytes_to_frame
 from .ctc_decoder import (
     CTCDecoder,
     decode_logits_beam_search,
@@ -598,13 +599,32 @@ class AsyncOCRPipeline:
         """Synchronous image processing (runs in thread pool)."""
         ld_row = fetched.ld_row
 
-        # Decode image
-        img_array = np.frombuffer(fetched.file_bytes, dtype=np.uint8)
-        image = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
-        if image is None:
-            raise ValueError("Failed to decode image")
+        # Decode image using shared decoder
+        # Parameters: max_width=6000, max_height=3000, patch_size=6000 (no patching)
+        gray, is_binary, orig_h, orig_w = bytes_to_frame(
+            fetched.filename,
+            fetched.file_bytes,
+            max_width=6000,
+            max_height=3000,
+            patch_size=6000,
+            linearize=True,  # Keep original behavior for now
+        )
 
-        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        # Convert grayscale to RGB for compatibility with rest of pipeline
+        image = cv2.cvtColor(gray, cv2.COLOR_GRAY2RGB)
+
+        # Check if downscaling occurred and compute scale factor
+        actual_h, actual_w = gray.shape[:2]
+        scale_factor = 1.0
+        if orig_h > 0 and orig_w > 0:
+            scale_h = actual_h / orig_h
+            scale_w = actual_w / orig_w
+            # Use the smaller scale factor (they should be equal for uniform scaling)
+            if abs(scale_h - 1.0) > 0.001 or abs(scale_w - 1.0) > 0.001:
+                scale_factor = min(scale_h, scale_w)
+                logger.error(
+                    f"Image {fetched.filename} was downscaled: {orig_w}x{orig_h} -> {actual_w}x{actual_h} (scale={scale_factor:.3f})"
+                )
 
         # Apply transforms
         rotation_angle = ld_row.get("rotation_angle", 0.0)
@@ -618,6 +638,14 @@ class AsyncOCRPipeline:
             image = cv2.warpAffine(image, M, (w, h), borderMode=cv2.BORDER_REPLICATE)
 
         if tps_points:
+            # Scale TPS points if image was downscaled
+            if scale_factor != 1.0:
+                input_pts, output_pts = tps_points
+                if input_pts is not None:
+                    input_pts = [[p[0] * scale_factor, p[1] * scale_factor] for p in input_pts]
+                if output_pts is not None:
+                    output_pts = [[p[0] * scale_factor, p[1] * scale_factor] for p in output_pts]
+                tps_points = (input_pts, output_pts)
             image = self._apply_tps(image, tps_points, tps_alpha)
 
         # Extract lines
@@ -629,6 +657,17 @@ class AsyncOCRPipeline:
                 source_etag=fetched.source_etag,
                 line_tensors=[],
             )
+
+        # Scale contours if image was downscaled
+        if scale_factor != 1.0:
+            scaled_contours = []
+            for contour_points in contours:
+                scaled_points = [
+                    {"x": int(p["x"] * scale_factor), "y": int(p["y"] * scale_factor)}
+                    for p in contour_points
+                ]
+                scaled_contours.append(scaled_points)
+            contours = scaled_contours
 
         line_tensors = []
         mask_buffer = np.zeros((image.shape[0], image.shape[1]), dtype=np.uint8)

@@ -26,10 +26,7 @@ if TYPE_CHECKING:
     pass
 
 from .ctc_decoder import (
-    VOCAB_PRUNE_MODE,
-    VOCAB_PRUNE_THRESHOLD,
     CTCDecoder,
-    compute_page_keep_mask,
     decode_logits_beam_search,
     decode_logits_greedy,
     decode_logits_hybrid_global,
@@ -45,24 +42,20 @@ logger = logging.getLogger(__name__)
 def _decode_single_line(
     cropped_logits: npt.NDArray,
     vocab: list[str],
-    keep_mask: npt.NDArray | None = None,
     beam_width: int | None = None,
     token_min_logp: float | None = None,
-    vocab_prune_threshold: float | None = None,
-    vocab_prune_mode: str | None = None,
     submit_time: float | None = None,
 ) -> tuple[str, float, float, int]:
     """
     Decode a single line's pre-cropped logits. Used for parallel line decoding.
 
+    Vocabulary pruning is now handled in the model before IPC.
+
     Args:
-        cropped_logits: Pre-cropped logits in (time, vocab) shape
-        vocab: Full vocabulary list
-        keep_mask: Optional pre-computed mask for per-page vocabulary pruning
+        cropped_logits: Pre-cropped logits in (time, vocab) shape (already pruned by model)
+        vocab: Vocabulary list (already pruned by model)
         beam_width: Beam width for decoding (passed to worker)
         token_min_logp: Token min log prob (passed to worker)
-        vocab_prune_threshold: Vocabulary pruning threshold (passed to worker)
-        vocab_prune_mode: Vocabulary pruning mode (passed to worker)
         submit_time: Time when task was submitted (for IPC measurement)
 
     Returns:
@@ -74,9 +67,7 @@ def _decode_single_line(
     ipc_in_ms = (arrival_time - submit_time) * 1000 if submit_time else 0.0
 
     start = time.perf_counter()
-    text = decode_logits_beam_search(
-        cropped_logits, vocab, keep_mask, beam_width, token_min_logp, vocab_prune_threshold, vocab_prune_mode
-    )
+    text = decode_logits_beam_search(cropped_logits, vocab, beam_width, token_min_logp)
     elapsed_ms = (time.perf_counter() - start) * 1000
     return text.strip().replace("§", " "), elapsed_ms, ipc_in_ms, os.getpid()
 
@@ -84,23 +75,20 @@ def _decode_single_line(
 def _decode_page_lines(
     cropped_logits_list: list[npt.NDArray],
     vocab: list[str],
-    keep_mask: npt.NDArray | None = None,
     beam_width: int | None = None,
     token_min_logp: float | None = None,
-    vocab_prune_threshold: float | None = None,
-    vocab_prune_mode: str | None = None,
 ) -> list[str]:
     """
     Decode all lines of a page in a single worker call to reduce IPC overhead.
 
     Instead of 6 IPC calls per page (one per line), we do 1 IPC call with all lines.
     This reduces overhead from ~6*30ms = 180ms to ~30ms per page.
+
+    Vocabulary pruning is now handled in the model before IPC.
     """
     texts = []
     for cropped_logits in cropped_logits_list:
-        text = decode_logits_beam_search(
-            cropped_logits, vocab, keep_mask, beam_width, token_min_logp, vocab_prune_threshold, vocab_prune_mode
-        )
+        text = decode_logits_beam_search(cropped_logits, vocab, beam_width, token_min_logp)
         texts.append(text.strip().replace("§", " "))
     return texts
 
@@ -128,7 +116,7 @@ class InferredPage:
     page_idx: int
     filename: str
     source_etag: str
-    logits_list: list[tuple[npt.NDArray, int]]  # (logits, original_width)
+    logits_list: list[tuple[npt.NDArray, int, npt.NDArray | None]]  # (logits, original_width, keep_indices)
     error: Optional[str] = None
 
 
@@ -189,8 +177,6 @@ class AsyncOCRPipeline:
         self.gpu_batch_size = gpu_batch_size
         self.beam_width = beam_width
         self.token_min_logp = token_min_logp
-        self.vocab_prune_threshold: float | None = None
-        self.vocab_prune_mode: str | None = None
         self.use_greedy_decode = use_greedy_decode
         self.use_hybrid_decode = use_hybrid_decode
         self.use_nemo_decoder = use_nemo_decoder
@@ -357,33 +343,48 @@ class AsyncOCRPipeline:
                 )
                 continue
 
-            for line_idx, (logits, orig_w) in enumerate(inferred.logits_list):
+            for line_idx, (logits, orig_w, keep_indices) in enumerate(inferred.logits_list):
                 # Handle transposed logits (vocab, time) -> (time, vocab)
-                needs_transpose = logits.shape[0] == vocab_size
+                # Note: if GPU pruning was applied, vocab dimension is already reduced
+                actual_vocab_size = vocab_size if keep_indices is None else len(keep_indices)
+                needs_transpose = logits.shape[0] == actual_vocab_size
                 if needs_transpose:
                     crop_timesteps = max(1, int(logits.shape[1] * orig_w / self.input_width))
                     cropped = logits[:, :crop_timesteps].T
                 else:
                     crop_timesteps = max(1, int(logits.shape[0] * orig_w / self.input_width))
                     cropped = logits[:crop_timesteps, :]
-                all_decode_tasks.append((inferred.page_idx, line_idx, cropped, inferred))
+                all_decode_tasks.append((inferred.page_idx, line_idx, cropped, inferred, keep_indices))
 
-        logger.info(f"[Phase 2] Submitting {len(all_decode_tasks)} lines to {self.ctc_workers} workers...")
+        # Count how many have GPU pruning
+        gpu_pruned_count = sum(1 for _, _, _, _, ki in all_decode_tasks if ki is not None)
+        if gpu_pruned_count > 0:
+            sample_ki = next((ki for _, _, _, _, ki in all_decode_tasks if ki is not None), None)
+            logger.info(
+                f"[Phase 2] Submitting {len(all_decode_tasks)} lines to {self.ctc_workers} workers... "
+                f"({gpu_pruned_count} GPU-pruned, sample_keep_indices={len(sample_ki) if sample_ki is not None else 'N/A'})"
+            )
+        else:
+            logger.info(f"[Phase 2] Submitting {len(all_decode_tasks)} lines to {self.ctc_workers} workers... (0 GPU-pruned)")
 
         # Submit ALL lines at once to ProcessPoolExecutor
         futures = []
-        for page_idx, line_idx, cropped, inferred in all_decode_tasks:
+        for page_idx, line_idx, cropped, inferred, keep_indices in all_decode_tasks:
             submit_time = time.perf_counter()
+            
+            # Model already pruned vocabulary - use pruned vocab list
+            if keep_indices is not None:
+                pruned_vocab = [vocab[i] for i in keep_indices]
+            else:
+                pruned_vocab = vocab
+            
             future = loop.run_in_executor(
                 self._ctc_executor,
                 _decode_single_line,
                 cropped,
-                vocab,
-                None,  # keep_mask - disabled for simplicity
+                pruned_vocab,
                 self.beam_width,
                 self.token_min_logp,
-                self.vocab_prune_threshold,
-                self.vocab_prune_mode,
                 submit_time,
             )
             futures.append((page_idx, line_idx, future, inferred, submit_time))
@@ -733,7 +734,7 @@ class AsyncOCRPipeline:
         logger.info(f"[GPUInference] Starting with batch_size={self.gpu_batch_size}")
 
         # Track pages waiting for their lines to be processed
-        # page_idx -> (ProcessedPage, expected_lines, {line_idx: (logits, orig_w)})
+        # page_idx -> (ProcessedPage, expected_lines, {line_idx: (logits, orig_w, keep_indices)})
         pages_in_flight: dict[int, tuple[ProcessedPage, int, dict[int, tuple]]] = {}
 
         # Batch of tensors waiting to be processed
@@ -755,11 +756,11 @@ class AsyncOCRPipeline:
             # Stack tensors
             tensors = np.concatenate([t[2] for t in pending_tensors], axis=0)
 
-            # Run inference
+            # Run inference - always returns (log_probs, keep_indices) tuple
             loop = asyncio.get_event_loop()
-            batch_logits = await loop.run_in_executor(None, self.ocr_model.predict, tensors)
+            batch_logits, keep_indices = await loop.run_in_executor(None, self.ocr_model.predict, tensors)
 
-            # Handle single item
+            # Handle single item (batch_logits is 2D instead of 3D)
             if len(pending_tensors) == 1:
                 batch_logits = [batch_logits]
 
@@ -767,7 +768,8 @@ class AsyncOCRPipeline:
             for (page_idx, line_idx, _, orig_w), logits in zip(pending_tensors, batch_logits):
                 if page_idx in pages_in_flight:
                     _, _, logits_dict = pages_in_flight[page_idx]
-                    logits_dict[line_idx] = (logits, orig_w)
+                    # Store logits along with keep_indices for GPU-pruned vocab
+                    logits_dict[line_idx] = (logits, orig_w, keep_indices)
                 lines_processed += 1
 
             pending_tensors.clear()
@@ -794,7 +796,7 @@ class AsyncOCRPipeline:
                     if i in logits_dict:
                         logits_list.append(logits_dict[i])
                     else:
-                        logits_list.append((np.zeros((1, 84), dtype=np.float32), 1))
+                        logits_list.append((np.zeros((1, 84), dtype=np.float32), 1, None))
 
                 await self.q_inferred.put(
                     InferredPage(
@@ -825,7 +827,7 @@ class AsyncOCRPipeline:
                         if i in logits_dict:
                             logits_list.append(logits_dict[i])
                         else:
-                            logits_list.append((np.zeros((1, 84), dtype=np.float32), 1))
+                            logits_list.append((np.zeros((1, 84), dtype=np.float32), 1, None))
 
                     await self.q_inferred.put(
                         InferredPage(
@@ -911,26 +913,12 @@ class AsyncOCRPipeline:
                     vocab_size = len(vocab)
                     num_lines = len(inferred.logits_list)
 
-                    # Compute page-level vocabulary keep mask if per-page pruning is enabled
-                    keep_mask = None
-                    if VOCAB_PRUNE_THRESHOLD is not None and VOCAB_PRUNE_MODE == "page":
-                        # Prepare logits in (time, vocab) shape for mask computation
-                        page_logits = []
-                        for logits, orig_w in inferred.logits_list:
-                            needs_transpose = logits.shape[0] == vocab_size
-                            if needs_transpose:
-                                crop_timesteps = max(1, int(logits.shape[1] * orig_w / self.input_width))
-                                cropped = logits[:, :crop_timesteps].T
-                            else:
-                                crop_timesteps = max(1, int(logits.shape[0] * orig_w / self.input_width))
-                                cropped = logits[:crop_timesteps, :]
-                            page_logits.append(cropped)
-                        keep_mask = compute_page_keep_mask(page_logits, vocab_size, VOCAB_PRUNE_THRESHOLD)
-
                     # Crop logits before sending to workers to reduce IPC overhead
+                    # Vocabulary pruning is now done in the model
                     cropped_logits_list = []
-                    for logits, orig_w in inferred.logits_list:
-                        needs_transpose = logits.shape[0] == vocab_size
+                    for logits, orig_w, _keep_indices in inferred.logits_list:
+                        actual_vocab_size = vocab_size if _keep_indices is None else len(_keep_indices)
+                        needs_transpose = logits.shape[0] == actual_vocab_size
                         if needs_transpose:
                             crop_timesteps = max(1, int(logits.shape[1] * orig_w / self.input_width))
                             cropped = logits[:, :crop_timesteps].T
@@ -977,16 +965,14 @@ class AsyncOCRPipeline:
                                 _decode_single_line,
                                 cropped,
                                 vocab,
-                                keep_mask,
                                 self.beam_width,
                                 self.token_min_logp,
-                                self.vocab_prune_threshold,
-                                self.vocab_prune_mode,
+                                None,  # submit_time
                             )
                             futures.append(future)
 
                         # Wait for all lines to complete in parallel
-                        # _decode_single_line returns (text, decode_ms, worker_pid)
+                        # _decode_single_line returns (text, decode_ms, ipc_in_ms, worker_pid)
                         results = list(await asyncio.gather(*futures))
                         texts = [r[0] for r in results]
 

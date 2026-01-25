@@ -160,6 +160,7 @@ class AsyncOCRPipeline:
         token_min_logp: float | None = None,
         use_greedy_decode: bool = False,
         use_hybrid_decode: bool = True,
+        greedy_confidence_threshold: float | None = None,
         use_nemo_decoder: bool = False,
         kenlm_path: str | None = None,
     ):
@@ -179,6 +180,7 @@ class AsyncOCRPipeline:
         self.token_min_logp = token_min_logp
         self.use_greedy_decode = use_greedy_decode
         self.use_hybrid_decode = use_hybrid_decode
+        self.greedy_confidence_threshold = greedy_confidence_threshold
         self.use_nemo_decoder = use_nemo_decoder
         self.kenlm_path = kenlm_path
         self._nemo_decoder = None  # Lazy init when needed
@@ -958,6 +960,7 @@ class AsyncOCRPipeline:
                             pruned_vocab = [vocab[i] for i in keep_indices] if keep_indices is not None else vocab
                             text = decode_logits_hybrid_global(
                                 cropped, pruned_vocab,
+                                confidence_threshold=self.greedy_confidence_threshold,
                                 beam_width=self.beam_width,
                                 token_min_logp=self.token_min_logp,
                             )

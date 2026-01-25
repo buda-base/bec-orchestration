@@ -21,11 +21,7 @@ try:
     import torch.nn.functional as _F
     if _torch.cuda.is_available():
         _TORCH_CUDA_AVAILABLE = True
-        # Enable deterministic mode for reproducibility
-        _torch.use_deterministic_algorithms(True, warn_only=True)
-        _torch.backends.cudnn.deterministic = True
-        _torch.backends.cudnn.benchmark = False
-        logger.info("[OCRModel] PyTorch CUDA available - will use GPU for log_softmax and vocab pruning (deterministic mode enabled)")
+        logger.info("[OCRModel] PyTorch CUDA available - will use GPU for log_softmax and vocab pruning")
     else:
         logger.info("[OCRModel] PyTorch available but CUDA not available - using CPU operations")
 except ImportError:

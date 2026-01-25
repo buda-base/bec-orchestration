@@ -317,11 +317,18 @@ def main():
         worker.token_min_logp = reference_token_min_logp
         worker.vocab_prune_threshold = None  # Explicitly disable pruning for max accuracy
         worker.use_hybrid_decode = False  # Only use beam search for reference (no greedy shortcut)
+    else:
+        # Normal mode - use same beam search params as reference for consistency
+        worker.beam_width = reference_beam_width  # Same as reference
+        worker.token_min_logp = reference_token_min_logp  # Same as reference
+        # Keep pruning enabled in normal mode for performance
 
     # Greedy decode is 17x faster but loses ~1% accuracy - use beam search for production
     worker.use_greedy_decode = False
     # Hybrid decode: uses greedy first, falls back to beam search for low-confidence lines
-    # Enabled by default for good speed/accuracy tradeoff
+    # Disabled to ensure deterministic results across GPU/CPU platforms
+    # To enable with higher confidence threshold (only greedy for very confident lines):
+    worker.greedy_confidence_threshold = -0.2  # Higher = more selective (default: -0.5)
 
     # NeMo GPU decoder - requires nemo_toolkit installed (pip install nemo_toolkit[asr])
     # Set to True to use GPU-accelerated CTC decoding instead of pyctcdecode

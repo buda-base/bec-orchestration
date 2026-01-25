@@ -916,8 +916,14 @@ class AsyncOCRPipeline:
 
                     # Logits are already cropped to remove padding (done in model before softmax)
                     # Just need to transpose from (vocab, time) -> (time, vocab) if needed
+                    # Also handle vocabulary pruning - get keep_indices from first line
                     cropped_logits_list = []
+                    keep_indices_for_page = None
                     for logits, orig_w, _keep_indices in inferred.logits_list:
+                        # Track keep_indices (should be same for all lines in page)
+                        if _keep_indices is not None:
+                            keep_indices_for_page = _keep_indices
+                        
                         actual_vocab_size = vocab_size if _keep_indices is None else len(_keep_indices)
                         needs_transpose = logits.shape[0] == actual_vocab_size
                         if needs_transpose:
@@ -925,6 +931,12 @@ class AsyncOCRPipeline:
                         else:
                             cropped = logits
                         cropped_logits_list.append(cropped)
+                    
+                    # Get pruned vocabulary if applicable
+                    if keep_indices_for_page is not None:
+                        pruned_vocab = [vocab[i] for i in keep_indices_for_page]
+                    else:
+                        pruned_vocab = vocab
 
                     if self.use_nemo_decoder:
                         # NeMo GPU decoder - batch decode all lines on GPU
@@ -943,14 +955,14 @@ class AsyncOCRPipeline:
                         # Greedy decode is fast (~0.6ms/line), run directly without ProcessPoolExecutor
                         texts = []
                         for cropped in cropped_logits_list:
-                            text = decode_logits_greedy(cropped, vocab)
+                            text = decode_logits_greedy(cropped, pruned_vocab)
                             texts.append(text.strip().replace("§", " "))
                     elif self.use_hybrid_decode:
                         # Hybrid decode: greedy first, beam search fallback for low-confidence lines
                         texts = []
                         for cropped in cropped_logits_list:
                             text = decode_logits_hybrid_global(
-                                cropped, vocab,
+                                cropped, pruned_vocab,
                                 beam_width=self.beam_width,
                                 token_min_logp=self.token_min_logp,
                             )
@@ -963,7 +975,7 @@ class AsyncOCRPipeline:
                                 self._ctc_executor,
                                 _decode_single_line,
                                 cropped,
-                                vocab,
+                                pruned_vocab,
                                 self.beam_width,
                                 self.token_min_logp,
                                 None,  # submit_time

@@ -344,16 +344,14 @@ class AsyncOCRPipeline:
                 continue
 
             for line_idx, (logits, orig_w, keep_indices) in enumerate(inferred.logits_list):
-                # Handle transposed logits (vocab, time) -> (time, vocab)
-                # Note: if GPU pruning was applied, vocab dimension is already reduced
+                # Logits are already cropped to remove padding (done in model before softmax)
+                # Just need to transpose from (vocab, time) -> (time, vocab) if needed
                 actual_vocab_size = vocab_size if keep_indices is None else len(keep_indices)
                 needs_transpose = logits.shape[0] == actual_vocab_size
                 if needs_transpose:
-                    crop_timesteps = max(1, int(logits.shape[1] * orig_w / self.input_width))
-                    cropped = logits[:, :crop_timesteps].T
+                    cropped = logits.T
                 else:
-                    crop_timesteps = max(1, int(logits.shape[0] * orig_w / self.input_width))
-                    cropped = logits[:crop_timesteps, :]
+                    cropped = logits
                 all_decode_tasks.append((inferred.page_idx, line_idx, cropped, inferred, keep_indices))
 
         # Count how many have GPU pruning
@@ -753,22 +751,25 @@ class AsyncOCRPipeline:
             batch_size = len(pending_tensors)
             start_time = time.perf_counter()
 
-            # Stack tensors
+            # Stack tensors and collect original widths
             tensors = np.concatenate([t[2] for t in pending_tensors], axis=0)
+            original_widths = [t[3] for t in pending_tensors]
 
-            # Run inference - always returns (log_probs, keep_indices) tuple
+            # Run inference with original widths for early cropping
+            # Model crops time dimension BEFORE softmax/pruning to save computation
             loop = asyncio.get_event_loop()
-            batch_logits, keep_indices = await loop.run_in_executor(None, self.ocr_model.predict, tensors)
+            batch_logits, keep_indices = await loop.run_in_executor(
+                None, 
+                lambda: self.ocr_model.predict(tensors, original_widths, self.input_width)
+            )
 
-            # Handle single item (batch_logits is 2D instead of 3D)
-            if len(pending_tensors) == 1:
-                batch_logits = [batch_logits]
-
+            # batch_logits is now a list of arrays (one per item), already cropped
             # Distribute results back to pages
             for (page_idx, line_idx, _, orig_w), logits in zip(pending_tensors, batch_logits):
                 if page_idx in pages_in_flight:
                     _, _, logits_dict = pages_in_flight[page_idx]
                     # Store logits along with keep_indices for GPU-pruned vocab
+                    # Note: logits are already cropped to remove padding
                     logits_dict[line_idx] = (logits, orig_w, keep_indices)
                 lines_processed += 1
 
@@ -913,18 +914,16 @@ class AsyncOCRPipeline:
                     vocab_size = len(vocab)
                     num_lines = len(inferred.logits_list)
 
-                    # Crop logits before sending to workers to reduce IPC overhead
-                    # Vocabulary pruning is now done in the model
+                    # Logits are already cropped to remove padding (done in model before softmax)
+                    # Just need to transpose from (vocab, time) -> (time, vocab) if needed
                     cropped_logits_list = []
                     for logits, orig_w, _keep_indices in inferred.logits_list:
                         actual_vocab_size = vocab_size if _keep_indices is None else len(_keep_indices)
                         needs_transpose = logits.shape[0] == actual_vocab_size
                         if needs_transpose:
-                            crop_timesteps = max(1, int(logits.shape[1] * orig_w / self.input_width))
-                            cropped = logits[:, :crop_timesteps].T
+                            cropped = logits.T
                         else:
-                            crop_timesteps = max(1, int(logits.shape[0] * orig_w / self.input_width))
-                            cropped = logits[:crop_timesteps, :]
+                            cropped = logits
                         cropped_logits_list.append(cropped)
 
                     if self.use_nemo_decoder:

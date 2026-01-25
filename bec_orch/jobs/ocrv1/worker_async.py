@@ -20,7 +20,8 @@ if TYPE_CHECKING:
     from bec_orch.core.models import TaskResult
     from bec_orch.jobs.base import JobContext
 
-from .ctc_decoder import CTCDecoder, DEFAULT_WORD_DELIMITERS, SPACE_ONLY_DELIMITERS, TIBETAN_WORD_DELIMITERS
+from .config import OCRV1Config
+from .ctc_decoder import CTCDecoder, DEFAULT_WORD_DELIMITERS
 from .model import OCRModel
 from .pipeline_async import AsyncOCRPipeline
 
@@ -35,15 +36,17 @@ class OCRV1JobWorkerAsync:
     CPU-bound image processing and CTC decoding.
     """
 
-    def __init__(self, word_delimiters: frozenset[str] | None = None):
+    def __init__(self, config: OCRV1Config | None = None):
         """Initialize the OCR worker.
         
         Args:
-            word_delimiters: Characters that trigger word boundaries for CTC decoding.
-                           - None (default): Use TIBETAN_WORD_DELIMITERS for syllable-level decoding
-                           - SPACE_ONLY_DELIMITERS: Original behavior for backward compatibility
-                           - TIBETAN_WORD_DELIMITERS: Explicit syllable-level decoding
+            config: OCRV1Config instance for pipeline parameters. 
+                   If None, uses OCRV1Config() with default values.
         """
+        if config is None:
+            config = OCRV1Config()
+        
+        self.config = config
         model_dir = os.environ.get("BEC_OCR_MODEL_DIR")
         if not model_dir:
             raise ValueError("BEC_OCR_MODEL_DIR environment variable not set.")
@@ -87,11 +90,12 @@ class OCRV1JobWorkerAsync:
             swap_hw=swap_hw,
         )
 
-        # Store word_delimiters for reference
-        self.word_delimiters = word_delimiters if word_delimiters is not None else DEFAULT_WORD_DELIMITERS
-        logger.info(f"  Word delimiters: {len(self.word_delimiters)} chars ({'Tibetan syllable' if self.word_delimiters == TIBETAN_WORD_DELIMITERS else 'space-only'})")
+        # Store word_delimiters from config
+        word_delimiters = self.config.word_delimiters if self.config.word_delimiters is not None else DEFAULT_WORD_DELIMITERS
+        self.word_delimiters = word_delimiters
+        logger.info(f"  Word delimiters: {len(self.word_delimiters)} chars")
         
-        self.ctc_decoder = CTCDecoder(charset=charset, add_blank=add_blank, word_delimiters=self.word_delimiters)
+        self.ctc_decoder = CTCDecoder(charset=charset, add_blank=add_blank, word_delimiters=word_delimiters)
 
         self.ld_bucket = os.environ.get("BEC_LD_BUCKET", "bec.bdrc.io")
         self.source_image_bucket = os.environ.get("BEC_SOURCE_IMAGE_BUCKET", "archive.tbrc.org")
@@ -102,24 +106,6 @@ class OCRV1JobWorkerAsync:
             retries={"max_attempts": 3, "mode": "adaptive"},
         )
         self._s3_client = boto3.client("s3", config=boto_config)
-
-        # Pipeline config
-        self.prefetch_concurrency = 64
-        self.image_processor_workers = 16
-        self.ctc_workers = 8
-        self.gpu_batch_size = 16
-        self.beam_width: int | None = None  # None = use module default
-        self.token_min_logp: float | None = None  # None = use module default
-        self.vocab_prune_threshold: float | None = None  # None = use module default
-        self.vocab_prune_mode: str | None = None  # None = use module default
-        self.use_greedy_decode: bool = False  # Use fast greedy decode instead of beam search
-        self.use_hybrid_decode: bool = True  # Greedy + beam search fallback for low-confidence lines
-        self.greedy_confidence_threshold: float | None = None  # Confidence threshold for hybrid decode (None = module default -0.5)
-        self.use_nemo_decoder: bool = False  # Use NeMo GPU decoder instead of pyctcdecode
-        self.use_sequential_pipeline: bool = False  # Run GPU inference first, then CTC decode
-        self.kenlm_path: str | None = None  # Path to KenLM language model for NeMo decoder
-        self.debug_output_dir: str | None = None  # Directory to save debug line images (None = disabled)
-        self.debug_reference_lines: list[str] | None = None  # Reference text lines for diff comparison
 
         logger.info("OCR model loaded successfully")
 
@@ -189,25 +175,25 @@ class OCRV1JobWorkerAsync:
             s3_client=self._s3_client,
             source_image_bucket=self.source_image_bucket,
             volume_prefix=volume_prefix,
-            prefetch_concurrency=self.prefetch_concurrency,
-            image_processor_workers=self.image_processor_workers,
-            ctc_workers=self.ctc_workers,
-            gpu_batch_size=self.gpu_batch_size,
-            beam_width=self.beam_width,
-            token_min_logp=self.token_min_logp,
-            use_greedy_decode=self.use_greedy_decode,
-            use_hybrid_decode=self.use_hybrid_decode,
-            greedy_confidence_threshold=self.greedy_confidence_threshold,
-            use_nemo_decoder=self.use_nemo_decoder,
-            kenlm_path=self.kenlm_path,
-            debug_output_dir=self.debug_output_dir,
-            debug_reference_lines=self.debug_reference_lines,
+            prefetch_concurrency=self.config.prefetch_concurrency,
+            image_processor_workers=self.config.image_processor_workers,
+            ctc_workers=self.config.ctc_workers,
+            gpu_batch_size=self.config.gpu_batch_size,
+            beam_width=self.config.beam_width,
+            token_min_logp=self.config.token_min_logp,
+            use_greedy_decode=self.config.use_greedy_decode,
+            use_hybrid_decode=self.config.use_hybrid_decode,
+            greedy_confidence_threshold=self.config.greedy_confidence_threshold,
+            use_nemo_decoder=self.config.use_nemo_decoder,
+            kenlm_path=self.config.kenlm_path,
+            debug_output_dir=self.config.debug_output_dir,
+            debug_reference_lines=self.config.debug_reference_lines,
         )
-        pipeline.vocab_prune_threshold = self.vocab_prune_threshold
-        pipeline.vocab_prune_mode = self.vocab_prune_mode
+        pipeline.vocab_prune_threshold = self.config.vocab_prune_threshold
+        pipeline.vocab_prune_mode = self.config.vocab_prune_mode
 
         try:
-            if self.use_sequential_pipeline:
+            if self.config.use_sequential_pipeline:
                 stats = await pipeline.run_sequential(pages, output_parquet_uri)
             else:
                 stats = await pipeline.run(pages, output_parquet_uri)

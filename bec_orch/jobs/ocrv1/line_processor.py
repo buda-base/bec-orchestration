@@ -353,6 +353,9 @@ class LineProcessor:
         """
         Preprocess line: resize to model dims, conditionally binarize, normalize.
         
+        Ensures minimum horizontal padding of h (the target height) on left and right.
+        Line is left-aligned (ragged left), not centered.
+        
         Args:
             line_img: Grayscale line image (2D uint8)
             is_binary: Whether source page was binary
@@ -368,24 +371,36 @@ class LineProcessor:
         
         h, w = line_img.shape
         
-        # 1. Resize to fit model dimensions (aspect-preserving)
+        # 1. Resize to fit model dimensions with height-based padding requirement
         target_h = self.input_height
         target_w = self.input_width
+        
+        # Reserve space for minimum padding: h on left, h on right
+        min_padding_per_side = target_h
+        reserved_for_padding = 2 * min_padding_per_side
+        max_line_w = target_w - reserved_for_padding
+        
+        if max_line_w < 1:
+            # Fallback if target dimensions are too small for padding requirement
+            max_line_w = target_w // 2
+        
         aspect = w / h
         
-        if aspect > (target_w / target_h):
-            new_w = target_w
-            new_h = max(1, int(target_w / aspect))
-        else:
-            new_h = target_h
-            new_w = max(1, int(target_h * aspect))
+        # Calculate new dimensions: fit to height, then ensure width fits with padding
+        new_h = target_h
+        new_w = max(1, int(target_h * aspect))
+        
+        # If line is too wide even after height-fitting, scale down to fit with padding
+        if new_w > max_line_w:
+            new_w = max_line_w
+            new_h = max(1, int(max_line_w / aspect))
         
         resized = cv2.resize(line_img, (new_w, new_h), interpolation=cv2.INTER_AREA)
         
-        # 2. Pad to model size (white background = 255)
+        # 2. Pad to model size (white background = 255) - LEFT-ALIGNED with h padding on each side
         padded = np.ones((target_h, target_w), dtype=np.uint8) * 255
-        y_offset = (target_h - new_h) // 2
-        x_offset = 0
+        y_offset = (target_h - new_h) // 2  # Center vertically
+        x_offset = min_padding_per_side  # Left-align with h padding on left
         padded[y_offset : y_offset + new_h, x_offset : x_offset + new_w] = resized
         
         # 3. Conditional binarization

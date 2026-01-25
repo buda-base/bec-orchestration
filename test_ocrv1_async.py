@@ -341,59 +341,56 @@ def main():
 
     logger.info("Initializing OCRV1JobWorkerAsync...")
     from bec_orch.jobs.ocrv1.worker_async import OCRV1JobWorkerAsync
+    from bec_orch.jobs.ocrv1.config import OCRV1Config
 
-    worker = OCRV1JobWorkerAsync()
-    
-    # Enable debug mode if requested
+    # Build configuration based on mode
     if args.debug:
-        logger.info("=== DEBUG MODE: Saving line images to debug_output/ ===")
-        worker.debug_output_dir = "debug_output"
+        # Debug mode: load reference file if it exists
+        reference_file = str(REFERENCE_OUTPUT_PATH) if REFERENCE_OUTPUT_PATH.exists() else None
+        config = OCRV1Config.debug(output_dir="debug_output", reference_file=reference_file)
         
-        # Load reference lines if they exist
-        if REFERENCE_OUTPUT_PATH.exists():
-            logger.info(f"Loading reference output from {REFERENCE_OUTPUT_PATH} for diff comparison")
-            with open(REFERENCE_OUTPUT_PATH, 'r', encoding='utf-8') as f:
-                worker.debug_reference_lines = [line.rstrip('\n') for line in f]
-            logger.info(f"Loaded {len(worker.debug_reference_lines)} reference lines")
-        else:
-            logger.warning(f"Reference file not found at {REFERENCE_OUTPUT_PATH}, diffs will be skipped")
-            worker.debug_reference_lines = None
-
-    # Apply reference mode settings to worker (these get passed to worker processes)
-    if args.reference:
-        worker.beam_width = reference_beam_width
-        worker.token_min_logp = reference_token_min_logp
-        worker.vocab_prune_threshold = None  # Explicitly disable pruning for max accuracy
-        worker.use_hybrid_decode = False  # Only use beam search for reference (no greedy shortcut)
+        # Override with reference mode settings if both flags are used
+        if args.reference:
+            config.beam_width = reference_beam_width
+            config.token_min_logp = reference_token_min_logp
+            config.vocab_prune_threshold = None
+            config.use_hybrid_decode = False
+            config.use_sequential_pipeline = False  # Don't force sequential in reference mode
+        
+        logger.info("=== DEBUG MODE: Saving line images to debug_output/ ===")
+        if reference_file:
+            logger.info(f"Loaded {len(config.debug_reference_lines)} reference lines for diff comparison")
+    
+    elif args.reference:
+        # Reference mode: high accuracy settings
+        config = OCRV1Config(
+            beam_width=reference_beam_width,
+            token_min_logp=reference_token_min_logp,
+            vocab_prune_threshold=None,  # Disable pruning for max accuracy
+            use_hybrid_decode=False,  # Only beam search, no greedy shortcut
+        )
+    
     else:
-        # Normal mode - use same beam search params as reference for consistency
-        worker.beam_width = reference_beam_width  # Same as reference
-        worker.token_min_logp = reference_token_min_logp  # Same as reference
-        # Keep pruning enabled in normal mode for performance
+        # Normal mode: use defaults with same beam search params as reference for consistency
+        config = OCRV1Config(
+            beam_width=reference_beam_width,  # Same as reference
+            token_min_logp=reference_token_min_logp,  # Same as reference
+            # Keep pruning and hybrid decode enabled for performance
+        )
 
-    # Greedy decode is 17x faster but loses ~1% accuracy - use beam search for production
-    worker.use_greedy_decode = False
-    # Hybrid decode: uses greedy first, falls back to beam search for low-confidence lines
-    # Disabled to ensure deterministic results across GPU/CPU platforms
-    # To enable with higher confidence threshold (only greedy for very confident lines):
-    worker.greedy_confidence_threshold = -0.2  # Higher = more selective (default: -0.5)
-
-    # NeMo GPU decoder - requires nemo_toolkit installed (pip install nemo_toolkit[asr])
-    # Set to True to use GPU-accelerated CTC decoding instead of pyctcdecode
-    worker.use_nemo_decoder = False
-    worker.use_sequential_pipeline = True
-    worker.kenlm_path = os.path.join(os.environ.get("BEC_OCR_MODEL_DIR", "ocr_models"), "tibetan_5gram.binary")
+    # Create worker with config
+    worker = OCRV1JobWorkerAsync(config)
 
     # Log actual settings that will be used
     logger.info("=== CTC Decoder Settings ===")
-    logger.info(f"  beam_width: {worker.beam_width} (None = module default 64)")
-    logger.info(f"  token_min_logp: {worker.token_min_logp} (None = module default -3.0)")
-    logger.info(f"  vocab_prune_threshold: {worker.vocab_prune_threshold} (None = module default)")
-    logger.info(f"  vocab_prune_mode: {worker.vocab_prune_mode} (None = module default 'line')")
-    logger.info(f"  use_greedy_decode: {worker.use_greedy_decode}")
-    logger.info(f"  use_hybrid_decode: {worker.use_hybrid_decode}")
-    logger.info(f"  use_nemo_decoder: {worker.use_nemo_decoder}")
-    logger.info(f"  use_sequential_pipeline: {worker.use_sequential_pipeline}")
+    logger.info(f"  beam_width: {config.beam_width} (None = module default 64)")
+    logger.info(f"  token_min_logp: {config.token_min_logp} (None = module default -3.0)")
+    logger.info(f"  vocab_prune_threshold: {config.vocab_prune_threshold} (None = module default)")
+    logger.info(f"  vocab_prune_mode: {config.vocab_prune_mode} (None = module default 'line')")
+    logger.info(f"  use_greedy_decode: {config.use_greedy_decode}")
+    logger.info(f"  use_hybrid_decode: {config.use_hybrid_decode}")
+    logger.info(f"  use_nemo_decoder: {config.use_nemo_decoder}")
+    logger.info(f"  use_sequential_pipeline: {config.use_sequential_pipeline}")
 
     logger.info("Running async OCR...")
     result = worker.run(ctx)

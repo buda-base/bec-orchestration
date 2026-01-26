@@ -192,19 +192,27 @@ class CTCDecoderNemo:
         # Transpose if needed and collect lengths
         processed = []
         lengths = []
+        vocab_sizes = []
         for logits in batch_logits:
-            if logits.shape[0] == self.vocab_size:
-                logits = np.transpose(logits, axes=[1, 0])
+            # Check if we need to transpose (vocab_size should be first dimension)
+            if logits.shape[1] == self.vocab_size or logits.shape[0] != self.vocab_size:
+                # Shape is (time, vocab) or (vocab, time) where vocab != self.vocab_size
+                # We want (time, vocab)
+                if logits.shape[0] < logits.shape[1]:
+                    # Likely (vocab, time) - transpose
+                    logits = np.transpose(logits, axes=[1, 0])
             processed.append(logits)
             lengths.append(logits.shape[0])
+            vocab_sizes.append(logits.shape[1])
 
         batch_size = len(processed)
         max_len = max(lengths)
+        max_vocab = max(vocab_sizes)
 
         # Pad and stack on GPU
         # Use very negative value for padding
         padded = torch.full(
-            (batch_size, max_len, self.vocab_size),
+            (batch_size, max_len, max_vocab),
             fill_value=-1000.0,
             device=self.device,
             dtype=torch.float32,
@@ -212,7 +220,10 @@ class CTCDecoderNemo:
 
         for i, logits in enumerate(processed):
             t = logits.shape[0]
-            padded[i, :t, :] = _logits_to_torch(logits, self.device)
+            v = logits.shape[1]
+            # Pad vocab dimension if needed
+            logits_padded = np.pad(logits, ((0, 0), (0, max_vocab - v)), constant_values=-1000.0)
+            padded[i, :t, :] = _logits_to_torch(logits_padded, self.device)
 
         # Create lengths tensor
         lengths_tensor = torch.tensor(lengths, dtype=torch.long, device=self.device)

@@ -44,6 +44,7 @@ class OCRV1Config:
     # -------------------------------------------------------------------------
     input_width: int  # Model input width (e.g., 2048)
     input_height: int  # Model input height (e.g., 64)
+    apply_log_softmax: bool = True  # Set to false for the new version of the model
     
     # -------------------------------------------------------------------------
     # Image processing
@@ -68,8 +69,8 @@ class OCRV1Config:
     # -------------------------------------------------------------------------
     beam_width: int = 64  # Beam width for beam search
     token_min_logp: float = -3.0  # Skip tokens with log prob below this
-    vocab_prune_threshold: float | None = None  # Vocabulary pruning threshold
-    vocab_prune_mode: str | None = None  # Vocabulary pruning mode ('line', 'batch', etc.)
+    vocab_prune_threshold: float | None = -10.0  # Vocabulary pruning threshold (None = no pruning)
+    vocab_prune_mode: str | None = 'line'  # Vocabulary pruning mode ('line', 'batch', etc.)
     use_greedy_decode: bool = False  # Use fast greedy decode (less accurate)
     use_hybrid_decode: bool = True  # Greedy + beam search fallback
     greedy_confidence_threshold: float = -0.5  # Threshold for hybrid decode

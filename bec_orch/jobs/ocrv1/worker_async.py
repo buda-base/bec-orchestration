@@ -95,6 +95,8 @@ class OCRV1JobWorkerAsync:
             output_layer=model_config["output_layer"],
             squeeze_channel=squeeze_channel,
             swap_hw=swap_hw,
+            apply_log_softmax=cfg.apply_log_softmax,
+            vocab_prune_threshold=cfg.vocab_prune_threshold,
         )
 
         logger.info(

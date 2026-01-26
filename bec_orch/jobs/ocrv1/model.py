@@ -40,6 +40,21 @@ class OCRModel:
         use_gpu_operations: bool = True,
         vocab_prune_threshold: float | None = -10.0,
     ) -> None:
+        """Initialize OCR model wrapper for ONNX inference.
+        
+        Args:
+            model_file: Path to ONNX model file
+            input_layer: Name of the input layer in the ONNX model
+            output_layer: Name of the output layer in the ONNX model
+            squeeze_channel: Whether to squeeze channel dimension
+            swap_hw: Whether to swap height and width dimensions
+            apply_log_softmax: If True, applies log_softmax after forward pass (on GPU or CPU).
+                              If False, returns raw logits without softmax transformation.
+                              Works for both GPU and CPU execution paths.
+            use_gpu_operations: Whether to use GPU for log_softmax and vocab pruning (if available)
+            vocab_prune_threshold: Threshold for vocabulary pruning. Tokens with max log_prob
+                                   below this threshold are pruned. None disables pruning.
+        """
         self._input_layer = input_layer
         self._output_layer = output_layer
         self._squeeze_channel_dim = squeeze_channel
@@ -51,7 +66,12 @@ class OCRModel:
         execution_providers = get_execution_providers()
         self.session = ort.InferenceSession(model_file, providers=execution_providers)
         
-        if self._use_gpu:
+        if not self._apply_log_softmax:
+            logger.info(
+                "[OCRModel] Softmax disabled - returning raw logits from forward pass "
+                "(no log_softmax applied on GPU or CPU)"
+            )
+        elif self._use_gpu:
             logger.info(
                 f"[OCRModel] Using PyTorch GPU for log_softmax + vocab pruning "
                 f"(threshold={vocab_prune_threshold}, per-line pruning)"
@@ -220,7 +240,8 @@ class OCRModel:
             else:
                 return self._process_logits_batch_cpu(logits_list)
         
-        # No log_softmax - return unpruned with None keep_indices
+        # Softmax disabled: return raw logits without transformation
+        # This works for both GPU and CPU execution paths - no softmax is applied
         return logits_list, [None] * len(logits_list)
     
     def _process_logits_batch_gpu(

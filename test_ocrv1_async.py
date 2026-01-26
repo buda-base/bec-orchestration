@@ -7,6 +7,12 @@ Usage:
 
 To generate a reference parquet with max accuracy settings:
     BEC_OCR_MODEL_DIR=ocr_models/Woodblock python test_ocrv1_async.py --reference
+
+To use NeMo GPU decoder:
+    BEC_OCR_MODEL_DIR=ocr_models/Woodblock python test_ocrv1_async.py --use-nemo
+
+To limit number of pages:
+    BEC_OCR_MODEL_DIR=ocr_models/Woodblock python test_ocrv1_async.py --max-pages 50
 """
 
 import argparse
@@ -254,6 +260,17 @@ def main():
         action="store_true",
         help="Save preprocessed line images to debug_output folder for inspection",
     )
+    parser.add_argument(
+        "--use-nemo",
+        action="store_true",
+        help="Use NeMo GPU decoder instead of pyctcdecode",
+    )
+    parser.add_argument(
+        "--max-pages",
+        type=int,
+        default=50,
+        help="Maximum number of pages to process (default: 50)",
+    )
     args = parser.parse_args()
 
     # Reference mode settings (will be applied to worker after initialization)
@@ -282,7 +299,7 @@ def main():
     logger.info(f"OCR dest bucket: {ocr_dest_bucket}")
     logger.info(f"Source image bucket: {source_image_bucket}")
 
-    max_images = 50  # Limit for testing
+    max_images = args.max_pages  # Use command-line argument
     manifest = get_volume_manifest_from_s3(w_id, i_id, source_image_bucket)
     logger.info(f"Manifest has {len(manifest.manifest)} images, etag={manifest.s3_etag}")
 
@@ -325,7 +342,7 @@ def main():
         use_greedy_decode=False,
         use_hybrid_decode=not args.reference,  # Disable hybrid for reference mode
         greedy_confidence_threshold=-0.2,  # Higher = more selective
-        use_nemo_decoder=False,
+        use_nemo_decoder=args.use_nemo,
         use_sequential_pipeline=True,
         kenlm_path=os.path.join(os.environ.get("BEC_OCR_MODEL_DIR", "ocr_models"), "tibetan_5gram.binary"),
         # Debug

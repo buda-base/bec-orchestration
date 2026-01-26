@@ -43,7 +43,6 @@ s3fs
 boto3
 psycopg[binary]
 onnxruntime
-# pyctcdecode - use local modified version from ./pyctcdecode/
-# (install with: pip install -e ./pyctcdecode/)
--e ./pyctcdecode/
+pyctcdecode @ git+https://github.com/buda-base/pyctcdecode/@main
+pandas
 scipy  # needed for log_softmax in ctc_decoder

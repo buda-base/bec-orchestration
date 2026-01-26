@@ -23,6 +23,7 @@ import torch
 logger = logging.getLogger(__name__)
 
 try:
+    from nemo.collections.asr.modules.decoders.ctc_decoder import GreedyCTCInfer
     from nemo.collections.asr.parts.submodules.ctc_beam_decoding import BeamCTCInfer
 
     NEMO_AVAILABLE = True
@@ -60,6 +61,7 @@ class CTCDecoderNemo:
         device: str = "cuda",
         beam_width: int = DEFAULT_BEAM_WIDTH,
         kenlm_path: str | None = None,
+        use_greedy: bool = False,
     ):
         _check_nemo_available()
 
@@ -90,54 +92,28 @@ class CTCDecoderNemo:
             beam_threshold=25.0,
         )
 
-        if kenlm_path:
-            # Try pyctcdecode backend first (faster, less overhead)
-            try:
-                from nemo.collections.asr.parts.submodules.ctc_beam_decoding import PyCTCDecodeConfig
-                
-                pyctcdecode_cfg = PyCTCDecodeConfig(
-                    beam_width=beam_width,
-                )
-                
-                self._decoder = BeamCTCInfer(
-                    blank_id=self.blank_idx,
-                    beam_size=beam_width,
-                    search_type="pyctcdecode",
-                    return_best_hypothesis=True,
-                    pyctcdecode_cfg=pyctcdecode_cfg,
-                )
-                logger.info(
-                    f"[CTCDecoderNemo] Initialized with pyctcdecode: vocab_size={self.vocab_size}, "
-                    f"device={device}, beam_width={beam_width}"
-                )
-            except ImportError:
-                # Fall back to flashlight backend
-                flashlight_cfg.lexicon_path = None  # Lexicon-free decoding
-                flashlight_cfg.beam_size_token = beam_width
-                self._decoder = BeamCTCInfer(
-                    blank_id=self.blank_idx,
-                    beam_size=beam_width,
-                    search_type="flashlight",
-                    return_best_hypothesis=True,
-                    ngram_lm_model=kenlm_path,
-                    ngram_lm_alpha=0.5,
-                    flashlight_cfg=flashlight_cfg,
-                )
-                logger.info(
-                    f"[CTCDecoderNemo] Initialized with flashlight+KenLM: vocab_size={self.vocab_size}, "
-                    f"device={device}, beam_width={beam_width}, kenlm={kenlm_path}"
-                )
-        else:
+        # Use pyctcdecode backend (faster than flashlight)
+        try:
+            from nemo.collections.asr.parts.submodules.ctc_beam_decoding import PyCTCDecodeConfig
+            
+            pyctcdecode_cfg = PyCTCDecodeConfig()
+            
             self._decoder = BeamCTCInfer(
                 blank_id=self.blank_idx,
                 beam_size=beam_width,
-                search_type="flashlight",
+                search_type="pyctcdecode",
                 return_best_hypothesis=True,
-                flashlight_cfg=flashlight_cfg,
+                pyctcdecode_cfg=pyctcdecode_cfg,
             )
             logger.info(
-                f"[CTCDecoderNemo] Initialized with flashlight (no LM): vocab_size={self.vocab_size}, "
+                f"[CTCDecoderNemo] Initialized with pyctcdecode: vocab_size={self.vocab_size}, "
                 f"device={device}, beam_width={beam_width}"
+            )
+        except ImportError:
+            # Fall back to greedy if pyctcdecode not available
+            self._decoder = GreedyCTCInfer()
+            logger.warning(
+                f"[CTCDecoderNemo] pyctcdecode not available, falling back to greedy: vocab_size={self.vocab_size}"
             )
 
         # Set vocabulary and decoding type - required by BeamCTCInfer

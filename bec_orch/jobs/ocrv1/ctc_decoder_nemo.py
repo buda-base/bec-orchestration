@@ -237,23 +237,42 @@ class CTCDecoderNemo:
 
         # Extract texts
         texts = []
-        for i in range(batch_size):
-            if hypotheses and i < len(hypotheses):
-                hyp = hypotheses[i]
-                if hasattr(hyp, "y_sequence"):
-                    indices = hyp.y_sequence
-                elif isinstance(hyp, (list, tuple)):
-                    indices = hyp[0] if hyp else []
+        # When return_best_hypothesis=True, hypotheses is a list of Hypothesis objects
+        # one for each item in the batch
+        if hypotheses:
+            for i in range(batch_size):
+                if i < len(hypotheses):
+                    hyp = hypotheses[i]
+                    # Extract indices from hypothesis
+                    if hasattr(hyp, "y_sequence"):
+                        indices = hyp.y_sequence
+                    elif hasattr(hyp, "tokens"):
+                        indices = hyp.tokens
+                    elif hasattr(hyp, "text"):
+                        # Some backends return text directly
+                        text = hyp.text
+                        texts.append(text.replace(self.blank_sign, "").replace("§", " "))
+                        continue
+                    else:
+                        # For flashlight backend, try to get the text directly
+                        if hasattr(hyp, "text"):
+                            text = hyp.text
+                            texts.append(text.replace(self.blank_sign, "").replace("§", " "))
+                            continue
+                        else:
+                            # Last resort - try to convert to string
+                            text = str(hyp)
+                            texts.append(text.replace(self.blank_sign, "").replace("§", " "))
+                            continue
+
+                    if isinstance(indices, torch.Tensor):
+                        indices = indices.cpu().tolist()
+
+                    text = self._indices_to_text(indices)
+                    texts.append(text.replace(self.blank_sign, "").replace("§", " "))
                 else:
-                    indices = hyp if hyp is not None else []
-
-                if isinstance(indices, torch.Tensor):
-                    indices = indices.cpu().tolist()
-
-                text = self._indices_to_text(indices)
-            else:
-                text = ""
-
-            texts.append(text.replace(self.blank_sign, "").replace("§", " "))
+                    texts.append("")
+        else:
+            texts = [""] * batch_size
 
         return texts

@@ -17,18 +17,14 @@ import os
 import time
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from dataclasses import dataclass
-from pathlib import Path
 from typing import TYPE_CHECKING, Optional
 
-import cv2
 import numpy as np
 import numpy.typing as npt
 
 if TYPE_CHECKING:
     pass
 
-from ..ldv1.img_helpers import adaptive_binarize, apply_transform_1
-from ..shared.decoder import bytes_to_frame
 from .ctc_decoder import (
     CTCDecoder,
     decode_logits_beam_search,
@@ -36,190 +32,11 @@ from .ctc_decoder import (
     decode_logits_hybrid_global,
     init_worker_process,
 )
-from .line import get_line_image
+from .line_decoder import FetchedBytes, LineDecoder, ProcessedPage, ProcessedLine
 from .model import OCRModel
 from .parquet_writer import StreamingParquetWriter
 
 logger = logging.getLogger(__name__)
-
-
-# =============================================================================
-# Line Segment Merging Utilities
-# =============================================================================
-
-@dataclass
-class LineSegment:
-    """Represents a line segment with contour and bounding box info."""
-    contour: npt.NDArray  # numpy contour array
-    bbox: tuple[int, int, int, int]  # (x, y, w, h)
-    center: tuple[int, int]  # (x_center, y_center)
-
-
-def _build_line_segment(contour: npt.NDArray) -> LineSegment:
-    """Create a LineSegment from a contour."""
-    # Ensure contour is in standard OpenCV format (N, 1, 2)
-    if contour.ndim == 2:
-        contour = contour.reshape(-1, 1, 2)
-    x, y, w, h = cv2.boundingRect(contour)
-    x_center = x + (w // 2)
-    y_center = y + (h // 2)
-    return LineSegment(contour=contour, bbox=(x, y, w, h), center=(x_center, y_center))
-
-
-def _sort_bbox_centers(
-    bbox_centers: list[tuple[int, int]], line_threshold: float = 20
-) -> list[list[tuple[int, int]]]:
-    """
-    Sort bounding box centers into horizontal lines based on y-position.
-    
-    Args:
-        bbox_centers: List of (x, y) center coordinates
-        line_threshold: Vertical distance threshold for grouping
-        
-    Returns:
-        List of lists, each containing centers on the same line
-    """
-    if not bbox_centers:
-        return []
-
-    sorted_bbox_centers = []
-    tmp_line = []
-
-    for i in range(len(bbox_centers)):
-        if len(tmp_line) > 0:
-            # Use mean y of current line group for comparison
-            ys = [y[1] for y in tmp_line]
-            mean_y = np.mean(ys)
-            y_diff = abs(mean_y - bbox_centers[i][1])
-
-            if y_diff > line_threshold:
-                tmp_line.sort(key=lambda x: x[0])
-                sorted_bbox_centers.append(tmp_line.copy())
-                tmp_line.clear()
-
-            tmp_line.append(bbox_centers[i])
-        else:
-            tmp_line.append(bbox_centers[i])
-
-    # Add the last tmp_line if not empty
-    if tmp_line:
-        sorted_bbox_centers.append(tmp_line)
-
-    # Sort each line by x-coordinate
-    for line in sorted_bbox_centers:
-        line.sort(key=lambda x: x[0])
-
-    sorted_bbox_centers.reverse()
-    return sorted_bbox_centers
-
-
-def _group_line_segments(
-    sorted_bbox_centers: list[list[tuple[int, int]]], segments: list[LineSegment]
-) -> list[LineSegment]:
-    """
-    Group line segments that belong to the same horizontal line into unified segments.
-    
-    Args:
-        sorted_bbox_centers: Sorted bounding box centers by lines
-        segments: Original LineSegment objects
-        
-    Returns:
-        List of merged LineSegment objects
-    """
-    new_segments = []
-    
-    for bbox_centers in sorted_bbox_centers:
-        if len(bbox_centers) > 1:
-            # Multiple segments on same line - merge them
-            contour_stack = []
-            
-            for box_center in bbox_centers:
-                for segment in segments:
-                    if box_center == segment.center:
-                        contour_stack.append(segment.contour)
-                        break
-            
-            if contour_stack:
-                # Stack and create convex hull
-                stacked_contour = np.vstack(contour_stack)
-                stacked_contour = cv2.convexHull(stacked_contour)
-                new_segments.append(_build_line_segment(stacked_contour))
-        else:
-            # Single segment - keep as is
-            for bcenter in bbox_centers:
-                for segment in segments:
-                    if bcenter == segment.center:
-                        new_segments.append(segment)
-                        break
-    
-    return new_segments
-
-
-def _estimate_line_threshold(segments: list[LineSegment]) -> float:
-    """
-    Estimate a reasonable line threshold based on segment heights.
-    
-    Uses median height of segments as a baseline for grouping threshold.
-    """
-    if not segments:
-        return 20.0
-    
-    heights = [seg.bbox[3] for seg in segments]  # bbox[3] is height
-    median_height = float(np.median(heights))
-    # Use half the median height as threshold
-    return max(10.0, median_height * 0.5)
-
-
-def _merge_line_segments(
-    contours: list[list[dict]], line_threshold: float | None = None
-) -> list[list[dict]]:
-    """
-    Merge line segment contours that belong to the same horizontal line.
-    
-    Args:
-        contours: List of contours, where each contour is a list of {"x": x, "y": y} dicts
-        line_threshold: Vertical threshold for grouping (auto-calculated if None)
-        
-    Returns:
-        List of merged contours in the same format
-    """
-    if not contours:
-        return []
-    
-    # Convert dict format to numpy contours and build LineSegments
-    segments = []
-    for contour_points in contours:
-        if not contour_points:
-            continue
-        pts = np.array([[p["x"], p["y"]] for p in contour_points], dtype=np.int32)
-        segments.append(_build_line_segment(pts))
-    
-    if not segments:
-        return []
-    
-    # Calculate threshold if not provided
-    if line_threshold is None:
-        line_threshold = _estimate_line_threshold(segments)
-    
-    # Get centers and sort into lines
-    bbox_centers = [seg.center for seg in segments]
-    
-    # Sort by y-coordinate first (top to bottom)
-    sorted_indices = sorted(range(len(bbox_centers)), key=lambda i: bbox_centers[i][1])
-    bbox_centers_sorted = [bbox_centers[i] for i in sorted_indices]
-    
-    sorted_bbox_centers = _sort_bbox_centers(bbox_centers_sorted, line_threshold=line_threshold)
-    
-    # Group segments
-    merged_segments = _group_line_segments(sorted_bbox_centers, segments)
-    
-    # Convert back to dict format
-    merged_contours = []
-    for segment in merged_segments:
-        contour_dicts = [{"x": int(pt[0][0]), "y": int(pt[0][1])} for pt in segment.contour]
-        merged_contours.append(contour_dicts)
-    
-    return merged_contours
 
 
 # =============================================================================
@@ -280,22 +97,7 @@ def _decode_page_lines(
     return texts
 
 
-@dataclass
-class FetchedBytes:
-    page_idx: int
-    filename: str
-    source_etag: str
-    file_bytes: bytes
-    ld_row: dict
-
-
-@dataclass
-class ProcessedPage:
-    page_idx: int
-    filename: str
-    source_etag: str
-    line_tensors: list[tuple[npt.NDArray, int, int]]  # (tensor, content_width, left_pad_width)
-    error: Optional[str] = None
+# FetchedBytes and ProcessedPage are imported from line_decoder
 
 
 @dataclass
@@ -373,12 +175,20 @@ class AsyncOCRPipeline:
         self.use_hybrid_decode = use_hybrid_decode
         self.greedy_confidence_threshold = greedy_confidence_threshold
         self.use_nemo_decoder = use_nemo_decoder
-        self.merge_line_segments = merge_line_segments
-        self.line_merge_threshold = line_merge_threshold
         self.kenlm_path = kenlm_path
-        self.use_line_prepadding = use_line_prepadding
-        self.debug_output_dir = debug_output_dir
         self._nemo_decoder = None  # Lazy init when needed
+
+        # Create LineDecoder for image processing
+        self.line_decoder = LineDecoder(
+            input_width=input_width,
+            input_height=input_height,
+            max_image_width=6000,
+            max_image_height=3000,
+            use_line_prepadding=use_line_prepadding,
+            merge_line_segments=merge_line_segments,
+            line_merge_threshold=line_merge_threshold,
+            debug_output_dir=debug_output_dir,
+        )
 
         # Bounded queues for backpressure
         self.q_fetched: asyncio.Queue = asyncio.Queue(maxsize=64)
@@ -747,7 +557,11 @@ class AsyncOCRPipeline:
                             page_idx=fetched.page_idx,
                             filename=fetched.filename,
                             source_etag=fetched.source_etag,
-                            line_tensors=[],
+                            lines=[],
+                            orig_width=0,
+                            orig_height=0,
+                            transformed_width=0,
+                            transformed_height=0,
                             error="Failed to fetch image",
                         )
                     )
@@ -756,11 +570,14 @@ class AsyncOCRPipeline:
                 try:
                     processed = await loop.run_in_executor(
                         self._image_executor,
-                        self._process_image_sync,
+                        self.line_decoder.process,
                         fetched,
                     )
                     await self.q_processed.put(processed)
                     self.stats["processed"] += 1
+
+                    if processed.error:
+                        self.stats["errors"] += 1
 
                 except Exception as e:
                     logger.warning(f"[ImageProcessor] Failed to process {fetched.filename}: {e}")
@@ -769,7 +586,11 @@ class AsyncOCRPipeline:
                             page_idx=fetched.page_idx,
                             filename=fetched.filename,
                             source_etag=fetched.source_etag,
-                            line_tensors=[],
+                            lines=[],
+                            orig_width=0,
+                            orig_height=0,
+                            transformed_width=0,
+                            transformed_height=0,
                             error=str(e),
                         )
                     )
@@ -790,266 +611,6 @@ class AsyncOCRPipeline:
             task.add_done_callback(pending_tasks.discard)
 
         logger.info(f"[ImageProcessor] Done, processed {self.stats['processed']} pages")
-
-    def _process_image_sync(self, fetched: FetchedBytes) -> ProcessedPage:
-        """Synchronous image processing (runs in thread pool)."""
-        ld_row = fetched.ld_row
-
-        # Decode image using shared decoder (returns grayscale)
-        # Parameters: max_width=6000, max_height=3000, patch_size=6000 (no patching)
-        image, is_binary, orig_h, orig_w = bytes_to_frame(
-            fetched.filename,
-            fetched.file_bytes,
-            max_width=6000,
-            max_height=3000,
-            patch_size=6000,
-            linearize=True,
-        )
-
-        # Check if downscaling occurred and compute scale factor
-        actual_h, actual_w = image.shape[:2]
-        scale_factor = 1.0
-        if orig_h > 0 and orig_w > 0:
-            scale_h = actual_h / orig_h
-            scale_w = actual_w / orig_w
-            # Use the smaller scale factor (they should be equal for uniform scaling)
-            if abs(scale_h - 1.0) > 0.001 or abs(scale_w - 1.0) > 0.001:
-                scale_factor = min(scale_h, scale_w)
-                logger.error(
-                    f"Image {fetched.filename} was downscaled: {orig_w}x{orig_h} -> {actual_w}x{actual_h} (scale={scale_factor:.3f})"
-                )
-
-        # Apply transforms (rotation + TPS) using shared helper
-        rotation_angle = ld_row.get("rotation_angle", 0.0) or 0.0
-        tps_points = ld_row.get("tps_points")
-        tps_alpha = ld_row.get("tps_alpha", 0.5)
-
-        # Extract and scale TPS points if present
-        tps_input_pts = None
-        tps_output_pts = None
-        if tps_points:
-            tps_input_pts, tps_output_pts = tps_points
-            # Scale TPS points if image was downscaled
-            if scale_factor != 1.0:
-                if tps_input_pts is not None:
-                    tps_input_pts = [[p[0] * scale_factor, p[1] * scale_factor] for p in tps_input_pts]
-                if tps_output_pts is not None:
-                    tps_output_pts = [[p[0] * scale_factor, p[1] * scale_factor] for p in tps_output_pts]
-
-        # Apply rotation and TPS in one call (grayscale)
-        image = apply_transform_1(image, rotation_angle, tps_input_pts, tps_output_pts, tps_alpha)
-
-        # Track if any transformation was applied (affects binarization decision)
-        was_transformed = (
-            scale_factor != 1.0 or  # resized/downscaled
-            (rotation_angle is not None and abs(rotation_angle) > 0.01) or  # rotated
-            tps_input_pts is not None  # TPS applied
-        )
-
-        # Extract lines
-        contours = ld_row.get("contours", [])
-        if not contours:
-            return ProcessedPage(
-                page_idx=fetched.page_idx,
-                filename=fetched.filename,
-                source_etag=fetched.source_etag,
-                line_tensors=[],
-            )
-
-        # Scale contours if image was downscaled
-        if scale_factor != 1.0:
-            scaled_contours = []
-            for contour_points in contours:
-                scaled_points = [
-                    {"x": int(p["x"] * scale_factor), "y": int(p["y"] * scale_factor)}
-                    for p in contour_points
-                ]
-                scaled_contours.append(scaled_points)
-            contours = scaled_contours
-
-        # Merge line segments that belong to the same horizontal line
-        if self.merge_line_segments:
-            original_count = len(contours)
-            contours = _merge_line_segments(contours, line_threshold=self.line_merge_threshold)
-            if len(contours) != original_count:
-                logger.debug(
-                    f"[ImageProcessor] {fetched.filename}: merged {original_count} segments into {len(contours)} lines"
-                )
-
-        line_tensors = []
-        mask_buffer = np.zeros((image.shape[0], image.shape[1]), dtype=np.uint8)
-        current_k = 1.7
-
-        # Determine if we should skip binarization (already binary and not transformed)
-        # weirdly, not rebinarizing already binary images gives different results...
-        skip_binarization = False # is_binary and not was_transformed
-
-        for line_idx, contour_points in enumerate(contours):
-            line_img, current_k = self._extract_line(image, contour_points, current_k, mask_buffer)
-            if line_img is None:
-                line_tensors.append((np.zeros((1, self.input_height, self.input_width), dtype=np.float32), 1, 0))
-                continue
-
-            tensor, content_width, left_pad_width = self._preprocess_line(
-                line_img,
-                skip_binarization=skip_binarization,
-                use_prepadding=self.use_line_prepadding,
-                debug_filename=fetched.filename if self.debug_output_dir else None,
-                debug_line_idx=line_idx if self.debug_output_dir else None,
-            )
-            line_tensors.append((tensor, content_width, left_pad_width))
-
-        return ProcessedPage(
-            page_idx=fetched.page_idx,
-            filename=fetched.filename,
-            source_etag=fetched.source_etag,
-            line_tensors=line_tensors,
-        )
-
-    def _extract_line(
-        self, image: npt.NDArray, contour_points: list[dict], k_factor: float, mask_buffer: npt.NDArray
-    ) -> tuple[Optional[npt.NDArray], float]:
-        """Extract line image from contour."""
-        if not contour_points:
-            return None, k_factor
-
-        pts = np.array([[p["x"], p["y"]] for p in contour_points], dtype=np.int32)
-        _, _, _, bbox_h = cv2.boundingRect(pts)
-        if bbox_h <= 0:
-            return None, k_factor
-
-        mask_buffer.fill(0)
-        cv2.drawContours(mask_buffer, [pts], -1, 255, -1)
-
-        line_img, adapted_k = get_line_image(image, mask_buffer, bbox_h, bbox_tolerance=3.0, k_factor=k_factor)
-
-        if line_img.size == 0:
-            return None, adapted_k
-
-        return line_img, adapted_k
-
-    def _preprocess_line(
-        self,
-        image: npt.NDArray,
-        skip_binarization: bool = False,
-        use_prepadding: bool = True,
-        debug_filename: str | None = None,
-        debug_line_idx: int | None = None,
-    ) -> tuple[npt.NDArray, int, int]:
-        """Preprocess line image to tensor.
-        
-        Args:
-            image: Line image (grayscale, may be 2D or 3D with 1 channel)
-            skip_binarization: If True, skip binarization (image is already binary and untransformed)
-            use_prepadding: If True, add h pixels of padding on left and right before resizing
-            debug_filename: If provided (along with debug_output_dir), save debug images
-            debug_line_idx: Line index for debug filename
-            
-        Returns:
-            Tuple of (tensor, content_width, left_pad_width) where:
-            - tensor: preprocessed image tensor
-            - content_width: width of actual content in the final padded image
-            - left_pad_width: width of left padding in the final padded image
-        """
-        # Ensure we have a 2D grayscale image
-        if image.ndim == 3:
-            # get_line_image returns (H, W, 1) for grayscale input
-            image = image.squeeze(axis=-1)
-
-        h, w = image.shape[:2]
-        target_h = self.input_height
-        target_w = self.input_width
-
-        if use_prepadding:
-            # Add square padding (h x h) on left and right before resizing
-            left_pad = h
-            right_pad = h
-            padded_w = w + left_pad + right_pad
-            
-            # Create padded image with white (255) padding
-            with_lr_pad = np.ones((h, padded_w), dtype=np.uint8) * 255
-            with_lr_pad[:, left_pad:left_pad + w] = image
-
-            # Calculate resize dimensions to fit target while maintaining aspect ratio
-            aspect = padded_w / h
-            if aspect > (target_w / target_h):
-                new_w = target_w
-                new_h = max(1, int(target_w / aspect))
-            else:
-                new_h = target_h
-                new_w = max(1, int(target_h * aspect))
-
-            resized = cv2.resize(with_lr_pad, (new_w, new_h), interpolation=cv2.INTER_AREA)
-
-            # Calculate content and left_pad widths in resized image coordinates
-            scale = new_w / padded_w
-            left_pad_resized = int(left_pad * scale)
-            content_width_resized = int(w * scale)
-        else:
-            # No prepadding - just resize to fit target
-            left_pad_resized = 0
-            aspect = w / h
-            if aspect > (target_w / target_h):
-                new_w = target_w
-                new_h = max(1, int(target_w / aspect))
-            else:
-                new_h = target_h
-                new_w = max(1, int(target_h * aspect))
-
-            resized = cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_AREA)
-            content_width_resized = new_w
-
-        # Pad to target size with white (255)
-        padded = np.ones((target_h, target_w), dtype=np.uint8) * 255
-        y_offset = (target_h - new_h) // 2
-        x_offset = 0
-        padded[y_offset : y_offset + new_h, x_offset : x_offset + new_w] = resized
-
-        # Binarize unless image was already binary and untransformed
-        if skip_binarization:
-            binary = padded
-        else:
-            binary = adaptive_binarize(padded)
-
-        # Debug: save preprocessed line images
-        if self.debug_output_dir and debug_filename is not None and debug_line_idx is not None:
-            debug_dir = Path(self.debug_output_dir)
-            debug_dir.mkdir(parents=True, exist_ok=True)
-            # Create a safe filename from the original
-            safe_name = Path(debug_filename).stem.replace("/", "_").replace("\\", "_")
-            # Save the preprocessed (binarized) line
-            out_path = debug_dir / f"{safe_name}_L{debug_line_idx:02d}.png"
-            cv2.imwrite(str(out_path), binary)
-
-        # Normalize
-        tensor = binary.reshape((1, target_h, target_w)).astype(np.float32)
-        tensor = (tensor / 127.5) - 1.0
-
-        return tensor, content_width_resized, left_pad_resized
-
-    def _apply_tps(self, image: npt.NDArray, tps_points: tuple, alpha: float) -> npt.NDArray:
-        """Apply TPS transform (simplified)."""
-        try:
-            input_pts, output_pts = tps_points
-            if input_pts is None or output_pts is None:
-                return image
-
-            input_pts = np.array(input_pts, dtype=np.float32)
-            output_pts = np.array(output_pts, dtype=np.float32)
-
-            tps = cv2.createThinPlateSplineShapeTransformer()  # type: ignore[attr-defined]
-            tps.estimateTransformation(
-                output_pts.reshape(1, -1, 2),
-                input_pts.reshape(1, -1, 2),
-                list(range(len(input_pts))),
-            )
-
-            h, w = image.shape[:2]
-            result = tps.warpImage(image)
-            return result if result is not None else image
-
-        except Exception:
-            return image
 
     async def _gpu_inference(self) -> None:
         """Run GPU inference with batching - emit pages as soon as all lines are done."""
@@ -1180,7 +741,7 @@ class AsyncOCRPipeline:
                 )
 
             # Handle error/empty pages immediately
-            if processed.error or not processed.line_tensors:
+            if processed.error or not processed.lines:
                 await self.q_inferred.put(
                     InferredPage(
                         page_idx=processed.page_idx,
@@ -1195,12 +756,12 @@ class AsyncOCRPipeline:
                 continue
 
             # Register page
-            expected_lines = len(processed.line_tensors)
+            expected_lines = len(processed.lines)
             pages_in_flight[processed.page_idx] = (processed, expected_lines, {})
 
             # Add tensors to batch
-            for line_idx, (tensor, content_w, left_pad_w) in enumerate(processed.line_tensors):
-                pending_tensors.append((processed.page_idx, line_idx, tensor, content_w, left_pad_w))
+            for line_idx, line in enumerate(processed.lines):
+                pending_tensors.append((processed.page_idx, line_idx, line.tensor, line.content_width, line.left_pad_width))
 
                 if len(pending_tensors) >= self.gpu_batch_size:
                     await flush_batch()

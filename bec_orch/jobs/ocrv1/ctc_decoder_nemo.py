@@ -91,21 +91,44 @@ class CTCDecoderNemo:
         )
 
         if kenlm_path:
-            flashlight_cfg.lexicon_path = None  # Lexicon-free decoding
-            flashlight_cfg.beam_size_token = beam_width
-            self._decoder = BeamCTCInfer(
-                blank_id=self.blank_idx,
-                beam_size=beam_width,
-                search_type="flashlight",
-                return_best_hypothesis=True,
-                ngram_lm_model=kenlm_path,
-                ngram_lm_alpha=0.5,
-                flashlight_cfg=flashlight_cfg,
-            )
-            logger.info(
-                f"[CTCDecoderNemo] Initialized with flashlight+KenLM: vocab_size={self.vocab_size}, "
-                f"device={device}, beam_width={beam_width}, kenlm={kenlm_path}"
-            )
+            # Try pyctcdecode backend first (faster, less overhead)
+            try:
+                from nemo.collections.asr.parts.submodules.ctc_beam_decoding import PyCTCDecodeConfig
+                
+                pyctcdecode_cfg = PyCTCDecodeConfig(
+                    beam_width=beam_width,
+                    beam_prune_logp=-10.0,
+                    token_min_logp=-5.0,
+                )
+                
+                self._decoder = BeamCTCInfer(
+                    blank_id=self.blank_idx,
+                    beam_size=beam_width,
+                    search_type="pyctcdecode",
+                    return_best_hypothesis=True,
+                    pyctcdecode_cfg=pyctcdecode_cfg,
+                )
+                logger.info(
+                    f"[CTCDecoderNemo] Initialized with pyctcdecode: vocab_size={self.vocab_size}, "
+                    f"device={device}, beam_width={beam_width}"
+                )
+            except ImportError:
+                # Fall back to flashlight backend
+                flashlight_cfg.lexicon_path = None  # Lexicon-free decoding
+                flashlight_cfg.beam_size_token = beam_width
+                self._decoder = BeamCTCInfer(
+                    blank_id=self.blank_idx,
+                    beam_size=beam_width,
+                    search_type="flashlight",
+                    return_best_hypothesis=True,
+                    ngram_lm_model=kenlm_path,
+                    ngram_lm_alpha=0.5,
+                    flashlight_cfg=flashlight_cfg,
+                )
+                logger.info(
+                    f"[CTCDecoderNemo] Initialized with flashlight+KenLM: vocab_size={self.vocab_size}, "
+                    f"device={device}, beam_width={beam_width}, kenlm={kenlm_path}"
+                )
         else:
             self._decoder = BeamCTCInfer(
                 blank_id=self.blank_idx,

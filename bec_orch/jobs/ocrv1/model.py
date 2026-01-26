@@ -66,20 +66,16 @@ class OCRModel:
         execution_providers = get_execution_providers()
         self.session = ort.InferenceSession(model_file, providers=execution_providers)
         
-        if not self._apply_log_softmax:
+        softmax_status = "enabled" if self._apply_log_softmax else "disabled"
+        pruning_status = f"enabled (threshold={vocab_prune_threshold})" if vocab_prune_threshold is not None else "disabled"
+        
+        if self._use_gpu:
             logger.info(
-                "[OCRModel] Softmax disabled - returning raw logits from forward pass "
-                "(no log_softmax applied on GPU or CPU)"
-            )
-        elif self._use_gpu:
-            logger.info(
-                f"[OCRModel] Using PyTorch GPU for log_softmax + vocab pruning "
-                f"(threshold={vocab_prune_threshold}, per-line pruning)"
+                f"[OCRModel] PyTorch GPU: softmax={softmax_status}, vocab_pruning={pruning_status} (per-line)"
             )
         else:
             logger.info(
-                f"[OCRModel] Using scipy/numpy CPU for log_softmax + vocab pruning "
-                f"(threshold={vocab_prune_threshold}, per-line pruning)"
+                f"[OCRModel] scipy/numpy CPU: softmax={softmax_status}, vocab_pruning={pruning_status} (per-line)"
             )
 
     def _process_logits_gpu(
@@ -233,92 +229,139 @@ class OCRModel:
                 cropped_list.append(item_logits[:, start_timestep:end_timestep])
             logits_list = cropped_list
         
-        # Apply log_softmax (and optionally vocab pruning per-line)
+        # Apply log_softmax if enabled
         if self._apply_log_softmax:
             if self._use_gpu:
-                return self._process_logits_batch_gpu(logits_list)
+                processed_list = self._apply_softmax_batch_gpu(logits_list)
             else:
-                return self._process_logits_batch_cpu(logits_list)
+                processed_list = self._apply_softmax_batch_cpu(logits_list)
+        else:
+            # Keep raw logits
+            processed_list = logits_list
         
-        # Softmax disabled: return raw logits without transformation
-        # This works for both GPU and CPU execution paths - no softmax is applied
-        return logits_list, [None] * len(logits_list)
+        # Apply vocab pruning if threshold is set (independent of softmax)
+        if self._vocab_prune_threshold is not None:
+            if self._use_gpu:
+                return self._prune_batch_gpu(processed_list, logits_list, apply_softmax=self._apply_log_softmax)
+            else:
+                return self._prune_batch_cpu(processed_list, logits_list, apply_softmax=self._apply_log_softmax)
+        
+        # No pruning - return processed list (with or without softmax) and None keep_indices
+        return processed_list, [None] * len(processed_list)
     
-    def _process_logits_batch_gpu(
+    def _apply_softmax_batch_gpu(
         self, logits_list: list[npt.NDArray]
-    ) -> tuple[list[npt.NDArray], list[npt.NDArray | None]]:
-        """Apply log_softmax and per-line vocab pruning on GPU.
+    ) -> list[npt.NDArray]:
+        """Apply log_softmax to each item in the batch on GPU.
         
         Returns:
-            Tuple of (list of log_probs arrays, list of keep_indices per line)
+            List of log_probs arrays (numpy, on CPU)
         """
-        # Apply log_softmax to each item
         log_probs_list = []
         for logits in logits_list:
             logits_tensor = _torch.from_numpy(logits).cuda()
             log_probs_tensor = _F.log_softmax(logits_tensor, dim=0)  # vocab axis
-            log_probs_list.append(log_probs_tensor)
-        
-        # Prune vocabulary per-line for deterministic results
-        keep_indices_list = []
-        if self._vocab_prune_threshold is not None:
-            pruned_list = []
-            for log_probs_tensor in log_probs_list:
-                # Find max log prob per vocab token for this line only
-                max_per_token = log_probs_tensor.max(dim=1).values  # max over time
-                
-                # Create mask for tokens above threshold
-                keep_mask = max_per_token > self._vocab_prune_threshold
-                keep_mask[0] = True  # Always keep blank token
-                
-                keep_indices = _torch.where(keep_mask)[0].cpu().numpy()
-                keep_indices_list.append(keep_indices)
-                
-                # Prune this line
-                pruned = log_probs_tensor[keep_mask, :]
-                pruned_list.append(pruned.cpu().numpy().astype(np.float32))
-            
-            return pruned_list, keep_indices_list
-        
-        # No pruning - return None for each line's keep_indices
-        keep_indices_list = [None] * len(log_probs_list)
-        return [lp.cpu().numpy().astype(np.float32) for lp in log_probs_list], keep_indices_list
+            log_probs_list.append(log_probs_tensor.cpu().numpy().astype(np.float32))
+        return log_probs_list
     
-    def _process_logits_batch_cpu(
-        self, logits_list: list[npt.NDArray]
+    def _prune_batch_gpu(
+        self, processed_list: list[npt.NDArray], original_logits_list: list[npt.NDArray], apply_softmax: bool
     ) -> tuple[list[npt.NDArray], list[npt.NDArray | None]]:
-        """Apply log_softmax and per-line vocab pruning on CPU.
+        """Apply vocabulary pruning per-line on GPU.
+        
+        Args:
+            processed_list: List of arrays (log_probs if apply_softmax=True, raw logits if False)
+            original_logits_list: Original raw logits (used for threshold comparison if softmax disabled)
+            apply_softmax: Whether processed_list contains log_probs (True) or raw logits (False)
         
         Returns:
-            Tuple of (list of log_probs arrays, list of keep_indices per line)
+            Tuple of (list of pruned arrays, list of keep_indices per line)
         """
-        # Apply log_softmax to each item
+        keep_indices_list = []
+        pruned_list = []
+        
+        for i, processed in enumerate(processed_list):
+            # For threshold comparison, use log_probs (compute if needed)
+            if apply_softmax:
+                # Already have log_probs, use them for threshold
+                log_probs_tensor = _torch.from_numpy(processed).cuda()
+            else:
+                # Need to compute log_softmax temporarily just for threshold comparison
+                logits_tensor = _torch.from_numpy(original_logits_list[i]).cuda()
+                log_probs_tensor = _F.log_softmax(logits_tensor, dim=0)
+            
+            # Find max log prob per vocab token for this line only
+            max_per_token = log_probs_tensor.max(dim=1).values  # max over time
+            
+            # Create mask for tokens above threshold
+            keep_mask = max_per_token > self._vocab_prune_threshold
+            keep_mask[0] = True  # Always keep blank token
+            
+            keep_indices = _torch.where(keep_mask)[0].cpu().numpy()
+            keep_indices_list.append(keep_indices)
+            
+            # Prune the processed array (log_probs or raw logits)
+            if apply_softmax:
+                pruned_tensor = log_probs_tensor[keep_mask, :]
+            else:
+                # Prune raw logits using the same mask
+                pruned_tensor = _torch.from_numpy(processed).cuda()[keep_mask, :]
+            
+            pruned_list.append(pruned_tensor.cpu().numpy().astype(np.float32))
+        
+        return pruned_list, keep_indices_list
+    
+    def _apply_softmax_batch_cpu(
+        self, logits_list: list[npt.NDArray]
+    ) -> list[npt.NDArray]:
+        """Apply log_softmax to each item in the batch on CPU.
+        
+        Returns:
+            List of log_probs arrays
+        """
         log_probs_list = []
         for logits in logits_list:
             log_probs = scipy_log_softmax(logits, axis=0).astype(np.float32)
             log_probs_list.append(log_probs)
+        return log_probs_list
+    
+    def _prune_batch_cpu(
+        self, processed_list: list[npt.NDArray], original_logits_list: list[npt.NDArray], apply_softmax: bool
+    ) -> tuple[list[npt.NDArray], list[npt.NDArray | None]]:
+        """Apply vocabulary pruning per-line on CPU.
         
-        # Prune vocabulary per-line for deterministic results
+        Args:
+            processed_list: List of arrays (log_probs if apply_softmax=True, raw logits if False)
+            original_logits_list: Original raw logits (used for threshold comparison if softmax disabled)
+            apply_softmax: Whether processed_list contains log_probs (True) or raw logits (False)
+        
+        Returns:
+            Tuple of (list of pruned arrays, list of keep_indices per line)
+        """
         keep_indices_list = []
-        if self._vocab_prune_threshold is not None:
-            pruned_list = []
-            for log_probs in log_probs_list:
-                # Find max log prob per vocab token for this line only
-                max_per_token = log_probs.max(axis=1)  # max over time
-                
-                # Create mask for tokens above threshold
-                keep_mask = max_per_token > self._vocab_prune_threshold
-                keep_mask[0] = True  # Always keep blank token
-                
-                keep_indices = np.where(keep_mask)[0]
-                keep_indices_list.append(keep_indices)
-                
-                # Prune this line
-                pruned = log_probs[keep_mask, :]
-                pruned_list.append(pruned)
-            
-            return pruned_list, keep_indices_list
+        pruned_list = []
         
-        # No pruning - return None for each line's keep_indices
-        keep_indices_list = [None] * len(log_probs_list)
-        return log_probs_list, keep_indices_list
+        for i, processed in enumerate(processed_list):
+            # For threshold comparison, use log_probs (compute if needed)
+            if apply_softmax:
+                # Already have log_probs, use them for threshold
+                log_probs = processed
+            else:
+                # Need to compute log_softmax temporarily just for threshold comparison
+                log_probs = scipy_log_softmax(original_logits_list[i], axis=0).astype(np.float32)
+            
+            # Find max log prob per vocab token for this line only
+            max_per_token = log_probs.max(axis=1)  # max over time
+            
+            # Create mask for tokens above threshold
+            keep_mask = max_per_token > self._vocab_prune_threshold
+            keep_mask[0] = True  # Always keep blank token
+            
+            keep_indices = np.where(keep_mask)[0]
+            keep_indices_list.append(keep_indices)
+            
+            # Prune the processed array (log_probs or raw logits)
+            pruned = processed[keep_mask, :]
+            pruned_list.append(pruned)
+        
+        return pruned_list, keep_indices_list

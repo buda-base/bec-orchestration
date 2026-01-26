@@ -23,7 +23,7 @@ import numpy as np
 import numpy.typing as npt
 
 if TYPE_CHECKING:
-    pass
+    from .config import OCRV1Config
 
 from .ctc_decoder import (
     CTCDecoder,
@@ -134,61 +134,23 @@ class AsyncOCRPipeline:
 
     def __init__(
         self,
+        cfg: "OCRV1Config",
         ocr_model: OCRModel,
         ctc_decoder: CTCDecoder,
-        input_width: int,
-        input_height: int,
         s3_client,
         source_image_bucket: str,
         volume_prefix: str,
-        prefetch_concurrency: int = 32,
-        image_processor_workers: int = 4,
-        ctc_workers: int = 4,
-        gpu_batch_size: int = 16,
-        beam_width: int | None = None,
-        token_min_logp: float | None = None,
-        use_greedy_decode: bool = False,
-        use_hybrid_decode: bool = True,
-        greedy_confidence_threshold: float | None = None,
-        use_nemo_decoder: bool = False,
-        kenlm_path: str | None = None,
-        use_line_prepadding: bool = True,
-        merge_line_segments: bool = True,
-        line_merge_threshold: float | None = None,
-        debug_output_dir: str | None = None,
     ):
+        self.cfg = cfg
         self.ocr_model = ocr_model
         self.ctc_decoder = ctc_decoder
-        self.input_width = input_width
-        self.input_height = input_height
         self.s3_client = s3_client
         self.source_image_bucket = source_image_bucket
         self.volume_prefix = volume_prefix
-
-        self.prefetch_concurrency = prefetch_concurrency
-        self.image_processor_workers = image_processor_workers
-        self.ctc_workers = ctc_workers
-        self.gpu_batch_size = gpu_batch_size
-        self.beam_width = beam_width
-        self.token_min_logp = token_min_logp
-        self.use_greedy_decode = use_greedy_decode
-        self.use_hybrid_decode = use_hybrid_decode
-        self.greedy_confidence_threshold = greedy_confidence_threshold
-        self.use_nemo_decoder = use_nemo_decoder
-        self.kenlm_path = kenlm_path
         self._nemo_decoder = None  # Lazy init when needed
 
         # Create LineDecoder for image processing
-        self.line_decoder = LineDecoder(
-            input_width=input_width,
-            input_height=input_height,
-            max_image_width=6000,
-            max_image_height=3000,
-            use_line_prepadding=use_line_prepadding,
-            merge_line_segments=merge_line_segments,
-            line_merge_threshold=line_merge_threshold,
-            debug_output_dir=debug_output_dir,
-        )
+        self.line_decoder = LineDecoder(cfg)
 
         # Bounded queues for backpressure
         self.q_fetched: asyncio.Queue = asyncio.Queue(maxsize=64)
@@ -197,21 +159,25 @@ class AsyncOCRPipeline:
         self.q_results: asyncio.Queue = asyncio.Queue(maxsize=64)
 
         # Thread pool for image processing (cv2 releases GIL)
-        self._image_executor = ThreadPoolExecutor(max_workers=image_processor_workers, thread_name_prefix="img")
+        self._image_executor = ThreadPoolExecutor(
+            max_workers=cfg.image_processor_workers, thread_name_prefix="img"
+        )
         # Process pool for CTC decoding - IPC overhead (~190ms/call) is acceptable tradeoff
         # to avoid blocking the async event loop (which starves GPU inference)
         self._ctc_executor = ProcessPoolExecutor(
-            max_workers=ctc_workers,
+            max_workers=cfg.ctc_workers,
             initializer=init_worker_process,
             initargs=(ctc_decoder.ctc_vocab,),
         )
 
         logger.info(
-            f"Pipeline config: prefetch={prefetch_concurrency}, img_workers={image_processor_workers}, ctc_workers={ctc_workers}, gpu_batch={gpu_batch_size}"
+            f"Pipeline config: prefetch={cfg.prefetch_concurrency}, "
+            f"img_workers={cfg.image_processor_workers}, "
+            f"ctc_workers={cfg.ctc_workers}, gpu_batch={cfg.gpu_batch_size}"
         )
 
         # Semaphore for S3 concurrency
-        self._s3_sem = asyncio.Semaphore(prefetch_concurrency)
+        self._s3_sem = asyncio.Semaphore(cfg.prefetch_concurrency)
 
         # Stats
         self.stats = {
@@ -366,11 +332,11 @@ class AsyncOCRPipeline:
         if gpu_pruned_count > 0:
             sample_ki = next((ki for _, _, _, _, ki in all_decode_tasks if ki is not None), None)
             logger.info(
-                f"[Phase 2] Submitting {len(all_decode_tasks)} lines to {self.ctc_workers} workers... "
+                f"[Phase 2] Submitting {len(all_decode_tasks)} lines to {self.cfg.ctc_workers} workers... "
                 f"({gpu_pruned_count} GPU-pruned, sample_keep_indices={len(sample_ki) if sample_ki is not None else 'N/A'})"
             )
         else:
-            logger.info(f"[Phase 2] Submitting {len(all_decode_tasks)} lines to {self.ctc_workers} workers... (0 GPU-pruned)")
+            logger.info(f"[Phase 2] Submitting {len(all_decode_tasks)} lines to {self.cfg.ctc_workers} workers... (0 GPU-pruned)")
 
         # Submit ALL lines at once to ProcessPoolExecutor
         futures = []
@@ -388,8 +354,8 @@ class AsyncOCRPipeline:
                 _decode_single_line,
                 cropped,
                 pruned_vocab,
-                self.beam_width,
-                self.token_min_logp,
+                self.cfg.beam_width,
+                self.cfg.token_min_logp,
                 submit_time,
             )
             futures.append((page_idx, line_idx, future, inferred, submit_time))
@@ -487,7 +453,7 @@ class AsyncOCRPipeline:
 
     async def _prefetcher(self, pages: list[tuple[int, str, dict]]) -> None:
         """Fetch images from S3 with high concurrency."""
-        logger.info(f"[Prefetcher] Starting with {self.prefetch_concurrency} concurrency")
+        logger.info(f"[Prefetcher] Starting with {self.cfg.prefetch_concurrency} concurrency")
 
         async def fetch_one(page_idx: int, filename: str, ld_row: dict) -> None:
             async with self._s3_sem:
@@ -542,11 +508,11 @@ class AsyncOCRPipeline:
 
     async def _image_processor(self) -> None:
         """Process images concurrently using semaphore for backpressure."""
-        logger.info(f"[ImageProcessor] Starting with {self.image_processor_workers} concurrent workers")
+        logger.info(f"[ImageProcessor] Starting with {self.cfg.image_processor_workers} concurrent workers")
         loop = asyncio.get_event_loop()
 
         # Semaphore limits concurrent processing
-        sem = asyncio.Semaphore(self.image_processor_workers)
+        sem = asyncio.Semaphore(self.cfg.image_processor_workers)
         pending_tasks: set[asyncio.Task] = set()
 
         async def process_one(fetched: FetchedBytes) -> None:
@@ -614,7 +580,7 @@ class AsyncOCRPipeline:
 
     async def _gpu_inference(self) -> None:
         """Run GPU inference with batching - emit pages as soon as all lines are done."""
-        logger.info(f"[GPUInference] Starting with batch_size={self.gpu_batch_size}")
+        logger.info(f"[GPUInference] Starting with batch_size={self.cfg.gpu_batch_size}")
 
         # Track pages waiting for their lines to be processed
         # page_idx -> (ProcessedPage, expected_lines, {line_idx: (logits, orig_w, keep_indices)})
@@ -647,7 +613,7 @@ class AsyncOCRPipeline:
             loop = asyncio.get_event_loop()
             batch_logits, keep_indices_list = await loop.run_in_executor(
                 None, 
-                lambda: self.ocr_model.predict(tensors, content_widths, left_pad_widths, self.input_width)
+                lambda: self.ocr_model.predict(tensors, content_widths, left_pad_widths, self.cfg.input_width)
             )
 
             # batch_logits is now a list of arrays (one per item), already cropped
@@ -763,7 +729,7 @@ class AsyncOCRPipeline:
             for line_idx, line in enumerate(processed.lines):
                 pending_tensors.append((processed.page_idx, line_idx, line.tensor, line.content_width, line.left_pad_width))
 
-                if len(pending_tensors) >= self.gpu_batch_size:
+                if len(pending_tensors) >= self.cfg.gpu_batch_size:
                     await flush_batch()
                     await try_emit_completed_pages()
 
@@ -771,14 +737,14 @@ class AsyncOCRPipeline:
 
     async def _ctc_decoder_stage(self) -> None:
         """Decode logits to text concurrently using ProcessPoolExecutor."""
-        logger.info(f"[CTCDecoder] Starting with {self.ctc_workers} workers")
+        logger.info(f"[CTCDecoder] Starting with {self.cfg.ctc_workers} workers")
         loop = asyncio.get_event_loop()
         pending_tasks: set[asyncio.Task] = set()
         pages_received = 0
 
         # Limit concurrent page decodes to balance parallelism vs resource contention
         # With N workers and ~6 lines/page, allow N/2 pages to avoid memory pressure
-        max_concurrent_pages = max(2, self.ctc_workers // 2)
+        max_concurrent_pages = max(2, self.cfg.ctc_workers // 2)
         page_sem = asyncio.Semaphore(max_concurrent_pages)
         logger.info(f"[CTCDecoder] Max concurrent page decodes: {max_concurrent_pages}")
 
@@ -817,7 +783,7 @@ class AsyncOCRPipeline:
                         cropped_logits_list.append(cropped)
                         keep_indices_list.append(_keep_indices)
 
-                    if self.use_nemo_decoder:
+                    if self.cfg.use_nemo_decoder:
                         # NeMo GPU decoder - batch decode all lines on GPU
                         if self._nemo_decoder is None:
                             from .ctc_decoder_nemo import CTCDecoderNemo
@@ -826,27 +792,27 @@ class AsyncOCRPipeline:
                                 self.ctc_decoder.charset,
                                 add_blank=True,
                                 device="cuda",
-                                beam_width=self.beam_width or 10,
-                                kenlm_path=self.kenlm_path,
+                                beam_width=self.cfg.beam_width or 10,
+                                kenlm_path=self.cfg.kenlm_path,
                             )
                         texts = self._nemo_decoder.decode_batch(cropped_logits_list)
-                    elif self.use_greedy_decode:
+                    elif self.cfg.use_greedy_decode:
                         # Greedy decode is fast (~0.6ms/line), run directly without ProcessPoolExecutor
                         texts = []
                         for cropped, keep_indices in zip(cropped_logits_list, keep_indices_list):
                             pruned_vocab = [vocab[i] for i in keep_indices] if keep_indices is not None else vocab
                             text = decode_logits_greedy(cropped, pruned_vocab)
                             texts.append(text.strip().replace("§", " "))
-                    elif self.use_hybrid_decode:
+                    elif self.cfg.use_hybrid_decode:
                         # Hybrid decode: greedy first, beam search fallback for low-confidence lines
                         texts = []
                         for cropped, keep_indices in zip(cropped_logits_list, keep_indices_list):
                             pruned_vocab = [vocab[i] for i in keep_indices] if keep_indices is not None else vocab
                             text = decode_logits_hybrid_global(
                                 cropped, pruned_vocab,
-                                confidence_threshold=self.greedy_confidence_threshold,
-                                beam_width=self.beam_width,
-                                token_min_logp=self.token_min_logp,
+                                confidence_threshold=self.cfg.greedy_confidence_threshold,
+                                beam_width=self.cfg.beam_width,
+                                token_min_logp=self.cfg.token_min_logp,
                             )
                             texts.append(text.strip().replace("§", " "))
                     else:
@@ -859,8 +825,8 @@ class AsyncOCRPipeline:
                                 _decode_single_line,
                                 cropped,
                                 pruned_vocab,
-                                self.beam_width,
-                                self.token_min_logp,
+                                self.cfg.beam_width,
+                                self.cfg.token_min_logp,
                                 None,  # submit_time
                             )
                             futures.append(future)

@@ -60,36 +60,12 @@ _GLOBAL_DECODER = None
 _GLOBAL_VOCAB_LEN = None  # Use length for fast comparison
 _GLOBAL_BLANK_SIGN = "<pad>"
 
-# Tibetan word/syllable delimiters
-# These characters trigger word boundaries for language model scoring and frame tracking.
-# Includes: tsheg (་), tsheg-like (༌), space, shad (།), sbrul-shad (༴), visarga (ཿ),
-# head mark (࿒), brackets (༼༽), and other punctuation (࿙࿚༔)
-TIBETAN_WORD_DELIMITERS: frozenset[str] = frozenset({
-    "་",  # tsheg (most common syllable separator)
-    "༌",  # tsheg-like / non-breaking tsheg
-    " ",  # space
-    "།",  # shad (sentence/phrase delimiter)
-    "༴",  # sbrul-shad (repetition mark)
-    "ཿ",  # visarga / rnam-bcad
-    "࿒",  # head mark
-    "༼",  # opening bracket
-    "༽",  # closing bracket
-    "࿙",  # leading ornament
-    "࿚",  # trailing ornament
-    "༔",  # ter-tsheg / gter-tsheg
-})
-
-# Space-only delimiters - original behavior for backward compatibility
-# Use this for stable reference outputs that match previous decoder behavior
-SPACE_ONLY_DELIMITERS: frozenset[str] = frozenset({" "})
-
-# Default word delimiters - use Tibetan delimiters for syllable-level decoding
-# This enables proper syllable boundaries for:
-# - Per-syllable timing (text_frames)
-# - Per-syllable LM scoring (when using KenLM trained on syllables)
-# - Per-syllable confidence scores
-# Note: This changes beam search dynamics compared to space-only delimiters
-DEFAULT_WORD_DELIMITERS: frozenset[str] = TIBETAN_WORD_DELIMITERS
+# Import word delimiters from config (canonical location)
+from .config import (
+    TIBETAN_WORD_DELIMITERS,
+    SPACE_ONLY_DELIMITERS,
+    DEFAULT_WORD_DELIMITERS,
+)
 
 
 @lru_cache(maxsize=32)

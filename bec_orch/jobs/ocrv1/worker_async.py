@@ -20,7 +20,8 @@ if TYPE_CHECKING:
     from bec_orch.core.models import TaskResult
     from bec_orch.jobs.base import JobContext
 
-from .ctc_decoder import CTCDecoder, DEFAULT_WORD_DELIMITERS, SPACE_ONLY_DELIMITERS, TIBETAN_WORD_DELIMITERS
+from .config import OCRV1Config, DEFAULT_WORD_DELIMITERS, TIBETAN_WORD_DELIMITERS
+from .ctc_decoder import CTCDecoder
 from .model import OCRModel
 from .pipeline_async import AsyncOCRPipeline
 
@@ -35,14 +36,12 @@ class OCRV1JobWorkerAsync:
     CPU-bound image processing and CTC decoding.
     """
 
-    def __init__(self, word_delimiters: frozenset[str] | None = None):
+    def __init__(self, cfg: OCRV1Config | None = None):
         """Initialize the OCR worker.
         
         Args:
-            word_delimiters: Characters that trigger word boundaries for CTC decoding.
-                           - None (default): Use TIBETAN_WORD_DELIMITERS for syllable-level decoding
-                           - SPACE_ONLY_DELIMITERS: Original behavior for backward compatibility
-                           - TIBETAN_WORD_DELIMITERS: Explicit syllable-level decoding
+            cfg: OCRV1Config with all configuration options.
+                 If None, a default config is created from model dimensions.
         """
         model_dir = os.environ.get("BEC_OCR_MODEL_DIR")
         if not model_dir:
@@ -60,38 +59,52 @@ class OCRV1JobWorkerAsync:
         logger.info(f"Loading OCR model config from: {config_path}")
 
         with open(config_path, "r", encoding="utf-8") as f:
-            config = json.load(f)
+            model_config = json.load(f)
 
-        onnx_model_file = model_dir_path / config["onnx-model"]
+        onnx_model_file = model_dir_path / model_config["onnx-model"]
         if not onnx_model_file.exists():
             raise FileNotFoundError(f"ONNX model file not found: {onnx_model_file}")
 
-        self._input_width = config["input_width"]
-        self._input_height = config["input_height"]
-        charset = config["charset"]
-        squeeze_channel = config["squeeze_channel_dim"] == "yes"
-        swap_hw = config["swap_hw"] == "yes"
-        add_blank = config["add_blank"] == "yes"
+        input_width = model_config["input_width"]
+        input_height = model_config["input_height"]
+        charset = model_config["charset"]
+        squeeze_channel = model_config["squeeze_channel_dim"] == "yes"
+        swap_hw = model_config["swap_hw"] == "yes"
+        add_blank = model_config["add_blank"] == "yes"
+
+        # Create config if not provided
+        if cfg is None:
+            cfg = OCRV1Config(input_width=input_width, input_height=input_height)
+        else:
+            # Update config with model dimensions
+            cfg.input_width = input_width
+            cfg.input_height = input_height
+        
+        self.cfg = cfg
 
         logger.info(f"Loading OCR model: {onnx_model_file}")
         logger.info(
-            f"  Architecture: {config.get('architecture', 'unknown')}, Version: {config.get('version', 'unknown')}"
+            f"  Architecture: {model_config.get('architecture', 'unknown')}, "
+            f"Version: {model_config.get('version', 'unknown')}"
         )
-        logger.info(f"  Input: {self._input_width}x{self._input_height}, Charset length: {len(charset)}")
+        logger.info(f"  Input: {input_width}x{input_height}, Charset length: {len(charset)}")
 
         self.ocr_model = OCRModel(
             model_file=str(onnx_model_file),
-            input_layer=config["input_layer"],
-            output_layer=config["output_layer"],
+            input_layer=model_config["input_layer"],
+            output_layer=model_config["output_layer"],
             squeeze_channel=squeeze_channel,
             swap_hw=swap_hw,
         )
 
-        # Store word_delimiters for reference
-        self.word_delimiters = word_delimiters if word_delimiters is not None else DEFAULT_WORD_DELIMITERS
-        logger.info(f"  Word delimiters: {len(self.word_delimiters)} chars ({'Tibetan syllable' if self.word_delimiters == TIBETAN_WORD_DELIMITERS else 'space-only'})")
+        logger.info(
+            f"  Word delimiters: {len(cfg.word_delimiters)} chars "
+            f"({'Tibetan syllable' if cfg.word_delimiters == TIBETAN_WORD_DELIMITERS else 'space-only'})"
+        )
         
-        self.ctc_decoder = CTCDecoder(charset=charset, add_blank=add_blank, word_delimiters=self.word_delimiters)
+        self.ctc_decoder = CTCDecoder(
+            charset=charset, add_blank=add_blank, word_delimiters=cfg.word_delimiters
+        )
 
         self.ld_bucket = os.environ.get("BEC_LD_BUCKET", "bec.bdrc.io")
         self.source_image_bucket = os.environ.get("BEC_SOURCE_IMAGE_BUCKET", "archive.tbrc.org")
@@ -102,23 +115,6 @@ class OCRV1JobWorkerAsync:
             retries={"max_attempts": 3, "mode": "adaptive"},
         )
         self._s3_client = boto3.client("s3", config=boto_config)
-
-        # Pipeline config
-        self.prefetch_concurrency = 64
-        self.image_processor_workers = 16
-        self.ctc_workers = 8
-        self.gpu_batch_size = 16
-        self.beam_width: int | None = None  # None = use module default
-        self.token_min_logp: float | None = None  # None = use module default
-        self.vocab_prune_threshold: float | None = None  # None = use module default
-        self.vocab_prune_mode: str | None = None  # None = use module default
-        self.use_greedy_decode: bool = False  # Use fast greedy decode instead of beam search
-        self.use_hybrid_decode: bool = True  # Greedy + beam search fallback for low-confidence lines
-        self.greedy_confidence_threshold: float | None = None  # Confidence threshold for hybrid decode (None = module default -0.5)
-        self.use_nemo_decoder: bool = False  # Use NeMo GPU decoder instead of pyctcdecode
-        self.use_sequential_pipeline: bool = False  # Run GPU inference first, then CTC decode
-        self.kenlm_path: str | None = None  # Path to KenLM language model for NeMo decoder
-        self.debug_output_dir: str | None = None  # Directory to save preprocessed line images for debugging
 
         logger.info("OCR model loaded successfully")
 
@@ -181,31 +177,16 @@ class OCRV1JobWorkerAsync:
 
         # Create and run pipeline
         pipeline = AsyncOCRPipeline(
+            cfg=self.cfg,
             ocr_model=self.ocr_model,
             ctc_decoder=self.ctc_decoder,
-            input_width=self._input_width,
-            input_height=self._input_height,
             s3_client=self._s3_client,
             source_image_bucket=self.source_image_bucket,
             volume_prefix=volume_prefix,
-            prefetch_concurrency=self.prefetch_concurrency,
-            image_processor_workers=self.image_processor_workers,
-            ctc_workers=self.ctc_workers,
-            gpu_batch_size=self.gpu_batch_size,
-            beam_width=self.beam_width,
-            token_min_logp=self.token_min_logp,
-            use_greedy_decode=self.use_greedy_decode,
-            use_hybrid_decode=self.use_hybrid_decode,
-            greedy_confidence_threshold=self.greedy_confidence_threshold,
-            use_nemo_decoder=self.use_nemo_decoder,
-            kenlm_path=self.kenlm_path,
-            debug_output_dir=self.debug_output_dir,
         )
-        pipeline.vocab_prune_threshold = self.vocab_prune_threshold
-        pipeline.vocab_prune_mode = self.vocab_prune_mode
 
         try:
-            if self.use_sequential_pipeline:
+            if self.cfg.use_sequential_pipeline:
                 stats = await pipeline.run_sequential(pages, output_parquet_uri)
             else:
                 stats = await pipeline.run(pages, output_parquet_uri)

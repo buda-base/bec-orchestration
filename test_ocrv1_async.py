@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 Test script for async OCRV1JobWorker.
 
@@ -28,6 +27,8 @@ import s3fs
 
 from bec_orch.core.models import ArtifactLocation, VolumeManifest, VolumeRef
 from bec_orch.jobs.base import JobContext
+from bec_orch.jobs.ocrv1.config import OCRV1Config
+from bec_orch.jobs.ocrv1.worker_async import OCRV1JobWorkerAsync
 
 logging.basicConfig(
     level=logging.INFO,
@@ -54,34 +55,36 @@ def extract_lines_from_parquet(parquet_path: str) -> list[str]:
     for row in df.itertuples():
         texts = row.texts if hasattr(row, "texts") else []
 
-        # Convert to list if numpy array
-        if hasattr(texts, "tolist"):
+        # Convert to list if needed
+        if isinstance(texts, list):
+            pass  # Already a list
+        elif texts is None:
+            texts = []
+        elif hasattr(texts, "tolist") and callable(getattr(texts, "tolist", None)):
+            # Numpy array or similar with tolist method
             texts = texts.tolist()
+        elif hasattr(texts, "__iter__") and not isinstance(texts, (str, bytes)):
+            # Convert iterable to list (but not strings)
+            texts = list(texts)
+        else:
+            # Single value, wrap in list
+            texts = [texts]
 
         # Add each text line, including empty ones
-        if isinstance(texts, list):
-            for line in texts:
-                # Convert to string, use empty string for None/null values
-                all_lines.append(str(line) if line is not None else "")
-        elif texts is not None:
-            all_lines.append(str(texts))
-        else:
-            # Handle None case for non-list texts
-            all_lines.append("")
+        all_lines.extend(str(line) if line is not None else "" for line in texts)
 
     return all_lines
 
 
-def save_reference_lines(parquet_path: str):
+def save_reference_lines(parquet_path: str) -> None:
     """
     Save reference output lines to a text file.
     """
     lines = extract_lines_from_parquet(parquet_path)
 
     REFERENCE_OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
-    with open(REFERENCE_OUTPUT_PATH, "w", encoding="utf-8") as f:
-        for line in lines:
-            f.write(line + "\n")
+    with REFERENCE_OUTPUT_PATH.open("w", encoding="utf-8") as f:
+        f.writelines(line + "\n" for line in lines)
 
     logger.info(f"Reference output saved: {len(lines)} lines -> {REFERENCE_OUTPUT_PATH}")
 
@@ -126,7 +129,7 @@ def show_char_diff(ref_line: str, cur_line: str, max_context: int = 40) -> str:
     return " ".join(diff_parts) if diff_parts else "No visible differences"
 
 
-def compare_with_reference(current_parquet_path: str):
+def compare_with_reference(current_parquet_path: str) -> tuple[int, int]:
     """
     Compare current OCR output with reference line-by-line.
     Exits if reference file doesn't exist.
@@ -139,14 +142,14 @@ def compare_with_reference(current_parquet_path: str):
         sys.exit(1)
 
     # Load reference lines
-    with open(REFERENCE_OUTPUT_PATH, "r", encoding="utf-8") as f:
+    with REFERENCE_OUTPUT_PATH.open(encoding="utf-8") as f:
         ref_lines = [line.rstrip("\n") for line in f]
 
     # Extract current lines
     try:
         cur_lines = extract_lines_from_parquet(current_parquet_path)
-    except Exception as e:
-        logger.error(f"Failed to load current parquet: {e}")
+    except Exception:
+        logger.exception("Failed to load current parquet")
         sys.exit(1)
 
     # Check if line counts match
@@ -164,7 +167,7 @@ def compare_with_reference(current_parquet_path: str):
     lines_with_diff = 0
     diff_examples = []
 
-    for i, (ref_line, cur_line) in enumerate(zip(ref_lines, cur_lines)):
+    for i, (ref_line, cur_line) in enumerate(zip(ref_lines, cur_lines, strict=True)):
         total_chars += len(ref_line)
 
         if ref_line != cur_line:
@@ -213,17 +216,14 @@ def compare_with_reference(current_parquet_path: str):
 def get_volume_manifest_from_s3(w_id: str, i_id: str, bucket: str) -> VolumeManifest:
     s3 = s3fs.S3FileSystem()
 
-    w_prefix = hashlib.md5(w_id.encode()).hexdigest()[:2]
+    w_prefix = hashlib.md5(w_id.encode()).hexdigest()[:2]  # noqa: S324
     manifest_path = f"{bucket}/Works/{w_prefix}/{w_id}/images/{w_id}-{i_id}/dimensions.json"
     logger.info(f"Fetching manifest from s3://{manifest_path}")
 
     info = s3.info(manifest_path)
     etag = info.get("ETag", "").strip('"')
     last_modified = info.get("LastModified", "")
-    if hasattr(last_modified, "isoformat"):
-        last_modified_iso = last_modified.isoformat()
-    else:
-        last_modified_iso = str(last_modified)
+    last_modified_iso = last_modified.isoformat() if hasattr(last_modified, "isoformat") else str(last_modified)
 
     with s3.open(manifest_path, "rb") as f:
         raw = f.read()
@@ -238,7 +238,7 @@ def get_volume_manifest_from_s3(w_id: str, i_id: str, bucket: str) -> VolumeMani
     )
 
 
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser(description="Test async OCRV1 job worker")
     parser.add_argument(
         "--reference",
@@ -314,8 +314,6 @@ def main():
     )
 
     logger.info("Initializing OCRV1JobWorkerAsync...")
-    from bec_orch.jobs.ocrv1.config import OCRV1Config
-    from bec_orch.jobs.ocrv1.worker_async import OCRV1JobWorkerAsync
 
     # Build config
     cfg = OCRV1Config(
@@ -328,7 +326,7 @@ def main():
         use_hybrid_decode=not args.reference,  # Disable hybrid for reference mode
         greedy_confidence_threshold=-0.2,  # Higher = more selective
         use_sequential_pipeline=True,
-        kenlm_path=os.path.join(os.environ.get("BEC_OCR_MODEL_DIR", "ocr_models"), "tibetan_5gram.binary"),
+        kenlm_path=str(Path(os.environ.get("BEC_OCR_MODEL_DIR", "ocr_models")) / "tibetan_5gram.binary"),
         # Debug
         debug_output_dir="debug_output" if args.debug else None,
     )
@@ -359,9 +357,8 @@ def main():
     temp_parquet = "temp_current_output.parquet"
 
     try:
-        with s3.open(current_parquet_s3, "rb") as f_in:
-            with open(temp_parquet, "wb") as f_out:
-                shutil.copyfileobj(f_in, f_out)
+        with s3.open(current_parquet_s3, "rb") as f_in, Path(temp_parquet).open("wb") as f_out:
+            shutil.copyfileobj(f_in, f_out)
 
         if args.reference:
             # Save line-by-line reference output
@@ -372,8 +369,8 @@ def main():
     except Exception as e:
         logger.warning(f"Could not process output parquet: {e}")
     finally:
-        if os.path.exists(temp_parquet):
-            os.remove(temp_parquet)
+        if Path(temp_parquet).exists():
+            Path(temp_parquet).unlink()
 
     logger.info("Done!")
 

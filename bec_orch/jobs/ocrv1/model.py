@@ -7,6 +7,7 @@ import numpy.typing as npt
 import onnxruntime as ort
 from scipy.special import log_softmax as scipy_log_softmax
 
+from .data_structures import LineLogits
 from .utils import get_execution_providers
 
 logger = logging.getLogger(__name__)
@@ -170,7 +171,7 @@ class OCRModel:
         content_widths: list[int] | None = None,
         left_pad_widths: list[int] | None = None,
         input_width: int | None = None,
-    ) -> tuple[list[npt.NDArray], list[npt.NDArray | None]]:
+    ) -> list[LineLogits]:
         """Run ONNX inference on preprocessed tensor, return log probabilities.
 
         Applies log_softmax immediately after inference.
@@ -186,9 +187,7 @@ class OCRModel:
             input_width: The padded model input width
 
         Returns:
-            Tuple of (list of log_probs arrays, list of keep_indices per line) where:
-            - Each log_probs array has shape (pruned_vocab, time) with time cropped to content only
-            - keep_indices list contains vocabulary indices kept for each line (or None if no pruning)
+            List of LineLogits objects containing logits and metadata for each line
         """
         tensor = tensor.astype(np.float32)
 
@@ -239,11 +238,30 @@ class OCRModel:
         # Apply vocab pruning if threshold is set (independent of softmax)
         if self._vocab_prune_threshold is not None:
             if self._use_gpu:
-                return self._prune_batch_gpu(processed_list, logits_list, apply_softmax=self._apply_log_softmax)
-            return self._prune_batch_cpu(processed_list, logits_list, apply_softmax=self._apply_log_softmax)
+                processed_list, keep_indices_list = self._prune_batch_gpu(
+                    processed_list, logits_list, apply_softmax=self._apply_log_softmax
+                )
+            else:
+                processed_list, keep_indices_list = self._prune_batch_cpu(
+                    processed_list, logits_list, apply_softmax=self._apply_log_softmax
+                )
+        else:
+            # No pruning - return processed list (with or without softmax) and None keep_indices
+            keep_indices_list = [None] * len(processed_list)
 
-        # No pruning - return processed list (with or without softmax) and None keep_indices
-        return processed_list, [None] * len(processed_list)
+        default_content_width = processed_list[0].shape[1] if processed_list else 0
+        content_widths = content_widths or [default_content_width] * len(processed_list)
+        left_pad_widths = left_pad_widths or [0] * len(processed_list)
+
+        return [
+            LineLogits(
+                logits=logits,
+                content_width=content_widths[i],
+                left_pad_width=left_pad_widths[i],
+                keep_indices=keep_indices,
+            )
+            for i, (logits, keep_indices) in enumerate(zip(processed_list, keep_indices_list, strict=True))
+        ]
 
     def _apply_softmax_batch_gpu(self, logits_list: list[npt.NDArray]) -> list[npt.NDArray]:
         """Apply log_softmax to each item in the batch on GPU.

@@ -23,6 +23,8 @@ import numpy as np
 import numpy.typing as npt
 from botocore.client import BaseClient
 
+from .data_structures import LineLogits, PageInFlight, PendingTensor
+
 if TYPE_CHECKING:
     from .config import OCRV1Config
 
@@ -108,9 +110,7 @@ class InferredPage:
     page_idx: int
     filename: str
     source_etag: str
-    logits_list: list[
-        tuple[npt.NDArray, int, int, npt.NDArray | None]
-    ]  # (logits, content_width, left_pad_width, keep_indices)
+    logits_list: list[LineLogits]  # Structured line logits data
     error: str | None = None
 
 
@@ -297,7 +297,6 @@ class AsyncOCRPipeline:
         phase2_start = time.perf_counter()
 
         vocab = self.ctc_decoder.ctc_vocab
-        vocab_size = len(vocab)
         loop = asyncio.get_event_loop()
 
         # Prepare all lines from all pages for batch submission
@@ -309,13 +308,13 @@ class AsyncOCRPipeline:
                 await self.q_results.put(self._create_error_page(inferred, None))
                 continue
 
-            for line_idx, (logits, _content_w, _left_pad_w, keep_indices) in enumerate(inferred.logits_list):
+            for line_idx, line_logits in enumerate(inferred.logits_list):
                 # Logits are already cropped to remove padding (done in model before softmax)
                 # Just need to transpose from (vocab, time) -> (time, vocab) if needed
-                actual_vocab_size = vocab_size if keep_indices is None else len(keep_indices)
-                needs_transpose = logits.shape[0] == actual_vocab_size
-                cropped = logits.T if needs_transpose else logits
-                all_decode_tasks.append((inferred.page_idx, line_idx, cropped, inferred, keep_indices))
+                actual_vocab_size = line_logits.vocab_size
+                needs_transpose = line_logits.logits.shape[0] == actual_vocab_size
+                cropped = line_logits.logits.T if needs_transpose else line_logits.logits
+                all_decode_tasks.append((inferred.page_idx, line_idx, cropped, inferred, line_logits.keep_indices))
 
         # Count how many have GPU pruning
         gpu_pruned_count = sum(1 for _, _, _, _, ki in all_decode_tasks if ki is not None)
@@ -534,12 +533,10 @@ class AsyncOCRPipeline:
         logger.info(f"[GPUInference] Starting with batch_size={self.cfg.gpu_batch_size}")
 
         # Track pages waiting for their lines to be processed
-        # page_idx -> (ProcessedPage, expected_lines, {line_idx: (logits, orig_w, keep_indices)})
-        pages_in_flight: dict[int, tuple[ProcessedPage, int, dict[int, tuple]]] = {}
+        pages_in_flight: dict[int, PageInFlight] = {}
 
         # Batch of tensors waiting to be processed
-        # (page_idx, line_idx, tensor, content_w, left_pad_w)
-        pending_tensors: list[tuple[int, int, npt.NDArray, int, int]] = []
+        pending_tensors: list[PendingTensor] = []
 
         lines_processed = 0
         pages_emitted = 0
@@ -554,29 +551,25 @@ class AsyncOCRPipeline:
             start_time = time.perf_counter()
 
             # Stack tensors and collect content widths and left pad widths
-            tensors = np.concatenate([t[2] for t in pending_tensors], axis=0)
-            content_widths = [t[3] for t in pending_tensors]
-            left_pad_widths = [t[4] for t in pending_tensors]
+            tensors = np.concatenate([pt.tensor for pt in pending_tensors], axis=0)
+            content_widths = [pt.content_width for pt in pending_tensors]
+            left_pad_widths = [pt.left_pad_width for pt in pending_tensors]
 
             # Run inference with content widths and left pad widths for proper cropping
             # Model crops time dimension BEFORE softmax/pruning to save computation
-            # Returns per-line keep_indices for deterministic pruning
+            # Returns LineLogits objects for each line
             loop = asyncio.get_event_loop()
-            batch_logits, keep_indices_list = await loop.run_in_executor(
+            line_logits_list = await loop.run_in_executor(
                 None, lambda: self.ocr_model.predict(tensors, content_widths, left_pad_widths, self.cfg.input_width)
             )
 
-            # batch_logits is now a list of arrays (one per item), already cropped
-            # keep_indices_list is a list of keep_indices (one per item), or None per item
+            # line_logits_list is now a list of LineLogits objects (one per item)
             # Distribute results back to pages
-            for (page_idx, line_idx, _, content_w, left_pad_w), logits, keep_indices in zip(
-                pending_tensors, batch_logits, keep_indices_list, strict=True
-            ):
-                if page_idx in pages_in_flight:
-                    _, _, logits_dict = pages_in_flight[page_idx]
-                    # Store logits along with per-line keep_indices
-                    # Note: logits are already cropped to remove left and right padding
-                    logits_dict[line_idx] = (logits, content_w, left_pad_w, keep_indices)
+            for pending_tensor, line_logits in zip(pending_tensors, line_logits_list, strict=True):
+                if pending_tensor.page_idx in pages_in_flight:
+                    page_flight = pages_in_flight[pending_tensor.page_idx]
+                    # Store LineLogits object
+                    page_flight.line_logits[pending_tensor.line_idx] = line_logits
                 lines_processed += 1
 
             pending_tensors.clear()
@@ -590,21 +583,26 @@ class AsyncOCRPipeline:
             nonlocal pages_emitted
             # Check if any pages have all their lines done
             completed = []
-            for page_idx, (_, expected, logits_dict) in pages_in_flight.items():
-                if len(logits_dict) >= expected:
+            for page_idx, page_flight in pages_in_flight.items():
+                if len(page_flight.line_logits) >= page_flight.expected_lines:
                     completed.append(page_idx)
 
             for page_idx in completed:
-                page, expected, logits_dict = pages_in_flight.pop(page_idx)
+                page_flight = pages_in_flight.pop(page_idx)
 
                 # Build logits list in order
                 logits_list = [
-                    logits_dict[i]
-                    if i in logits_dict
-                    else (np.zeros((1, DEFAULT_VOCAB_SIZE), dtype=np.float32), 1, 0, None)
-                    for i in range(expected)
+                    page_flight.line_logits[i]
+                    if i in page_flight.line_logits
+                    else LineLogits(
+                        logits=np.zeros((1, DEFAULT_VOCAB_SIZE), dtype=np.float32),
+                        content_width=1,
+                        left_pad_width=0,
+                        keep_indices=None,
+                    )
+                    for i in range(page_flight.expected_lines)
                 ]
-                await self.q_inferred.put(self._create_inferred_page(page, logits_list))
+                await self.q_inferred.put(self._create_inferred_page(page_flight.processed_page, logits_list))
                 pages_emitted += 1
                 self.stats["inferred"] += 1
 
@@ -619,14 +617,19 @@ class AsyncOCRPipeline:
                 # Emit any remaining pages (shouldn't happen normally)
                 if pages_in_flight:
                     logger.info(f"[GPUInference] Emitting {len(pages_in_flight)} remaining pages")
-                for page, expected, logits_dict in pages_in_flight.values():
+                for page_flight in pages_in_flight.values():
                     logits_list = [
-                        logits_dict[i]
-                        if i in logits_dict
-                        else (np.zeros((1, DEFAULT_VOCAB_SIZE), dtype=np.float32), 1, 0, None)
-                        for i in range(expected)
+                        page_flight.line_logits[i]
+                        if i in page_flight.line_logits
+                        else LineLogits(
+                            logits=np.zeros((1, DEFAULT_VOCAB_SIZE), dtype=np.float32),
+                            content_width=1,
+                            left_pad_width=0,
+                            keep_indices=None,
+                        )
+                        for i in range(page_flight.expected_lines)
                     ]
-                    await self.q_inferred.put(self._create_inferred_page(page, logits_list))
+                    await self.q_inferred.put(self._create_inferred_page(page_flight.processed_page, logits_list))
                     self.stats["inferred"] += 1
 
                 await self.q_inferred.put(EOS)
@@ -648,13 +651,20 @@ class AsyncOCRPipeline:
                 continue
 
             # Register page
-            expected_lines = len(processed.lines)
-            pages_in_flight[processed.page_idx] = (processed, expected_lines, {})
+            pages_in_flight[processed.page_idx] = PageInFlight(
+                processed_page=processed, expected_lines=len(processed.lines), line_logits={}
+            )
 
             # Add tensors to batch
             for line_idx, line in enumerate(processed.lines):
                 pending_tensors.append(
-                    (processed.page_idx, line_idx, line.tensor, line.content_width, line.left_pad_width)
+                    PendingTensor(
+                        page_idx=processed.page_idx,
+                        line_idx=line_idx,
+                        tensor=line.tensor,
+                        content_width=line.content_width,
+                        left_pad_width=line.left_pad_width,
+                    )
                 )
 
                 if len(pending_tensors) >= self.cfg.gpu_batch_size:
@@ -854,19 +864,21 @@ class AsyncOCRPipeline:
     def _prepare_logits_and_vocab(self, inferred: InferredPage) -> tuple[list[npt.NDArray], list[list[str]]]:
         """Prepare cropped logits and corresponding vocabularies for decoding."""
         vocab = self.ctc_decoder.ctc_vocab
-        vocab_size = len(vocab)
 
         cropped_logits_list = []
         pruned_vocab_list = []
 
-        for logits, _content_w, _left_pad_w, keep_indices in inferred.logits_list:
-            actual_vocab_size = vocab_size if keep_indices is None else len(keep_indices)
-            needs_transpose = logits.shape[0] == actual_vocab_size
-            cropped = logits.T if needs_transpose else logits
-            cropped_logits_list.append(cropped)
+        for line_logits in inferred.logits_list:
+            actual_vocab_size = line_logits.vocab_size
+            needs_transpose = line_logits.logits.shape[0] == actual_vocab_size
+            cropped = line_logits.logits.T if needs_transpose else line_logits.logits
 
-            pruned_vocab = [vocab[i] for i in keep_indices] if keep_indices is not None else vocab
+            pruned_vocab = (
+                [vocab[i] for i in line_logits.keep_indices] if line_logits.keep_indices is not None else vocab
+            )
             pruned_vocab_list.append(pruned_vocab)
+
+            cropped_logits_list.append(cropped)
 
         return cropped_logits_list, pruned_vocab_list
 

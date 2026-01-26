@@ -17,7 +17,7 @@ import os
 import time
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 import numpy as np
 import numpy.typing as npt
@@ -137,7 +137,7 @@ class AsyncOCRPipeline:
         cfg: "OCRV1Config",
         ocr_model: OCRModel,
         ctc_decoder: CTCDecoder,
-        s3_client,
+        s3_client: Any,
         source_image_bucket: str,
         volume_prefix: str,
     ):
@@ -338,27 +338,59 @@ class AsyncOCRPipeline:
         else:
             logger.info(f"[Phase 2] Submitting {len(all_decode_tasks)} lines to {self.cfg.ctc_workers} workers... (0 GPU-pruned)")
 
-        # Submit ALL lines at once to ProcessPoolExecutor
-        futures = []
+        # Initialize NeMo decoder if needed
+        if self.cfg.use_nemo_decoder:
+            if self._nemo_decoder is None:
+                from .ctc_decoder_nemo import CTCDecoderNemo
+                logger.info(f"[Phase 2] Initializing NeMo decoder with kenlm_path={self.cfg.kenlm_path}")
+                self._nemo_decoder = CTCDecoderNemo(
+                    self.ctc_decoder.charset,
+                    add_blank=True,
+                    device="cuda",
+                    beam_width=self.cfg.beam_width or 10,
+                    kenlm_path=self.cfg.kenlm_path,
+                )
+        
+        # Group lines by page for batch decoding (works for both NeMo and ProcessPool)
+        pages_tasks = {}
         for page_idx, line_idx, cropped, inferred, keep_indices in all_decode_tasks:
-            submit_time = time.perf_counter()
+            if page_idx not in pages_tasks:
+                pages_tasks[page_idx] = []
+            pages_tasks[page_idx].append((line_idx, cropped, inferred, keep_indices))
+        
+        # Process each page
+        futures = []
+        for page_idx in sorted(pages_tasks.keys()):
+            page_tasks = pages_tasks[page_idx]
             
-            # Model already pruned vocabulary - use pruned vocab list
-            if keep_indices is not None:
-                pruned_vocab = [vocab[i] for i in keep_indices]
+            if self.cfg.use_nemo_decoder:
+                # NeMo GPU decoder - batch all lines on page
+                logger.info(f"[Phase 2] Using NeMo GPU decoder for page {page_idx} ({len(page_tasks)} lines)")
+                cropped_logits_list = [cropped for _, cropped, _, _ in page_tasks]
+                texts = self._nemo_decoder.decode_batch(cropped_logits_list)
+                
+                # Create futures with results
+                for i, (line_idx, _, inferred, _) in enumerate(page_tasks):
+                    submit_time = time.perf_counter()
+                    future = loop.create_future()
+                    future.set_result((texts[i], 0, 0, "nemo"))
+                    futures.append((page_idx, line_idx, future, inferred, submit_time))
             else:
-                pruned_vocab = vocab
-            
-            future = loop.run_in_executor(
-                self._ctc_executor,
-                _decode_single_line,
-                cropped,
-                pruned_vocab,
-                self.cfg.beam_width,
-                self.cfg.token_min_logp,
-                submit_time,
-            )
-            futures.append((page_idx, line_idx, future, inferred, submit_time))
+                # ProcessPoolExecutor - submit each line individually
+                for line_idx, cropped, inferred, keep_indices in page_tasks:
+                    submit_time = time.perf_counter()
+                    pruned_vocab = [vocab[i] for i in keep_indices] if keep_indices is not None else vocab
+                    
+                    future = loop.run_in_executor(
+                        self._ctc_executor,
+                        _decode_single_line,
+                        cropped,
+                        pruned_vocab,
+                        self.cfg.beam_width,
+                        self.cfg.token_min_logp,
+                        submit_time,
+                    )
+                    futures.append((page_idx, line_idx, future, inferred, submit_time))
 
         # Wait for decodes with progress logging
         decode_start = time.perf_counter()
@@ -783,11 +815,11 @@ class AsyncOCRPipeline:
                         cropped_logits_list.append(cropped)
                         keep_indices_list.append(_keep_indices)
 
+                                        
                     if self.cfg.use_nemo_decoder:
                         # NeMo GPU decoder - batch decode all lines on GPU
                         if self._nemo_decoder is None:
                             from .ctc_decoder_nemo import CTCDecoderNemo
-
                             self._nemo_decoder = CTCDecoderNemo(
                                 self.ctc_decoder.charset,
                                 add_blank=True,

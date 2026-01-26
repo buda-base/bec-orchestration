@@ -17,10 +17,11 @@ import os
 import time
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING
 
 import numpy as np
 import numpy.typing as npt
+from botocore.client import BaseClient
 
 if TYPE_CHECKING:
     from .config import OCRV1Config
@@ -32,16 +33,19 @@ from .ctc_decoder import (
     decode_logits_hybrid_global,
     init_worker_process,
 )
-from .line_decoder import FetchedBytes, LineDecoder, ProcessedPage, ProcessedLine
+from .line_decoder import FetchedBytes, LineDecoder, ProcessedPage
 from .model import OCRModel
 from .parquet_writer import StreamingParquetWriter
 
 logger = logging.getLogger(__name__)
 
+# Default vocabulary size for fallback logits
+DEFAULT_VOCAB_SIZE = 84
 
 # =============================================================================
 # CTC Decoding Utilities
 # =============================================================================
+
 
 def _decode_single_line(
     cropped_logits: npt.NDArray,
@@ -65,7 +69,6 @@ def _decode_single_line(
     Returns:
         Tuple of (decoded_text, decode_time_ms, ipc_overhead_ms, worker_pid)
     """
-    import os
 
     arrival_time = time.perf_counter()
     ipc_in_ms = (arrival_time - submit_time) * 1000 if submit_time else 0.0
@@ -105,8 +108,10 @@ class InferredPage:
     page_idx: int
     filename: str
     source_etag: str
-    logits_list: list[tuple[npt.NDArray, int, int, npt.NDArray | None]]  # (logits, content_width, left_pad_width, keep_indices)
-    error: Optional[str] = None
+    logits_list: list[
+        tuple[npt.NDArray, int, int, npt.NDArray | None]
+    ]  # (logits, content_width, left_pad_width, keep_indices)
+    error: str | None = None
 
 
 @dataclass
@@ -115,7 +120,7 @@ class PageResult:
     filename: str
     source_etag: str
     texts: list[str]
-    error: Optional[str] = None
+    error: str | None = None
 
 
 class EndOfStream:
@@ -137,17 +142,16 @@ class AsyncOCRPipeline:
         cfg: "OCRV1Config",
         ocr_model: OCRModel,
         ctc_decoder: CTCDecoder,
-        s3_client: Any,
+        s3_client: BaseClient,
         source_image_bucket: str,
         volume_prefix: str,
-    ):
+    ) -> None:
         self.cfg = cfg
         self.ocr_model = ocr_model
         self.ctc_decoder = ctc_decoder
         self.s3_client = s3_client
         self.source_image_bucket = source_image_bucket
         self.volume_prefix = volume_prefix
-        self._nemo_decoder = None  # Lazy init when needed
 
         # Create LineDecoder for image processing
         self.line_decoder = LineDecoder(cfg)
@@ -159,9 +163,7 @@ class AsyncOCRPipeline:
         self.q_results: asyncio.Queue = asyncio.Queue(maxsize=64)
 
         # Thread pool for image processing (cv2 releases GIL)
-        self._image_executor = ThreadPoolExecutor(
-            max_workers=cfg.image_processor_workers, thread_name_prefix="img"
-        )
+        self._image_executor = ThreadPoolExecutor(max_workers=cfg.image_processor_workers, thread_name_prefix="img")
         # Process pool for CTC decoding - IPC overhead (~190ms/call) is acceptable tradeoff
         # to avoid blocking the async event loop (which starves GPU inference)
         self._ctc_executor = ProcessPoolExecutor(
@@ -200,7 +202,7 @@ class AsyncOCRPipeline:
         logger.info(f"[AsyncOCRPipeline] Starting pipeline for {total_pages} pages")
 
         # Queue depth monitor task
-        async def monitor_queues():
+        async def monitor_queues() -> None:
             while True:
                 await asyncio.sleep(5)
                 logger.info(
@@ -225,7 +227,7 @@ class AsyncOCRPipeline:
 
         # Check for errors
         stage_names = ["prefetcher", "image_processor", "gpu_inference", "ctc_decoder", "writer"]
-        for name, result in zip(stage_names, results):
+        for name, result in zip(stage_names, results, strict=True):
             if isinstance(result, Exception):
                 logger.error(f"Pipeline stage '{name}' failed: {result}", exc_info=result)
 
@@ -257,7 +259,7 @@ class AsyncOCRPipeline:
         # Phase 1: Collect all inferred pages in memory
         all_inferred: list[InferredPage] = []
 
-        async def collect_inferred():
+        async def collect_inferred() -> None:
             """Collect all inferred pages instead of passing to CTC decoder."""
             while True:
                 msg = await self.q_inferred.get()
@@ -266,7 +268,7 @@ class AsyncOCRPipeline:
                 all_inferred.append(msg)
 
         # Queue depth monitor
-        async def monitor_queues():
+        async def monitor_queues() -> None:
             while True:
                 await asyncio.sleep(5)
                 logger.info(
@@ -299,32 +301,20 @@ class AsyncOCRPipeline:
         loop = asyncio.get_event_loop()
 
         # Prepare all lines from all pages for batch submission
-        # Each entry: (page_idx, line_idx, cropped_logits, inferred)
-        all_decode_tasks: list[tuple[int, int, npt.NDArray, InferredPage]] = []
+        # Each entry: (page_idx, line_idx, cropped_logits, inferred, keep_indices)
+        all_decode_tasks: list[tuple[int, int, npt.NDArray, InferredPage, npt.NDArray | None]] = []
 
         for inferred in all_inferred:
             if inferred.error or not inferred.logits_list:
-                # Handle error pages immediately
-                await self.q_results.put(
-                    PageResult(
-                        page_idx=inferred.page_idx,
-                        filename=inferred.filename,
-                        source_etag=inferred.source_etag,
-                        texts=[],
-                        error=inferred.error,
-                    )
-                )
+                await self.q_results.put(self._create_error_page(inferred, None))
                 continue
 
-            for line_idx, (logits, content_w, left_pad_w, keep_indices) in enumerate(inferred.logits_list):
+            for line_idx, (logits, _content_w, _left_pad_w, keep_indices) in enumerate(inferred.logits_list):
                 # Logits are already cropped to remove padding (done in model before softmax)
                 # Just need to transpose from (vocab, time) -> (time, vocab) if needed
                 actual_vocab_size = vocab_size if keep_indices is None else len(keep_indices)
                 needs_transpose = logits.shape[0] == actual_vocab_size
-                if needs_transpose:
-                    cropped = logits.T
-                else:
-                    cropped = logits
+                cropped = logits.T if needs_transpose else logits
                 all_decode_tasks.append((inferred.page_idx, line_idx, cropped, inferred, keep_indices))
 
         # Count how many have GPU pruning
@@ -336,61 +326,26 @@ class AsyncOCRPipeline:
                 f"({gpu_pruned_count} GPU-pruned, sample_keep_indices={len(sample_ki) if sample_ki is not None else 'N/A'})"
             )
         else:
-            logger.info(f"[Phase 2] Submitting {len(all_decode_tasks)} lines to {self.cfg.ctc_workers} workers... (0 GPU-pruned)")
+            logger.info(
+                f"[Phase 2] Submitting {len(all_decode_tasks)} lines to {self.cfg.ctc_workers} workers... (0 GPU-pruned)"
+            )
 
-        # Initialize NeMo decoder if needed
-        if self.cfg.use_nemo_decoder:
-            if self._nemo_decoder is None:
-                from .ctc_decoder_nemo import CTCDecoderNemo
-                logger.info(f"[Phase 2] Initializing NeMo decoder with kenlm_path={self.cfg.kenlm_path}")
-                self._nemo_decoder = CTCDecoderNemo(
-                    self.ctc_decoder.charset,
-                    add_blank=True,
-                    device="cuda",
-                    beam_width=self.cfg.beam_width or 10,
-                    kenlm_path=self.cfg.kenlm_path,
-                )
-        
-        # Group lines by page for batch decoding (works for both NeMo and ProcessPool)
-        pages_tasks = {}
-        for page_idx, line_idx, cropped, inferred, keep_indices in all_decode_tasks:
-            if page_idx not in pages_tasks:
-                pages_tasks[page_idx] = []
-            pages_tasks[page_idx].append((line_idx, cropped, inferred, keep_indices))
-        
-        # Process each page
+        # Submit ALL lines at once to ProcessPoolExecutor
         futures = []
-        for page_idx in sorted(pages_tasks.keys()):
-            page_tasks = pages_tasks[page_idx]
-            
-            if self.cfg.use_nemo_decoder:
-                # NeMo GPU decoder - batch all lines on page
-                logger.info(f"[Phase 2] Using NeMo GPU decoder for page {page_idx} ({len(page_tasks)} lines)")
-                cropped_logits_list = [cropped for _, cropped, _, _ in page_tasks]
-                texts = self._nemo_decoder.decode_batch(cropped_logits_list)
-                
-                # Create futures with results
-                for i, (line_idx, _, inferred, _) in enumerate(page_tasks):
-                    submit_time = time.perf_counter()
-                    future = loop.create_future()
-                    future.set_result((texts[i], 0, 0, "nemo"))
-                    futures.append((page_idx, line_idx, future, inferred, submit_time))
-            else:
-                # ProcessPoolExecutor - submit each line individually
-                for line_idx, cropped, inferred, keep_indices in page_tasks:
-                    submit_time = time.perf_counter()
-                    pruned_vocab = [vocab[i] for i in keep_indices] if keep_indices is not None else vocab
-                    
-                    future = loop.run_in_executor(
-                        self._ctc_executor,
-                        _decode_single_line,
-                        cropped,
-                        pruned_vocab,
-                        self.cfg.beam_width,
-                        self.cfg.token_min_logp,
-                        submit_time,
-                    )
-                    futures.append((page_idx, line_idx, future, inferred, submit_time))
+        for page_idx, line_idx, cropped, inferred, keep_indices in all_decode_tasks:
+            submit_time = time.perf_counter()
+            pruned_vocab = [vocab[i] for i in keep_indices] if keep_indices is not None else vocab
+
+            future = loop.run_in_executor(
+                self._ctc_executor,
+                _decode_single_line,
+                cropped,
+                pruned_vocab,
+                self.cfg.beam_width,
+                self.cfg.token_min_logp,
+                submit_time,
+            )
+            futures.append((page_idx, line_idx, future, inferred, submit_time))
 
         # Wait for decodes with progress logging
         decode_start = time.perf_counter()
@@ -399,7 +354,9 @@ class AsyncOCRPipeline:
         all_texts = []
 
         # Wait for all decodes and log each line as it completes
-        pending = {f[2]: (f[0], f[1], f[3], f[4]) for f in futures}  # future -> (page_idx, line_idx, inferred, submit_time)
+        pending = {
+            f[2]: (f[0], f[1], f[3], f[4]) for f in futures
+        }  # future -> (page_idx, line_idx, inferred, submit_time)
         results = [None] * total_lines
         total_ipc_in = 0.0
         total_ipc_out = 0.0
@@ -435,7 +392,7 @@ class AsyncOCRPipeline:
 
         # Group results by page
         page_results: dict[int, tuple[InferredPage, list[tuple[int, str]]]] = {}
-        for (page_idx, line_idx, _, inferred, _), text in zip(futures, all_texts):
+        for (page_idx, line_idx, _, inferred, _), text in zip(futures, all_texts, strict=True):
             if page_idx not in page_results:
                 page_results[page_idx] = (inferred, [])
             page_results[page_idx][1].append((line_idx, text))
@@ -458,7 +415,7 @@ class AsyncOCRPipeline:
             self.stats["decoded"] += 1
 
         # Emit results and write to parquet concurrently
-        async def emit_results():
+        async def emit_results() -> None:
             for result in results_to_write:
                 await self.q_results.put(result)
             await self.q_results.put(EOS)
@@ -493,20 +450,14 @@ class AsyncOCRPipeline:
                     key = f"{self.volume_prefix}/{filename}"
                     loop = asyncio.get_event_loop()
 
-                    def _fetch():
+                    def _fetch() -> tuple[str, bytes]:
                         response = self.s3_client.get_object(Bucket=self.source_image_bucket, Key=key)
                         return response.get("ETag", "").strip('"'), response["Body"].read()
 
                     source_etag, file_bytes = await loop.run_in_executor(None, _fetch)
 
                     await self.q_fetched.put(
-                        FetchedBytes(
-                            page_idx=page_idx,
-                            filename=filename,
-                            source_etag=source_etag,
-                            file_bytes=file_bytes,
-                            ld_row=ld_row,
-                        )
+                        self._create_fetched_bytes(page_idx, filename, ld_row, file_bytes, source_etag)
                     )
                     self.stats["fetched"] += 1
 
@@ -515,15 +466,7 @@ class AsyncOCRPipeline:
 
                 except Exception as e:
                     logger.warning(f"[Prefetcher] Failed to fetch {filename}: {e}")
-                    await self.q_fetched.put(
-                        FetchedBytes(
-                            page_idx=page_idx,
-                            filename=filename,
-                            source_etag="",
-                            file_bytes=b"",
-                            ld_row=ld_row,
-                        )
-                    )
+                    await self.q_fetched.put(self._create_fetched_bytes(page_idx, filename, ld_row))
                     self.stats["errors"] += 1
 
         # Create all fetch tasks
@@ -550,19 +493,7 @@ class AsyncOCRPipeline:
         async def process_one(fetched: FetchedBytes) -> None:
             async with sem:
                 if not fetched.file_bytes:
-                    await self.q_processed.put(
-                        ProcessedPage(
-                            page_idx=fetched.page_idx,
-                            filename=fetched.filename,
-                            source_etag=fetched.source_etag,
-                            lines=[],
-                            orig_width=0,
-                            orig_height=0,
-                            transformed_width=0,
-                            transformed_height=0,
-                            error="Failed to fetch image",
-                        )
-                    )
+                    await self.q_processed.put(self._create_processed_page(fetched, "Failed to fetch image"))
                     return
 
                 try:
@@ -579,19 +510,7 @@ class AsyncOCRPipeline:
 
                 except Exception as e:
                     logger.warning(f"[ImageProcessor] Failed to process {fetched.filename}: {e}")
-                    await self.q_processed.put(
-                        ProcessedPage(
-                            page_idx=fetched.page_idx,
-                            filename=fetched.filename,
-                            source_etag=fetched.source_etag,
-                            lines=[],
-                            orig_width=0,
-                            orig_height=0,
-                            transformed_width=0,
-                            transformed_height=0,
-                            error=str(e),
-                        )
-                    )
+                    await self.q_processed.put(self._create_processed_page(fetched, str(e)))
                     self.stats["errors"] += 1
 
         while True:
@@ -626,7 +545,7 @@ class AsyncOCRPipeline:
         pages_emitted = 0
         pages_received = 0
 
-        async def flush_batch():
+        async def flush_batch() -> None:
             nonlocal lines_processed
             if not pending_tensors:
                 return
@@ -644,14 +563,15 @@ class AsyncOCRPipeline:
             # Returns per-line keep_indices for deterministic pruning
             loop = asyncio.get_event_loop()
             batch_logits, keep_indices_list = await loop.run_in_executor(
-                None, 
-                lambda: self.ocr_model.predict(tensors, content_widths, left_pad_widths, self.cfg.input_width)
+                None, lambda: self.ocr_model.predict(tensors, content_widths, left_pad_widths, self.cfg.input_width)
             )
 
             # batch_logits is now a list of arrays (one per item), already cropped
             # keep_indices_list is a list of keep_indices (one per item), or None per item
             # Distribute results back to pages
-            for (page_idx, line_idx, _, content_w, left_pad_w), logits, keep_indices in zip(pending_tensors, batch_logits, keep_indices_list):
+            for (page_idx, line_idx, _, content_w, left_pad_w), logits, keep_indices in zip(
+                pending_tensors, batch_logits, keep_indices_list, strict=True
+            ):
                 if page_idx in pages_in_flight:
                     _, _, logits_dict = pages_in_flight[page_idx]
                     # Store logits along with per-line keep_indices
@@ -666,11 +586,11 @@ class AsyncOCRPipeline:
                 f"[GPUInference] Batch {batch_size} lines in {batch_ms:.0f}ms ({batch_ms / batch_size:.0f}ms/line). Total: {lines_processed} lines, {pages_emitted} pages emitted"
             )
 
-        async def try_emit_completed_pages():
+        async def try_emit_completed_pages() -> None:
             nonlocal pages_emitted
             # Check if any pages have all their lines done
             completed = []
-            for page_idx, (page, expected, logits_dict) in pages_in_flight.items():
+            for page_idx, (_, expected, logits_dict) in pages_in_flight.items():
                 if len(logits_dict) >= expected:
                     completed.append(page_idx)
 
@@ -678,22 +598,13 @@ class AsyncOCRPipeline:
                 page, expected, logits_dict = pages_in_flight.pop(page_idx)
 
                 # Build logits list in order
-                logits_list = []
-                for i in range(expected):
-                    if i in logits_dict:
-                        logits_list.append(logits_dict[i])
-                    else:
-                        logits_list.append((np.zeros((1, 84), dtype=np.float32), 1, 0, None))
-
-                await self.q_inferred.put(
-                    InferredPage(
-                        page_idx=page.page_idx,
-                        filename=page.filename,
-                        source_etag=page.source_etag,
-                        logits_list=logits_list,
-                        error=page.error,
-                    )
-                )
+                logits_list = [
+                    logits_dict[i]
+                    if i in logits_dict
+                    else (np.zeros((1, DEFAULT_VOCAB_SIZE), dtype=np.float32), 1, 0, None)
+                    for i in range(expected)
+                ]
+                await self.q_inferred.put(self._create_inferred_page(page, logits_list))
                 pages_emitted += 1
                 self.stats["inferred"] += 1
 
@@ -708,23 +619,14 @@ class AsyncOCRPipeline:
                 # Emit any remaining pages (shouldn't happen normally)
                 if pages_in_flight:
                     logger.info(f"[GPUInference] Emitting {len(pages_in_flight)} remaining pages")
-                for page_idx, (page, expected, logits_dict) in pages_in_flight.items():
-                    logits_list = []
-                    for i in range(expected):
-                        if i in logits_dict:
-                            logits_list.append(logits_dict[i])
-                        else:
-                            logits_list.append((np.zeros((1, 84), dtype=np.float32), 1, 0, None))
-
-                    await self.q_inferred.put(
-                        InferredPage(
-                            page_idx=page.page_idx,
-                            filename=page.filename,
-                            source_etag=page.source_etag,
-                            logits_list=logits_list,
-                            error=page.error,
-                        )
-                    )
+                for page, expected, logits_dict in pages_in_flight.values():
+                    logits_list = [
+                        logits_dict[i]
+                        if i in logits_dict
+                        else (np.zeros((1, DEFAULT_VOCAB_SIZE), dtype=np.float32), 1, 0, None)
+                        for i in range(expected)
+                    ]
+                    await self.q_inferred.put(self._create_inferred_page(page, logits_list))
                     self.stats["inferred"] += 1
 
                 await self.q_inferred.put(EOS)
@@ -740,15 +642,7 @@ class AsyncOCRPipeline:
 
             # Handle error/empty pages immediately
             if processed.error or not processed.lines:
-                await self.q_inferred.put(
-                    InferredPage(
-                        page_idx=processed.page_idx,
-                        filename=processed.filename,
-                        source_etag=processed.source_etag,
-                        logits_list=[],
-                        error=processed.error,
-                    )
-                )
+                await self.q_inferred.put(self._create_inferred_page(processed, []))
                 pages_emitted += 1
                 self.stats["inferred"] += 1
                 continue
@@ -759,7 +653,9 @@ class AsyncOCRPipeline:
 
             # Add tensors to batch
             for line_idx, line in enumerate(processed.lines):
-                pending_tensors.append((processed.page_idx, line_idx, line.tensor, line.content_width, line.left_pad_width))
+                pending_tensors.append(
+                    (processed.page_idx, line_idx, line.tensor, line.content_width, line.left_pad_width)
+                )
 
                 if len(pending_tensors) >= self.cfg.gpu_batch_size:
                     await flush_batch()
@@ -782,86 +678,53 @@ class AsyncOCRPipeline:
 
         async def decode_one(inferred: InferredPage) -> None:
             if inferred.error or not inferred.logits_list:
-                await self.q_results.put(
-                    PageResult(
-                        page_idx=inferred.page_idx,
-                        filename=inferred.filename,
-                        source_etag=inferred.source_etag,
-                        texts=[],
-                        error=inferred.error,
-                    )
-                )
+                await self.q_results.put(self._create_error_page(inferred, None))
                 return
 
             async with page_sem:
                 try:
                     start_time = time.perf_counter()
-                    vocab = self.ctc_decoder.ctc_vocab
-                    vocab_size = len(vocab)
                     num_lines = len(inferred.logits_list)
 
                     # Logits are already cropped to remove padding (done in model before softmax)
                     # Just need to transpose from (vocab, time) -> (time, vocab) if needed
                     # NOTE: Each line may have different keep_indices if they were in different GPU batches
-                    cropped_logits_list = []
-                    keep_indices_list = []
-                    for logits, content_w, left_pad_w, _keep_indices in inferred.logits_list:
-                        actual_vocab_size = vocab_size if _keep_indices is None else len(_keep_indices)
-                        needs_transpose = logits.shape[0] == actual_vocab_size
-                        if needs_transpose:
-                            cropped = logits.T
-                        else:
-                            cropped = logits
-                        cropped_logits_list.append(cropped)
-                        keep_indices_list.append(_keep_indices)
+                    cropped_logits_list, pruned_vocab_list = self._prepare_logits_and_vocab(inferred)
 
-                                        
-                    if self.cfg.use_nemo_decoder:
-                        # NeMo GPU decoder - batch decode all lines on GPU
-                        if self._nemo_decoder is None:
-                            from .ctc_decoder_nemo import CTCDecoderNemo
-                            self._nemo_decoder = CTCDecoderNemo(
-                                self.ctc_decoder.charset,
-                                add_blank=True,
-                                device="cuda",
-                                beam_width=self.cfg.beam_width or 10,
-                                kenlm_path=self.cfg.kenlm_path,
-                            )
-                        texts = self._nemo_decoder.decode_batch(cropped_logits_list)
-                    elif self.cfg.use_greedy_decode:
+                    if self.cfg.use_greedy_decode:
                         # Greedy decode is fast (~0.6ms/line), run directly without ProcessPoolExecutor
-                        texts = []
-                        for cropped, keep_indices in zip(cropped_logits_list, keep_indices_list):
-                            pruned_vocab = [vocab[i] for i in keep_indices] if keep_indices is not None else vocab
-                            text = decode_logits_greedy(cropped, pruned_vocab)
-                            texts.append(text.strip().replace("§", " "))
+                        texts = [
+                            decode_logits_greedy(cropped, vocab).strip().replace("§", " ")
+                            for cropped, vocab in zip(cropped_logits_list, pruned_vocab_list, strict=True)
+                        ]
                     elif self.cfg.use_hybrid_decode:
                         # Hybrid decode: greedy first, beam search fallback for low-confidence lines
-                        texts = []
-                        for cropped, keep_indices in zip(cropped_logits_list, keep_indices_list):
-                            pruned_vocab = [vocab[i] for i in keep_indices] if keep_indices is not None else vocab
-                            text = decode_logits_hybrid_global(
-                                cropped, pruned_vocab,
+                        texts = [
+                            decode_logits_hybrid_global(
+                                cropped,
+                                vocab,
                                 confidence_threshold=self.cfg.greedy_confidence_threshold,
                                 beam_width=self.cfg.beam_width,
                                 token_min_logp=self.cfg.token_min_logp,
                             )
-                            texts.append(text.strip().replace("§", " "))
+                            .strip()
+                            .replace("§", " ")
+                            for cropped, vocab in zip(cropped_logits_list, pruned_vocab_list, strict=True)
+                        ]
                     else:
                         # Beam search via ProcessPoolExecutor - submit each line for parallel decode
-                        futures = []
-                        for cropped, keep_indices in zip(cropped_logits_list, keep_indices_list):
-                            pruned_vocab = [vocab[i] for i in keep_indices] if keep_indices is not None else vocab
-                            future = loop.run_in_executor(
+                        futures = [
+                            loop.run_in_executor(
                                 self._ctc_executor,
                                 _decode_single_line,
                                 cropped,
-                                pruned_vocab,
+                                vocab,
                                 self.cfg.beam_width,
                                 self.cfg.token_min_logp,
                                 None,  # submit_time
                             )
-                            futures.append(future)
+                            for cropped, vocab in zip(cropped_logits_list, pruned_vocab_list, strict=True)
+                        ]
 
                         # Wait for all lines to complete in parallel
                         # _decode_single_line returns (text, decode_ms, ipc_in_ms, worker_pid)
@@ -885,15 +748,7 @@ class AsyncOCRPipeline:
 
                 except Exception as e:
                     logger.warning(f"[CTCDecoder] Failed to decode {inferred.filename}: {e}")
-                    await self.q_results.put(
-                        PageResult(
-                            page_idx=inferred.page_idx,
-                            filename=inferred.filename,
-                            source_etag=inferred.source_etag,
-                            texts=[],
-                            error=str(e),
-                        )
-                    )
+                    await self.q_results.put(self._create_error_page(inferred, str(e)))
                     self.stats["errors"] += 1
 
         while True:
@@ -944,6 +799,76 @@ class AsyncOCRPipeline:
             writer.close()
 
         logger.info(f"[ParquetWriter] Done, wrote {pages_written} pages")
+
+    def _create_error_page(self, inferred: InferredPage, error: str | None) -> PageResult:
+        """Create a PageResult for error cases."""
+        return PageResult(
+            page_idx=inferred.page_idx,
+            filename=inferred.filename,
+            source_etag=inferred.source_etag,
+            texts=[],
+            error=error or inferred.error,
+        )
+
+    def _create_processed_page(self, fetched: FetchedBytes, error: str | None) -> ProcessedPage:
+        """Create ProcessedPage with error handling."""
+        return ProcessedPage(
+            page_idx=fetched.page_idx,
+            filename=fetched.filename,
+            source_etag=fetched.source_etag,
+            lines=[],
+            orig_width=0,
+            orig_height=0,
+            transformed_width=0,
+            transformed_height=0,
+            error=error,
+        )
+
+    def _create_inferred_page(self, page: ProcessedPage, logits_list: list) -> InferredPage:
+        """Create InferredPage from ProcessedPage and logits."""
+        return InferredPage(
+            page_idx=page.page_idx,
+            filename=page.filename,
+            source_etag=page.source_etag,
+            logits_list=logits_list,
+            error=page.error,
+        )
+
+    def _create_fetched_bytes(
+        self,
+        page_idx: int,
+        filename: str,
+        ld_row: dict,
+        file_bytes: bytes = b"",
+        source_etag: str = "",
+    ) -> FetchedBytes:
+        """Create FetchedBytes with error handling."""
+        return FetchedBytes(
+            page_idx=page_idx,
+            filename=filename,
+            source_etag=source_etag,
+            file_bytes=file_bytes,
+            ld_row=ld_row,
+        )
+
+    def _prepare_logits_and_vocab(self, inferred: InferredPage) -> tuple[list[npt.NDArray], list[list[str]]]:
+        """Prepare cropped logits and corresponding vocabularies for decoding."""
+        vocab = self.ctc_decoder.ctc_vocab
+        vocab_size = len(vocab)
+
+        cropped_logits_list = []
+        pruned_vocab_list = []
+
+        for logits, _content_w, _left_pad_w, keep_indices in inferred.logits_list:
+            actual_vocab_size = vocab_size if keep_indices is None else len(keep_indices)
+            needs_transpose = logits.shape[0] == actual_vocab_size
+            cropped = logits.T if needs_transpose else logits
+            cropped_logits_list.append(cropped)
+
+            pruned_vocab = [vocab[i] for i in keep_indices] if keep_indices is not None else vocab
+            pruned_vocab_list.append(pruned_vocab)
+
+        return cropped_logits_list, pruned_vocab_list
 
     async def close(self) -> None:
         """Cleanup resources."""

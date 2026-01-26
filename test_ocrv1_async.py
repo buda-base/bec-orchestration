@@ -8,9 +8,6 @@ Usage:
 To generate a reference parquet with max accuracy settings:
     BEC_OCR_MODEL_DIR=ocr_models/Woodblock python test_ocrv1_async.py --reference
 
-To use NeMo GPU decoder:
-    BEC_OCR_MODEL_DIR=ocr_models/Woodblock python test_ocrv1_async.py --use-nemo
-
 To limit number of pages:
     BEC_OCR_MODEL_DIR=ocr_models/Woodblock python test_ocrv1_async.py --max-pages 50
 """
@@ -49,18 +46,18 @@ def extract_lines_from_parquet(parquet_path: str) -> list[str]:
     Preserves empty lines to maintain consistent line counts.
     """
     df = pd.read_parquet(parquet_path)
-    
+
     # Sort by img_file_name for consistent ordering
-    df = df.sort_values('img_file_name')
-    
+    df = df.sort_values("img_file_name")
+
     all_lines = []
     for row in df.itertuples():
-        texts = row.texts if hasattr(row, 'texts') else []
-        
+        texts = row.texts if hasattr(row, "texts") else []
+
         # Convert to list if numpy array
-        if hasattr(texts, 'tolist'):
+        if hasattr(texts, "tolist"):
             texts = texts.tolist()
-        
+
         # Add each text line, including empty ones
         if isinstance(texts, list):
             for line in texts:
@@ -71,7 +68,7 @@ def extract_lines_from_parquet(parquet_path: str) -> list[str]:
         else:
             # Handle None case for non-list texts
             all_lines.append("")
-    
+
     return all_lines
 
 
@@ -80,12 +77,12 @@ def save_reference_lines(parquet_path: str):
     Save reference output lines to a text file.
     """
     lines = extract_lines_from_parquet(parquet_path)
-    
+
     REFERENCE_OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
-    with open(REFERENCE_OUTPUT_PATH, 'w', encoding='utf-8') as f:
+    with open(REFERENCE_OUTPUT_PATH, "w", encoding="utf-8") as f:
         for line in lines:
-            f.write(line + '\n')
-    
+            f.write(line + "\n")
+
     logger.info(f"Reference output saved: {len(lines)} lines -> {REFERENCE_OUTPUT_PATH}")
 
 
@@ -96,9 +93,9 @@ def show_char_diff(ref_line: str, cur_line: str, max_context: int = 40) -> str:
     """
     matcher = SequenceMatcher(None, ref_line, cur_line)
     diff_parts = []
-    
+
     for tag, i1, i2, j1, j2 in matcher.get_opcodes():
-        if tag == 'replace':
+        if tag == "replace":
             ref_part = ref_line[i1:i2]
             cur_part = cur_line[j1:j2]
             # Show context around the change
@@ -106,32 +103,26 @@ def show_char_diff(ref_line: str, cur_line: str, max_context: int = 40) -> str:
             context_end = min(len(ref_line), i2 + max_context)
             context_before = ref_line[context_start:i1]
             context_after = ref_line[i2:context_end]
-            
-            diff_parts.append(
-                f"...{context_before}[{ref_part}→{cur_part}]{context_after}..."
-            )
-        elif tag == 'delete':
+
+            diff_parts.append(f"...{context_before}[{ref_part}→{cur_part}]{context_after}...")
+        elif tag == "delete":
             ref_part = ref_line[i1:i2]
             context_start = max(0, i1 - max_context)
             context_end = min(len(ref_line), i2 + max_context)
             context_before = ref_line[context_start:i1]
             context_after = ref_line[i2:context_end]
-            
-            diff_parts.append(
-                f"...{context_before}[-{ref_part}]{context_after}..."
-            )
-        elif tag == 'insert':
+
+            diff_parts.append(f"...{context_before}[-{ref_part}]{context_after}...")
+        elif tag == "insert":
             cur_part = cur_line[j1:j2]
             # Use position in current line for context
             context_start = max(0, j1 - max_context)
             context_end = min(len(cur_line), j2 + max_context)
             context_before = cur_line[context_start:j1]
             context_after = cur_line[j2:context_end]
-            
-            diff_parts.append(
-                f"...{context_before}[+{cur_part}]{context_after}..."
-            )
-    
+
+            diff_parts.append(f"...{context_before}[+{cur_part}]{context_after}...")
+
     return " ".join(diff_parts) if diff_parts else "No visible differences"
 
 
@@ -143,22 +134,21 @@ def compare_with_reference(current_parquet_path: str):
     """
     if not REFERENCE_OUTPUT_PATH.exists():
         logger.error(
-            f"Reference output not found at {REFERENCE_OUTPUT_PATH}. "
-            f"Run with --reference first to generate it."
+            f"Reference output not found at {REFERENCE_OUTPUT_PATH}. Run with --reference first to generate it."
         )
         sys.exit(1)
-    
+
     # Load reference lines
-    with open(REFERENCE_OUTPUT_PATH, 'r', encoding='utf-8') as f:
-        ref_lines = [line.rstrip('\n') for line in f]
-    
+    with open(REFERENCE_OUTPUT_PATH, "r", encoding="utf-8") as f:
+        ref_lines = [line.rstrip("\n") for line in f]
+
     # Extract current lines
     try:
         cur_lines = extract_lines_from_parquet(current_parquet_path)
     except Exception as e:
         logger.error(f"Failed to load current parquet: {e}")
         sys.exit(1)
-    
+
     # Check if line counts match
     if len(ref_lines) != len(cur_lines):
         logger.error(
@@ -167,26 +157,26 @@ def compare_with_reference(current_parquet_path: str):
             f"The input images may have changed."
         )
         sys.exit(1)
-    
+
     # Compare line by line
     total_chars = 0
     diff_chars = 0
     lines_with_diff = 0
     diff_examples = []
-    
+
     for i, (ref_line, cur_line) in enumerate(zip(ref_lines, cur_lines)):
         total_chars += len(ref_line)
-        
+
         if ref_line != cur_line:
             lines_with_diff += 1
-            
+
             # Count character differences
             matcher = SequenceMatcher(None, ref_line, cur_line)
             # Count characters that differ
             for tag, i1, i2, j1, j2 in matcher.get_opcodes():
-                if tag != 'equal':
+                if tag != "equal":
                     diff_chars += max(i2 - i1, j2 - j1)
-            
+
             # Store example for display (limit to first 10)
             if len(diff_examples) < 10:
                 # Special handling for empty line cases
@@ -197,18 +187,18 @@ def compare_with_reference(current_parquet_path: str):
                 else:
                     diff_display = show_char_diff(ref_line, cur_line)
                 diff_examples.append((i + 1, diff_display))
-    
+
     # Report results
     logger.info("=== LINE-BY-LINE COMPARISON WITH REFERENCE ===")
     logger.info(f"Total lines: {len(ref_lines)}")
     logger.info(f"Lines with differences: {lines_with_diff}")
     logger.info(f"Total characters: {total_chars}")
     logger.info(f"Characters different: {diff_chars}")
-    
+
     if total_chars > 0:
         accuracy = ((total_chars - diff_chars) / total_chars) * 100
         logger.info(f"Character accuracy: {accuracy:.2f}%")
-    
+
     if diff_examples:
         logger.info(f"\n=== SHOWING {len(diff_examples)} DIFFERENCE EXAMPLES ===")
         for line_num, diff_display in diff_examples:
@@ -216,7 +206,7 @@ def compare_with_reference(current_parquet_path: str):
             logger.info(f"  {diff_display}")
     else:
         logger.info("\nNo differences found! Output matches reference perfectly.")
-    
+
     return lines_with_diff, diff_chars
 
 
@@ -259,11 +249,6 @@ def main():
         "--debug",
         action="store_true",
         help="Save preprocessed line images to debug_output folder for inspection",
-    )
-    parser.add_argument(
-        "--use-nemo",
-        action="store_true",
-        help="Use NeMo GPU decoder instead of pyctcdecode",
     )
     parser.add_argument(
         "--max-pages",
@@ -342,7 +327,6 @@ def main():
         use_greedy_decode=False,
         use_hybrid_decode=not args.reference,  # Disable hybrid for reference mode
         greedy_confidence_threshold=-0.2,  # Higher = more selective
-        use_nemo_decoder=args.use_nemo,
         use_sequential_pipeline=True,
         kenlm_path=os.path.join(os.environ.get("BEC_OCR_MODEL_DIR", "ocr_models"), "tibetan_5gram.binary"),
         # Debug
@@ -362,7 +346,6 @@ def main():
     logger.info(f"  vocab_prune_mode: {cfg.vocab_prune_mode}")
     logger.info(f"  use_greedy_decode: {cfg.use_greedy_decode}")
     logger.info(f"  use_hybrid_decode: {cfg.use_hybrid_decode}")
-    logger.info(f"  use_nemo_decoder: {cfg.use_nemo_decoder}")
     logger.info(f"  use_sequential_pipeline: {cfg.use_sequential_pipeline}")
 
     logger.info("Running async OCR...")

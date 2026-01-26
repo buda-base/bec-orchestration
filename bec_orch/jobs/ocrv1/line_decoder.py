@@ -12,7 +12,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING
 
 import cv2
 import numpy as np
@@ -72,8 +72,8 @@ class ProcessedPage:
     transformed_height: int  # Height after transforms (rotation + TPS)
     # Transform parameters applied to get from original to transformed coordinates
     rotation_angle: float = 0.0  # Rotation angle in degrees
-    tps_points: Optional[tuple] = None  # ((input_pts, output_pts), alpha) or None
-    error: Optional[str] = None
+    tps_points: tuple | None = None  # ((input_pts, output_pts), alpha) or None
+    error: str | None = None
 
 
 # -----------------------------------------------------------------------------
@@ -121,9 +121,7 @@ def _sort_bbox_centers(centers: list[tuple[float, float]]) -> list[float]:
     return sorted([c[1] for c in centers])
 
 
-def _group_line_segments(
-    segments: list[LineSegment], line_threshold: float
-) -> list[list[LineSegment]]:
+def _group_line_segments(segments: list[LineSegment], line_threshold: float) -> list[list[LineSegment]]:
     """Group segments into lines based on vertical proximity."""
     if not segments:
         return []
@@ -224,7 +222,7 @@ class LineDecoder:
     Thread-safe: all processing is stateless per call.
     """
 
-    def __init__(self, cfg: "OCRV1Config"):
+    def __init__(self, cfg: OCRV1Config) -> None:
         """
         Initialize LineDecoder.
 
@@ -297,13 +295,9 @@ class LineDecoder:
             tps_input_pts, tps_output_pts = tps_points
             if scale_factor != 1.0:
                 if tps_input_pts is not None:
-                    tps_input_pts = [
-                        [p[0] * scale_factor, p[1] * scale_factor] for p in tps_input_pts
-                    ]
+                    tps_input_pts = [[p[0] * scale_factor, p[1] * scale_factor] for p in tps_input_pts]
                 if tps_output_pts is not None:
-                    tps_output_pts = [
-                        [p[0] * scale_factor, p[1] * scale_factor] for p in tps_output_pts
-                    ]
+                    tps_output_pts = [[p[0] * scale_factor, p[1] * scale_factor] for p in tps_output_pts]
 
         # Apply transforms (rotation + TPS)
         image = apply_transform_1(image, rotation_angle, tps_input_pts, tps_output_pts, tps_alpha)
@@ -335,8 +329,7 @@ class LineDecoder:
             scaled_contours = []
             for contour_points in contours:
                 scaled_points = [
-                    {"x": int(p["x"] * scale_factor), "y": int(p["y"] * scale_factor)}
-                    for p in contour_points
+                    {"x": int(p["x"] * scale_factor), "y": int(p["y"] * scale_factor)} for p in contour_points
                 ]
                 scaled_contours.append(scaled_points)
             contours = scaled_contours
@@ -361,15 +354,11 @@ class LineDecoder:
 
         for line_idx, (merged_contour, original_contours) in enumerate(merged):
             # Extract line image using merged contour
-            line_img, current_k, bbox = self._extract_line(
-                image, merged_contour, current_k, mask_buffer
-            )
+            line_img, current_k, bbox = self._extract_line(image, merged_contour, current_k, mask_buffer)
 
             if line_img is None:
                 # Create empty line entry
-                empty_tensor = np.zeros(
-                    (1, self.cfg.input_height, self.cfg.input_width), dtype=np.float32
-                )
+                empty_tensor = np.zeros((1, self.cfg.input_height, self.cfg.input_width), dtype=np.float32)
                 lines.append(
                     ProcessedLine(
                         tensor=empty_tensor,
@@ -417,7 +406,7 @@ class LineDecoder:
         contour_points: list[dict],
         k_factor: float,
         mask_buffer: npt.NDArray,
-    ) -> tuple[Optional[npt.NDArray], float, tuple[int, int, int, int]]:
+    ) -> tuple[npt.NDArray | None, float, tuple[int, int, int, int]]:
         """
         Extract line image from contour.
 
@@ -437,9 +426,7 @@ class LineDecoder:
         mask_buffer.fill(0)
         cv2.drawContours(mask_buffer, [pts], -1, 255, -1)
 
-        line_img, adapted_k = get_line_image(
-            image, mask_buffer, h, bbox_tolerance=3.0, k_factor=k_factor
-        )
+        line_img, adapted_k = get_line_image(image, mask_buffer, h, bbox_tolerance=3.0, k_factor=k_factor)
 
         if line_img.size == 0:
             return None, adapted_k, (x, y, w, h)

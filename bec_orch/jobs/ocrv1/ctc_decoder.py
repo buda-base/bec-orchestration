@@ -1,19 +1,23 @@
 import logging
+import time
+from collections.abc import Collection
 from dataclasses import dataclass
 from functools import lru_cache
-from typing import Collection
 
 import numpy as np
 import numpy.typing as npt
+from pyctcdecode.decoder import BeamSearchDecoderCTC, OutputBeam, build_ctcdecoder
 from scipy.special import log_softmax as scipy_log_softmax
 
-from pyctcdecode.decoder import build_ctcdecoder
+from .config import (
+    DEFAULT_WORD_DELIMITERS,
+)
 
 
 @dataclass
 class SyllableSegment:
     """A decoded syllable/word segment with position and confidence.
-    
+
     Attributes:
         start_pixel: Starting pixel position (x-coordinate) in the line image
         end_pixel: Ending pixel position (x-coordinate) in the line image
@@ -21,17 +25,18 @@ class SyllableSegment:
         trailing_delimiters: Delimiter(s) that follow this syllable (e.g., "་" or "།")
         confidence: Confidence score (normalized log probability, typically -inf to 0)
     """
+
     start_pixel: int
     end_pixel: int
     text: str
     trailing_delimiters: str
     confidence: float
-    
+
     @property
     def full_text(self) -> str:
         """Return text with trailing delimiters included."""
         return self.text + self.trailing_delimiters
-    
+
     def as_tuple(self) -> tuple[int, int, str, float]:
         """Return (start_pixel, end_pixel, full_text, confidence) tuple."""
         return (self.start_pixel, self.end_pixel, self.full_text, self.confidence)
@@ -40,20 +45,24 @@ class SyllableSegment:
 @dataclass
 class LineDecodeResult:
     """Complete decode result for a line including text and segment details.
-    
+
     Attributes:
         text: Full decoded text for the line
         segments: List of syllable/word segments with positions and confidence
         line_confidence: Overall confidence for the entire line
         logit_score: Raw cumulative logit score from beam search
     """
+
     text: str
     segments: list[SyllableSegment]
     line_confidence: float
     logit_score: float
 
+
 # Suppress noisy pyctcdecode warnings
 logging.getLogger("pyctcdecode.alphabet").setLevel(logging.ERROR)
+
+logger = logging.getLogger("ctc_decoder")
 
 # Global decoder instance for multiprocessing (avoids pickling issues)
 _GLOBAL_DECODER = None
@@ -61,23 +70,18 @@ _GLOBAL_VOCAB_LEN = None  # Use length for fast comparison
 _GLOBAL_BLANK_SIGN = "<pad>"
 
 # Import word delimiters from config (canonical location)
-from .config import (
-    TIBETAN_WORD_DELIMITERS,
-    SPACE_ONLY_DELIMITERS,
-    DEFAULT_WORD_DELIMITERS,
-)
 
 
 @lru_cache(maxsize=32)
 def _get_cached_decoder(
     vocab_tuple: tuple[str, ...],
     word_delimiters: frozenset[str] | None = None,
-):
+) -> BeamSearchDecoderCTC:
     """Get or create a cached CTC decoder for a given vocabulary.
-    
+
     Caches decoders by vocabulary to avoid rebuilding for lines with the same
     pruned vocabulary (common in batch processing with model-side pruning).
-    
+
     Args:
         vocab_tuple: vocabulary as a tuple (hashable for caching)
         word_delimiters: characters that trigger word boundaries.
@@ -102,6 +106,14 @@ GREEDY_CONFIDENCE_THRESHOLD = -0.5
 
 # Blank index in vocabulary (blank is always first token)
 BLANK_IDX = 0
+
+
+def _resolve_decode_params(
+    beam_width: int | None,
+    token_min_logp: float | None,
+) -> tuple[int, float]:
+    """Resolve beam width and token min log prob to module defaults."""
+    return beam_width or BEAM_WIDTH, token_min_logp or TOKEN_MIN_LOGP
 
 
 def _apply_log_softmax(logits: npt.NDArray) -> npt.NDArray:
@@ -141,15 +153,13 @@ def decode_logits_greedy(logits: npt.NDArray, vocab: list[str]) -> str:
     decoded = []
     prev = -1
     for idx in best_path:
-        if idx != prev and idx != 0:  # 0 is blank
+        if idx not in (prev, 0):  # 0 is blank
             decoded.append(vocab[idx])
         prev = idx
     return "".join(decoded)
 
 
-def _decode_logits_greedy_with_confidence_internal(
-    log_probs: npt.NDArray, vocab: list[str]
-) -> tuple[str, float]:
+def _decode_logits_greedy_with_confidence_internal(log_probs: npt.NDArray, vocab: list[str]) -> tuple[str, float]:
     """
     Greedy CTC decode with confidence score (internal, expects log probabilities).
 
@@ -169,7 +179,7 @@ def _decode_logits_greedy_with_confidence_internal(
     scores = []
     prev = -1
     for i, idx in enumerate(best_path):
-        if idx != prev and idx != 0:  # 0 is blank
+        if idx not in (prev, 0):  # 0 is blank
             decoded.append(vocab[idx])
             scores.append(best_log_probs[i])
         prev = idx
@@ -177,17 +187,13 @@ def _decode_logits_greedy_with_confidence_internal(
     text = "".join(decoded)
 
     # Confidence is mean log probability of decoded tokens
-    if scores:
-        confidence = float(np.mean(scores))
-    else:
-        # Empty decode - low confidence
-        confidence = -float("inf")
+    confidence = float(np.mean(scores)) if scores else -float("inf")
 
     return text, confidence
 
 
 def decode_logits_greedy_with_confidence(
-    logits: npt.NDArray, vocab: list[str], logits_are_log_probs: bool = True
+    logits: npt.NDArray, vocab: list[str], *, logits_are_log_probs: bool = True
 ) -> tuple[str, float]:
     """
     Greedy CTC decode with confidence score.
@@ -203,10 +209,7 @@ def decode_logits_greedy_with_confidence(
     Returns:
         Tuple of (decoded text, confidence score as mean log prob)
     """
-    if logits_are_log_probs:
-        log_probs = logits
-    else:
-        log_probs = _apply_log_softmax(logits)
+    log_probs = _prepare_logits(logits, logits_are_log_probs=logits_are_log_probs)
     return _decode_logits_greedy_with_confidence_internal(log_probs, vocab)
 
 
@@ -216,6 +219,7 @@ def decode_logits_hybrid_global(
     confidence_threshold: float | None = None,
     beam_width: int | None = None,
     token_min_logp: float | None = None,
+    *,
     logits_are_log_probs: bool = True,
 ) -> str:
     """
@@ -237,14 +241,8 @@ def decode_logits_hybrid_global(
     Returns:
         Decoded text string
     """
-    if confidence_threshold is None:
-        confidence_threshold = GREEDY_CONFIDENCE_THRESHOLD
-
-    # Use log probs directly if already converted, otherwise apply log_softmax
-    if logits_are_log_probs:
-        log_probs = logits
-    else:
-        log_probs = _apply_log_softmax(logits)
+    confidence_threshold = confidence_threshold or GREEDY_CONFIDENCE_THRESHOLD
+    log_probs = _prepare_logits(logits, logits_are_log_probs=logits_are_log_probs)
 
     # Try greedy first (using already-converted log probs)
     text, confidence = _decode_logits_greedy_with_confidence_internal(log_probs, vocab)
@@ -254,9 +252,7 @@ def decode_logits_hybrid_global(
         return text
 
     # Fall back to beam search for low-confidence lines
-    return _decode_logits_beam_search_internal(
-        log_probs, vocab, beam_width=beam_width, token_min_logp=token_min_logp
-    )
+    return _decode_logits_beam_search_internal(log_probs, vocab, beam_width, token_min_logp)
 
 
 def _init_global_decoder(
@@ -264,7 +260,7 @@ def _init_global_decoder(
     word_delimiters: Collection[str] | None = None,
 ) -> None:
     """Initialize the global decoder for use in worker processes.
-    
+
     Args:
         vocab: vocabulary list
         word_delimiters: characters that trigger word boundaries.
@@ -272,7 +268,7 @@ def _init_global_decoder(
                         Use TIBETAN_WORD_DELIMITERS for syllable-level decoding.
     """
     global _GLOBAL_DECODER, _GLOBAL_VOCAB_LEN
-    if _GLOBAL_DECODER is None or _GLOBAL_VOCAB_LEN != len(vocab):
+    if _GLOBAL_DECODER is None or len(vocab) != _GLOBAL_VOCAB_LEN:
         if word_delimiters is None:
             word_delimiters = DEFAULT_WORD_DELIMITERS
         _GLOBAL_DECODER = build_ctcdecoder(vocab, word_delimiters=word_delimiters)
@@ -307,14 +303,8 @@ def _decode_logits_beam_search_internal(
         beam_width: beam width for decoding (defaults to module BEAM_WIDTH)
         token_min_logp: token min log prob (defaults to module TOKEN_MIN_LOGP)
     """
-    import time
 
-    # Use passed values or fall back to module defaults
-    if beam_width is None:
-        beam_width = BEAM_WIDTH
-    if token_min_logp is None:
-        token_min_logp = TOKEN_MIN_LOGP
-
+    beam_width, token_min_logp = _resolve_decode_params(beam_width, token_min_logp)
     t0 = time.perf_counter()
     orig_shape = log_probs.shape
 
@@ -323,15 +313,12 @@ def _decode_logits_beam_search_internal(
     decoder = _get_cached_decoder(vocab_tuple)
     t1 = time.perf_counter()
 
-    result = decoder.decode(
-        log_probs, beam_width=beam_width, token_min_logp=token_min_logp,
-        logits_are_log_probs=True
-    )
+    result = decoder.decode(log_probs, beam_width=beam_width, token_min_logp=token_min_logp, logits_are_log_probs=True)
     t2 = time.perf_counter()
 
-    logging.info(
+    logger.info(
         f"[CTC timing] shape={orig_shape}, vocab={len(vocab)}, "
-        f"build_decoder={1000*(t1-t0):.1f}ms, decode={1000*(t2-t1):.1f}ms"
+        f"build_decoder={1000 * (t1 - t0):.1f}ms, decode={1000 * (t2 - t1):.1f}ms"
     )
     return result.replace(_GLOBAL_BLANK_SIGN, "")
 
@@ -341,6 +328,7 @@ def decode_logits_beam_search(
     vocab: list[str],
     beam_width: int | None = None,
     token_min_logp: float | None = None,
+    *,
     logits_are_log_probs: bool = True,
 ) -> str:
     """
@@ -360,21 +348,22 @@ def decode_logits_beam_search(
         logits_are_log_probs: if True (default), logits are already log probabilities from model.
                               If False, apply log_softmax here.
     """
-    import time
 
     t0 = time.perf_counter()
 
     # Apply log_softmax only if not already done (e.g., model already applied it)
-    if logits_are_log_probs:
-        log_probs = logits
-    else:
-        log_probs = _apply_log_softmax(logits)
-        t_softmax = time.perf_counter()
-        logging.info(f"[CTC timing] softmax={1000*(t_softmax-t0):.1f}ms for shape {logits.shape}")
+    log_probs = logits if logits_are_log_probs else _apply_log_softmax(logits)
 
-    return _decode_logits_beam_search_internal(
-        log_probs, vocab, beam_width, token_min_logp
-    )
+    if not logits_are_log_probs:
+        t_softmax = time.perf_counter()
+        logger.info(f"[CTC timing] softmax={1000 * (t_softmax - t0):.1f}ms for shape {logits.shape}")
+
+    return _decode_logits_beam_search_internal(log_probs, vocab, beam_width, token_min_logp)
+
+
+def _prepare_logits(logits: npt.NDArray, *, logits_are_log_probs: bool = True) -> npt.NDArray:
+    """Prepare logits for decoding by applying log_softmax if needed."""
+    return logits if logits_are_log_probs else _apply_log_softmax(logits)
 
 
 def _split_into_syllables(
@@ -383,54 +372,52 @@ def _split_into_syllables(
 ) -> list[tuple[str, str]]:
     """
     Split text into syllables, returning (clean_syllable, trailing_delimiters) pairs.
-    
+
     This handles Tibetan text where delimiters follow syllables:
     "བཀྲ་ཤིས།" -> [("བཀྲ", "་"), ("ཤིས", "།")]
-    
+
     Args:
         text: Full decoded text
         delimiters: Set of delimiter characters
-    
+
     Returns:
         List of (syllable, trailing_delimiters) tuples
     """
     if not text:
         return []
-    
+
     result = []
     current_syllable = ""
     current_delimiters = ""
-    
+
     for char in text:
         if char in delimiters:
             # This is a delimiter
             if current_syllable:
                 # Accumulate delimiter after the syllable
                 current_delimiters += char
+            # Delimiter at start or consecutive - add to previous or skip
+            elif result:
+                # Add to previous syllable's delimiters
+                prev_syl, prev_delim = result[-1]
+                result[-1] = (prev_syl, prev_delim + char)
             else:
-                # Delimiter at start or consecutive - add to previous or skip
-                if result:
-                    # Add to previous syllable's delimiters
-                    prev_syl, prev_delim = result[-1]
-                    result[-1] = (prev_syl, prev_delim + char)
-                else:
-                    # Leading delimiter - skip or treat as part of first syllable
-                    current_delimiters += char
+                # Leading delimiter - skip or treat as part of first syllable
+                current_delimiters += char
+        # This is a regular character
+        elif current_syllable and current_delimiters:
+            # We have a complete syllable with delimiters, save it
+            result.append((current_syllable, current_delimiters))
+            current_syllable = char
+            current_delimiters = ""
         else:
-            # This is a regular character
-            if current_syllable and current_delimiters:
-                # We have a complete syllable with delimiters, save it
-                result.append((current_syllable, current_delimiters))
-                current_syllable = char
-                current_delimiters = ""
-            else:
-                # Continue building current syllable
-                current_syllable += char
-    
+            # Continue building current syllable
+            current_syllable += char
+
     # Don't forget the last syllable
     if current_syllable or current_delimiters:
         result.append((current_syllable, current_delimiters))
-    
+
     return result
 
 
@@ -440,15 +427,15 @@ def _compute_segment_confidences(
 ) -> list[float]:
     """
     Compute per-segment confidence from frame log probabilities.
-    
+
     For each segment, computes the mean of the maximum log probability
     at each frame. This represents "how confident was the model about
     its best choice at each timestep within this segment?"
-    
+
     Args:
         log_probs: shape (num_frames, vocab_size) - log probabilities
         text_frames: list of (word_text, (start_frame, end_frame)) from decoder
-    
+
     Returns:
         List of confidence scores (one per segment), each is mean log prob
     """
@@ -457,18 +444,85 @@ def _compute_segment_confidences(
         if end_frame <= start_frame:
             confidences.append(float("-inf"))
             continue
-        
+
         # Get the log probs for frames in this segment
         segment_log_probs = log_probs[start_frame:end_frame]
-        
+
         # Max log prob at each frame (confidence in best token)
         max_per_frame = segment_log_probs.max(axis=1)
-        
+
         # Average log probability for this segment
         segment_confidence = float(max_per_frame.mean())
         confidences.append(segment_confidence)
-    
+
     return confidences
+
+
+def _process_segments_from_beam(
+    full_text: str,
+    word_delimiters: frozenset[str],
+    best_beam: OutputBeam,
+    original_width: int,
+    num_frames: int,
+    log_probs: npt.NDArray,
+) -> list[SyllableSegment]:
+    """
+    Process syllable/word segments from beam search output.
+
+    This is shared between decode_logits_with_segments and CTCDecoder.decode_with_segments.
+    """
+    # Parse syllables from the full text using our delimiters
+    # This handles Tibetan properly (pyctcdecode's whitespace split doesn't work)
+    syllables = _split_into_syllables(full_text, word_delimiters)
+
+    # Get frame ranges - pyctcdecode stores these without the word text for non-space delimiters
+    # text_frames is List[(word, (start, end))] but the words may be wrong for non-space delimited text
+    frame_ranges = [frames for _, frames in best_beam.text_frames]
+
+    # If frame count doesn't match syllable count, fall back to distributing evenly
+    if len(frame_ranges) != len(syllables) and syllables:
+        # Distribute frames proportionally across syllables
+        total_frames = num_frames
+        syllable_lengths = [len(syl) + len(delim) for syl, delim in syllables]
+        total_chars = sum(syllable_lengths)
+        if total_chars > 0:
+            frame_ranges = []
+            current_frame = 0
+            for length in syllable_lengths:
+                frames_for_syllable = max(1, int(total_frames * length / total_chars))
+                frame_ranges.append((current_frame, current_frame + frames_for_syllable))
+                current_frame += frames_for_syllable
+
+    # Compute per-segment confidence from frame probabilities
+    # Create fake text_frames for confidence computation
+    fake_text_frames = [(syl, frames) for (syl, _), frames in zip(syllables, frame_ranges, strict=True)]
+    segment_confidences = _compute_segment_confidences(log_probs, fake_text_frames)
+
+    # Convert frames to pixels
+    pixels_per_frame = original_width / num_frames if num_frames > 0 else 1.0
+
+    segments: list[SyllableSegment] = []
+    for (syllable, trailing), (start_frame, end_frame), seg_conf in zip(
+        syllables, frame_ranges, segment_confidences, strict=True
+    ):
+        if not syllable and not trailing:
+            continue
+
+        # Convert frames to pixels
+        start_pixel = int(start_frame * pixels_per_frame)
+        end_pixel = int(end_frame * pixels_per_frame)
+
+        segments.append(
+            SyllableSegment(
+                start_pixel=start_pixel,
+                end_pixel=end_pixel,
+                text=syllable,
+                trailing_delimiters=trailing,
+                confidence=seg_conf,
+            )
+        )
+
+    return segments
 
 
 def decode_logits_with_segments(
@@ -477,6 +531,7 @@ def decode_logits_with_segments(
     original_width: int,
     beam_width: int | None = None,
     token_min_logp: float | None = None,
+    *,
     logits_are_log_probs: bool = True,
     word_delimiters: frozenset[str] | None = None,
 ) -> LineDecodeResult:
@@ -500,19 +555,9 @@ def decode_logits_with_segments(
     Returns:
         LineDecodeResult with text, segments, and confidence scores
     """
-    if beam_width is None:
-        beam_width = BEAM_WIDTH
-    if token_min_logp is None:
-        token_min_logp = TOKEN_MIN_LOGP
-    if word_delimiters is None:
-        word_delimiters = DEFAULT_WORD_DELIMITERS
-
-    # Apply log_softmax only if not already done
-    if logits_are_log_probs:
-        log_probs = logits
-    else:
-        log_probs = _apply_log_softmax(logits)
-
+    beam_width, token_min_logp = _resolve_decode_params(beam_width, token_min_logp)
+    word_delimiters = word_delimiters or DEFAULT_WORD_DELIMITERS
+    log_probs = _prepare_logits(logits, logits_are_log_probs=logits_are_log_probs)
     num_frames = log_probs.shape[0]
 
     # Get cached decoder
@@ -524,7 +569,7 @@ def decode_logits_with_segments(
         log_probs,
         beam_width=beam_width,
         token_min_logp=token_min_logp,
-        logits_are_log_probs=True,
+        logits_are_log_probs=logits_are_log_probs,
     )
 
     if not output_beams:
@@ -543,54 +588,8 @@ def decode_logits_with_segments(
     # Calculate overall line confidence (normalized by number of frames)
     line_confidence = logit_score / num_frames if num_frames > 0 else float("-inf")
 
-    # Parse syllables from the full text using our delimiters
-    # This handles Tibetan properly (pyctcdecode's whitespace split doesn't work)
-    syllables = _split_into_syllables(full_text, word_delimiters)
-    
-    # Get frame ranges - pyctcdecode stores these without the word text for non-space delimiters
-    # text_frames is List[(word, (start, end))] but the words may be wrong for non-space delimited text
-    frame_ranges = [frames for _, frames in best_beam.text_frames]
-    
-    # If frame count doesn't match syllable count, fall back to distributing evenly
-    if len(frame_ranges) != len(syllables) and syllables:
-        # Distribute frames proportionally across syllables
-        total_frames = num_frames
-        syllable_lengths = [len(syl) + len(delim) for syl, delim in syllables]
-        total_chars = sum(syllable_lengths)
-        if total_chars > 0:
-            frame_ranges = []
-            current_frame = 0
-            for length in syllable_lengths:
-                frames_for_syllable = max(1, int(total_frames * length / total_chars))
-                frame_ranges.append((current_frame, current_frame + frames_for_syllable))
-                current_frame += frames_for_syllable
-    
-    # Compute per-segment confidence from frame probabilities
-    # Create fake text_frames for confidence computation
-    fake_text_frames = [(syl, frames) for (syl, _), frames in zip(syllables, frame_ranges)]
-    segment_confidences = _compute_segment_confidences(log_probs, fake_text_frames)
-
-    # Convert frames to pixels
-    pixels_per_frame = original_width / num_frames if num_frames > 0 else 1.0
-
-    segments: list[SyllableSegment] = []
-    for (syllable, trailing), (start_frame, end_frame), seg_conf in zip(
-        syllables, frame_ranges, segment_confidences
-    ):
-        if not syllable and not trailing:
-            continue
-
-        # Convert frames to pixels
-        start_pixel = int(start_frame * pixels_per_frame)
-        end_pixel = int(end_frame * pixels_per_frame)
-
-        segments.append(SyllableSegment(
-            start_pixel=start_pixel,
-            end_pixel=end_pixel,
-            text=syllable,
-            trailing_delimiters=trailing,
-            confidence=seg_conf,
-        ))
+    # Process segments using shared helper function
+    segments = _process_segments_from_beam(full_text, word_delimiters, best_beam, original_width, num_frames, log_probs)
 
     return LineDecodeResult(
         text=full_text,
@@ -606,11 +605,12 @@ class CTCDecoder:
     def __init__(
         self,
         charset: str | list[str],
+        *,
         add_blank: bool,
         word_delimiters: Collection[str] | None = None,
-    ):
+    ) -> None:
         """Initialize CTC decoder.
-        
+
         Args:
             charset: character set as string or list
             add_blank: whether to add blank token at index 0
@@ -639,13 +639,18 @@ class CTCDecoder:
             self.word_delimiters = frozenset(word_delimiters)
 
         # Build beam search decoder with word delimiters
-        self._beam_decoder = build_ctcdecoder(
-            self.ctc_vocab, word_delimiters=self.word_delimiters
-        )
+        self._beam_decoder = build_ctcdecoder(self.ctc_vocab, word_delimiters=self.word_delimiters)
 
-    def decode(
-        self, logits: npt.NDArray, logits_are_log_probs: bool = True
-    ) -> str:
+    def _prepare_logits_for_decode(self, logits: npt.NDArray, *, logits_are_log_probs: bool = True) -> npt.NDArray:
+        """Prepare logits for decoding by ensuring correct shape and applying log_softmax."""
+        # Ensure shape is (time, vocab)
+        vocab_size = len(self.ctc_vocab)
+        if logits.shape[0] == vocab_size:
+            logits = np.transpose(logits, axes=[1, 0])
+
+        return _prepare_logits(logits, logits_are_log_probs=logits_are_log_probs)
+
+    def decode(self, logits: npt.NDArray, *, logits_are_log_probs: bool = True) -> str:
         """Decode logits to text using beam search.
 
         Vocabulary pruning is now handled in the model before IPC.
@@ -654,25 +659,16 @@ class CTCDecoder:
             logits: shape (time, vocab) or (vocab, time) - log probabilities (or raw logits)
             logits_are_log_probs: if True (default), logits are already log probabilities
         """
-        # Ensure shape is (time, vocab)
-        if logits.shape[0] == len(self.ctc_vocab):
-            logits = np.transpose(logits, axes=[1, 0])
-
-        # Apply log_softmax only if not already done
-        if logits_are_log_probs:
-            log_probs = logits
-        else:
-            log_probs = _apply_log_softmax(logits)
-
+        log_probs = self._prepare_logits_for_decode(logits, logits_are_log_probs=logits_are_log_probs)
         return self._beam_decoder.decode(
-            log_probs, beam_width=BEAM_WIDTH, token_min_logp=TOKEN_MIN_LOGP,
-            logits_are_log_probs=True
+            log_probs, beam_width=BEAM_WIDTH, token_min_logp=TOKEN_MIN_LOGP, logits_are_log_probs=True
         ).replace(self.blank_sign, "")
 
     def decode_with_segments(
         self,
         logits: npt.NDArray,
         original_width: int,
+        *,
         logits_are_log_probs: bool = True,
         beam_width: int | None = None,
         token_min_logp: float | None = None,
@@ -694,21 +690,8 @@ class CTCDecoder:
         Returns:
             LineDecodeResult with text, segments, and confidence scores
         """
-        if beam_width is None:
-            beam_width = BEAM_WIDTH
-        if token_min_logp is None:
-            token_min_logp = TOKEN_MIN_LOGP
-
-        # Ensure shape is (time, vocab)
-        if logits.shape[0] == len(self.ctc_vocab):
-            logits = np.transpose(logits, axes=[1, 0])
-
-        # Apply log_softmax only if not already done
-        if logits_are_log_probs:
-            log_probs = logits
-        else:
-            log_probs = _apply_log_softmax(logits)
-
+        beam_width, token_min_logp = _resolve_decode_params(beam_width, token_min_logp)
+        log_probs = self._prepare_logits_for_decode(logits, logits_are_log_probs=logits_are_log_probs)
         num_frames = log_probs.shape[0]
 
         # Use decode_beams to get frame information
@@ -733,53 +716,12 @@ class CTCDecoder:
         logit_score = best_beam.logit_score
 
         # Calculate overall line confidence (normalized by number of frames)
-        # logit_score is cumulative log probability; normalize by frames for comparability
         line_confidence = logit_score / num_frames if num_frames > 0 else float("-inf")
 
-        # Parse syllables from the full text using our delimiters
-        syllables = _split_into_syllables(full_text, self.word_delimiters)
-        
-        # Get frame ranges from pyctcdecode output
-        frame_ranges = [frames for _, frames in best_beam.text_frames]
-        
-        # If frame count doesn't match syllable count, distribute evenly
-        if len(frame_ranges) != len(syllables) and syllables:
-            total_frames = num_frames
-            syllable_lengths = [len(syl) + len(delim) for syl, delim in syllables]
-            total_chars = sum(syllable_lengths)
-            if total_chars > 0:
-                frame_ranges = []
-                current_frame = 0
-                for length in syllable_lengths:
-                    frames_for_syllable = max(1, int(total_frames * length / total_chars))
-                    frame_ranges.append((current_frame, current_frame + frames_for_syllable))
-                    current_frame += frames_for_syllable
-        
-        # Compute per-segment confidence from frame probabilities
-        fake_text_frames = [(syl, frames) for (syl, _), frames in zip(syllables, frame_ranges)]
-        segment_confidences = _compute_segment_confidences(log_probs, fake_text_frames)
-
-        # Convert frames to pixels
-        pixels_per_frame = original_width / num_frames if num_frames > 0 else 1.0
-
-        segments: list[SyllableSegment] = []
-        for (syllable, trailing), (start_frame, end_frame), seg_conf in zip(
-            syllables, frame_ranges, segment_confidences
-        ):
-            if not syllable and not trailing:
-                continue
-
-            # Convert frames to pixels
-            start_pixel = int(start_frame * pixels_per_frame)
-            end_pixel = int(end_frame * pixels_per_frame)
-
-            segments.append(SyllableSegment(
-                start_pixel=start_pixel,
-                end_pixel=end_pixel,
-                text=syllable,
-                trailing_delimiters=trailing,
-                confidence=seg_conf,
-            ))
+        # Process segments using shared helper function
+        segments = _process_segments_from_beam(
+            full_text, self.word_delimiters, best_beam, original_width, num_frames, log_probs
+        )
 
         return LineDecodeResult(
             text=full_text,

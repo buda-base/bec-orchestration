@@ -13,9 +13,11 @@ All stages connected by bounded asyncio.Queue for backpressure.
 
 import asyncio
 import logging
+import os
 import time
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING, Optional
 
 import cv2
@@ -351,6 +353,7 @@ class AsyncOCRPipeline:
         use_line_prepadding: bool = True,
         merge_line_segments: bool = True,
         line_merge_threshold: float | None = None,
+        debug_output_dir: str | None = None,
     ):
         self.ocr_model = ocr_model
         self.ctc_decoder = ctc_decoder
@@ -374,6 +377,7 @@ class AsyncOCRPipeline:
         self.line_merge_threshold = line_merge_threshold
         self.kenlm_path = kenlm_path
         self.use_line_prepadding = use_line_prepadding
+        self.debug_output_dir = debug_output_dir
         self._nemo_decoder = None  # Lazy init when needed
 
         # Bounded queues for backpressure
@@ -880,7 +884,7 @@ class AsyncOCRPipeline:
         # weirdly, not rebinarizing already binary images gives different results...
         skip_binarization = False # is_binary and not was_transformed
 
-        for contour_points in contours:
+        for line_idx, contour_points in enumerate(contours):
             line_img, current_k = self._extract_line(image, contour_points, current_k, mask_buffer)
             if line_img is None:
                 line_tensors.append((np.zeros((1, self.input_height, self.input_width), dtype=np.float32), 1, 0))
@@ -890,6 +894,8 @@ class AsyncOCRPipeline:
                 line_img,
                 skip_binarization=skip_binarization,
                 use_prepadding=self.use_line_prepadding,
+                debug_filename=fetched.filename if self.debug_output_dir else None,
+                debug_line_idx=line_idx if self.debug_output_dir else None,
             )
             line_tensors.append((tensor, content_width, left_pad_width))
 
@@ -923,7 +929,12 @@ class AsyncOCRPipeline:
         return line_img, adapted_k
 
     def _preprocess_line(
-        self, image: npt.NDArray, skip_binarization: bool = False, use_prepadding: bool = True
+        self,
+        image: npt.NDArray,
+        skip_binarization: bool = False,
+        use_prepadding: bool = True,
+        debug_filename: str | None = None,
+        debug_line_idx: int | None = None,
     ) -> tuple[npt.NDArray, int, int]:
         """Preprocess line image to tensor.
         
@@ -931,6 +942,8 @@ class AsyncOCRPipeline:
             image: Line image (grayscale, may be 2D or 3D with 1 channel)
             skip_binarization: If True, skip binarization (image is already binary and untransformed)
             use_prepadding: If True, add h pixels of padding on left and right before resizing
+            debug_filename: If provided (along with debug_output_dir), save debug images
+            debug_line_idx: Line index for debug filename
             
         Returns:
             Tuple of (tensor, content_width, left_pad_width) where:
@@ -997,6 +1010,16 @@ class AsyncOCRPipeline:
             binary = padded
         else:
             binary = adaptive_binarize(padded)
+
+        # Debug: save preprocessed line images
+        if self.debug_output_dir and debug_filename is not None and debug_line_idx is not None:
+            debug_dir = Path(self.debug_output_dir)
+            debug_dir.mkdir(parents=True, exist_ok=True)
+            # Create a safe filename from the original
+            safe_name = Path(debug_filename).stem.replace("/", "_").replace("\\", "_")
+            # Save the preprocessed (binarized) line
+            out_path = debug_dir / f"{safe_name}_L{debug_line_idx:02d}.png"
+            cv2.imwrite(str(out_path), binary)
 
         # Normalize
         tensor = binary.reshape((1, target_h, target_w)).astype(np.float32)

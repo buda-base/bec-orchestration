@@ -249,6 +249,11 @@ def main():
         action="store_true",
         help="Generate reference parquet with max accuracy settings (beam=100, no pruning)",
     )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Save preprocessed line images to debug_output folder for inspection",
+    )
     args = parser.parse_args()
 
     # Reference mode settings (will be applied to worker after initialization)
@@ -335,6 +340,11 @@ def main():
     worker.use_nemo_decoder = False
     worker.use_sequential_pipeline = True
     worker.kenlm_path = os.path.join(os.environ.get("BEC_OCR_MODEL_DIR", "ocr_models"), "tibetan_5gram.binary")
+
+    # Debug mode - save preprocessed lines to debug_output folder
+    if args.debug:
+        worker.debug_output_dir = "debug_output"
+        logger.info(f"Debug mode enabled - preprocessed lines will be saved to {worker.debug_output_dir}/")
 
     # Log actual settings that will be used
     logger.info("=== CTC Decoder Settings ===")

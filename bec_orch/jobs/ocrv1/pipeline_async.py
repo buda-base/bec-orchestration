@@ -358,25 +358,32 @@ class AsyncOCRPipeline:
                 pages_tasks[page_idx] = []
             pages_tasks[page_idx].append((line_idx, cropped, inferred, keep_indices))
         
-        # Process each page
+        # Process all lines
         futures = []
-        for page_idx in sorted(pages_tasks.keys()):
-            page_tasks = pages_tasks[page_idx]
+        if self.cfg.use_nemo_decoder:
+            # NeMo GPU decoder - batch ALL lines together for maximum efficiency
+            all_cropped_logits = []
+            all_line_info = []  # (page_idx, line_idx, inferred, submit_time)
             
-            if self.cfg.use_nemo_decoder:
-                # NeMo GPU decoder - batch all lines on page
-                logger.info(f"[Phase 2] Using NeMo GPU decoder for page {page_idx} ({len(page_tasks)} lines)")
-                cropped_logits_list = [cropped for _, cropped, _, _ in page_tasks]
-                texts = self._nemo_decoder.decode_batch(cropped_logits_list)
-                
-                # Create futures with results
-                for i, (line_idx, _, inferred, _) in enumerate(page_tasks):
+            for page_idx in sorted(pages_tasks.keys()):
+                page_tasks = pages_tasks[page_idx]
+                for line_idx, cropped, inferred, keep_indices in page_tasks:
+                    all_cropped_logits.append(cropped)
                     submit_time = time.perf_counter()
-                    future = loop.create_future()
-                    future.set_result((texts[i], 0, 0, "nemo"))
-                    futures.append((page_idx, line_idx, future, inferred, submit_time))
-            else:
-                # ProcessPoolExecutor - submit each line individually
+                    all_line_info.append((page_idx, line_idx, inferred, submit_time))
+            
+            logger.info(f"[Phase 2] Using NeMo GPU decoder for ALL {len(all_cropped_logits)} lines in one batch")
+            texts = self._nemo_decoder.decode_batch(all_cropped_logits)
+            
+            # Create futures with results
+            for i, (page_idx, line_idx, inferred, submit_time) in enumerate(all_line_info):
+                future = loop.create_future()
+                future.set_result((texts[i], 0, 0, "nemo"))
+                futures.append((page_idx, line_idx, future, inferred, submit_time))
+        else:
+            # ProcessPoolExecutor - submit each line individually
+            for page_idx in sorted(pages_tasks.keys()):
+                page_tasks = pages_tasks[page_idx]
                 for line_idx, cropped, inferred, keep_indices in page_tasks:
                     submit_time = time.perf_counter()
                     pruned_vocab = [vocab[i] for i in keep_indices] if keep_indices is not None else vocab

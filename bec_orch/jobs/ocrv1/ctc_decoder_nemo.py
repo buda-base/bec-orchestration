@@ -97,8 +97,6 @@ class CTCDecoderNemo:
                 
                 pyctcdecode_cfg = PyCTCDecodeConfig(
                     beam_width=beam_width,
-                    beam_prune_logp=-10.0,
-                    token_min_logp=-5.0,
                 )
                 
                 self._decoder = BeamCTCInfer(

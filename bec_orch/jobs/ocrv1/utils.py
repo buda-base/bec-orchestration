@@ -15,7 +15,7 @@ def get_execution_providers() -> list[str]:
     Returns:
         List of execution provider names to use
     """
-    available = ort.get_available_providers()
+    available = ort.get_available_providers()  # ty:ignore[possibly-missing-attribute]
     logger.info("Available ONNX providers: %s", available)
 
     # Prefer CUDA over TensorRT (TensorRT often has library issues)

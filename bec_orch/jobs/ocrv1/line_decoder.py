@@ -18,8 +18,9 @@ import cv2
 import numpy as np
 import numpy.typing as npt
 
-from ..ldv1.img_helpers import adaptive_binarize, apply_transform_1
-from ..shared.decoder import bytes_to_frame
+from bec_orch.jobs.ldv1.img_helpers import adaptive_binarize, apply_transform_1
+from bec_orch.jobs.shared.decoder import bytes_to_frame
+
 from .line import get_line_image
 
 if TYPE_CHECKING:
@@ -86,23 +87,23 @@ class LineSegment:
     """A line segment with its contour and bounding box info."""
 
     contour: npt.NDArray  # NumPy array of points
-    contour_dict: list[dict]  # Original dict format [{x, y}, ...]
+    contour_dict: list[dict[str, int]]  # Original dict format [{x, y}, ...]
     bbox: tuple[int, int, int, int]  # (x, y, w, h)
     center: tuple[float, float]  # (cx, cy) center of bbox
 
 
-def _build_line_segment(contour: list[dict] | npt.NDArray) -> LineSegment:
+def _build_line_segment(contour: list[dict[str, int]] | npt.NDArray) -> LineSegment:
     """Build a LineSegment from a contour (dict list or numpy array)."""
     # Convert to numpy if needed
     if isinstance(contour, list):
-        contour_dict = contour
+        contour_dict: list[dict[str, int]] = [{"x": p["x"], "y": p["y"]} for p in contour]
         pts = np.array([[p["x"], p["y"]] for p in contour], dtype=np.int32)
     else:
         # Normalize shape to (N, 1, 2) for cv2 compatibility
         if contour.ndim == 2:
             contour = contour.reshape(-1, 1, 2)
         pts = contour.reshape(-1, 2)
-        contour_dict = [{"x": int(pt[0]), "y": int(pt[1])} for pt in pts]
+        contour_dict: list[dict[str, int]] = [{"x": int(pt[0]), "y": int(pt[1])} for pt in pts]
 
     x, y, w, h = cv2.boundingRect(pts)
     cx = x + w / 2.0
@@ -262,7 +263,7 @@ class LineDecoder:
         ld_row = fetched.ld_row
 
         # Decode image
-        image, is_binary, orig_h, orig_w = bytes_to_frame(
+        image, _, orig_h, orig_w = bytes_to_frame(
             fetched.filename,
             fetched.file_bytes,
             max_width=self.cfg.max_image_width,

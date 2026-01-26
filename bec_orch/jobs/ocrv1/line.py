@@ -8,6 +8,8 @@ This module contains functions for:
 - Rotation angle calculation from line orientations
 """
 
+import logging
+
 import cv2
 import numpy as np
 import numpy.typing as npt
@@ -15,6 +17,8 @@ import numpy.typing as npt
 # Constants
 GRAYSCALE_NDIM = 2
 MIN_K_FACTOR = 0.1
+
+logger = logging.getLogger(__name__)
 
 
 def mask_n_crop(image: npt.NDArray, mask: npt.NDArray) -> npt.NDArray:
@@ -93,9 +97,9 @@ def get_line_image(
             attempts += 1
 
         return line_img, tmp_k  # noqa: TRY300
-    except (cv2.error, ValueError) as e:
+    except (cv2.error, ValueError):
         # Return a minimal valid image and the original k_factor in case of error
-        print(f"Error in get_line_image: {e}")
+        logger.exception("Error in get_line_image")
         # Create a small blank image as fallback
         fallback_img = np.zeros((bbox_h, bbox_h * 2, 3), dtype=np.uint8)
         return fallback_img, k_factor

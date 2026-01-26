@@ -33,7 +33,7 @@ class StreamingParquetWriter:
     This avoids accumulating all records in memory before writing.
     """
 
-    def __init__(self, uri: str, batch_size: int = 100):
+    def __init__(self, uri: str, batch_size: int = 100) -> None:
         self.uri = uri
         self.batch_size = batch_size
         self.schema = ocr_build_schema()
@@ -44,7 +44,7 @@ class StreamingParquetWriter:
         self._writer: pq.ParquetWriter | None = None
         self._file = None
 
-    def _open_writer(self):
+    def _open_writer(self) -> None:
         """Open the parquet writer lazily on first write."""
         s3_path = self.uri.replace("s3://", "")
         self._file = self._s3.open(s3_path, "wb")

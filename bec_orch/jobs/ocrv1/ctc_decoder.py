@@ -64,12 +64,7 @@ logging.getLogger("pyctcdecode.alphabet").setLevel(logging.ERROR)
 
 logger = logging.getLogger("ctc_decoder")
 
-# Global decoder instance for multiprocessing (avoids pickling issues)
-_GLOBAL_DECODER = None
-_GLOBAL_VOCAB_LEN = None  # Use length for fast comparison
 _GLOBAL_BLANK_SIGN = "<pad>"
-
-# Import word delimiters from config (canonical location)
 
 
 @lru_cache(maxsize=32)
@@ -267,12 +262,10 @@ def _init_global_decoder(
                         Default is space-only for backward compatibility.
                         Use TIBETAN_WORD_DELIMITERS for syllable-level decoding.
     """
-    global _GLOBAL_DECODER, _GLOBAL_VOCAB_LEN
-    if _GLOBAL_DECODER is None or len(vocab) != _GLOBAL_VOCAB_LEN:
-        if word_delimiters is None:
-            word_delimiters = DEFAULT_WORD_DELIMITERS
-        _GLOBAL_DECODER = build_ctcdecoder(vocab, word_delimiters=word_delimiters)
-        _GLOBAL_VOCAB_LEN = len(vocab)
+    # Pre-warm the cache with the decoder for this worker process
+    vocab_tuple = tuple(vocab)
+    word_delimiters_frozenset = frozenset(word_delimiters) if word_delimiters else None
+    _get_cached_decoder(vocab_tuple, word_delimiters_frozenset)
 
 
 def init_worker_process(vocab: list[str]) -> None:

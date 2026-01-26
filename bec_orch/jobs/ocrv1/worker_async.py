@@ -5,6 +5,7 @@ Uses asyncio for high-concurrency S3 prefetching with backpressure.
 """
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -14,13 +15,17 @@ from typing import TYPE_CHECKING
 
 import boto3
 import pyarrow.parquet as pq
+import s3fs
 from botocore.config import Config as BotoConfig
 
+from bec_orch.core.models import TaskResult
+from bec_orch.errors import TerminalTaskError
+from bec_orch.jobs.shared.memory_monitor import log_memory_snapshot
+
 if TYPE_CHECKING:
-    from bec_orch.core.models import TaskResult
     from bec_orch.jobs.base import JobContext
 
-from .config import OCRV1Config, DEFAULT_WORD_DELIMITERS, TIBETAN_WORD_DELIMITERS
+from .config import TIBETAN_WORD_DELIMITERS, OCRV1Config
 from .ctc_decoder import CTCDecoder
 from .model import OCRModel
 from .pipeline_async import AsyncOCRPipeline
@@ -36,9 +41,9 @@ class OCRV1JobWorkerAsync:
     CPU-bound image processing and CTC decoding.
     """
 
-    def __init__(self, cfg: OCRV1Config | None = None):
+    def __init__(self, cfg: OCRV1Config | None = None) -> None:
         """Initialize the OCR worker.
-        
+
         Args:
             cfg: OCRV1Config with all configuration options.
                  If None, a default config is created from model dimensions.
@@ -58,7 +63,7 @@ class OCRV1JobWorkerAsync:
 
         logger.info(f"Loading OCR model config from: {config_path}")
 
-        with open(config_path, "r", encoding="utf-8") as f:
+        with config_path.open(encoding="utf-8") as f:
             model_config = json.load(f)
 
         onnx_model_file = model_dir_path / model_config["onnx-model"]
@@ -79,7 +84,7 @@ class OCRV1JobWorkerAsync:
             # Update config with model dimensions
             cfg.input_width = input_width
             cfg.input_height = input_height
-        
+
         self.cfg = cfg
 
         logger.info(f"Loading OCR model: {onnx_model_file}")
@@ -103,10 +108,8 @@ class OCRV1JobWorkerAsync:
             f"  Word delimiters: {len(cfg.word_delimiters)} chars "
             f"({'Tibetan syllable' if cfg.word_delimiters == TIBETAN_WORD_DELIMITERS else 'space-only'})"
         )
-        
-        self.ctc_decoder = CTCDecoder(
-            charset=charset, add_blank=add_blank, word_delimiters=cfg.word_delimiters
-        )
+
+        self.ctc_decoder = CTCDecoder(charset=charset, add_blank=add_blank, word_delimiters=cfg.word_delimiters)
 
         self.ld_bucket = os.environ.get("BEC_LD_BUCKET", "bec.bdrc.io")
         self.source_image_bucket = os.environ.get("BEC_SOURCE_IMAGE_BUCKET", "archive.tbrc.org")
@@ -125,10 +128,6 @@ class OCRV1JobWorkerAsync:
         return asyncio.run(self._run_async(ctx))
 
     async def _run_async(self, ctx: "JobContext") -> "TaskResult":
-        from bec_orch.core.models import TaskResult
-        from bec_orch.errors import TerminalTaskError
-        from bec_orch.jobs.shared.memory_monitor import log_memory_snapshot
-
         logger.info(f"Starting OCRV1 async job for volume {ctx.volume.w_id}/{ctx.volume.i_id}")
         start_time = time.time()
 
@@ -227,14 +226,10 @@ class OCRV1JobWorkerAsync:
         return f"s3://{ctx.artifacts_location.bucket}/{ctx.artifacts_location.prefix}/{ctx.artifacts_location.basename}.parquet"
 
     def _get_volume_prefix(self, ctx: "JobContext") -> str:
-        import hashlib
-
-        w_prefix = hashlib.md5(ctx.volume.w_id.encode()).hexdigest()[:2]
+        w_prefix = hashlib.md5(ctx.volume.w_id.encode()).hexdigest()[:2]  # noqa: S324
         return f"Works/{w_prefix}/{ctx.volume.w_id}/images/{ctx.volume.w_id}-{ctx.volume.i_id}"
 
     def _check_s3_exists(self, uri: str) -> bool:
-        import s3fs
-
         fs = s3fs.S3FileSystem()
         path = uri.replace("s3://", "")
         return fs.exists(path)

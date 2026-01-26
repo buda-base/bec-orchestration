@@ -14,10 +14,10 @@ logger = logging.getLogger(__name__)
 # Check if PyTorch with CUDA is available for GPU operations
 _TORCH_CUDA_AVAILABLE = False
 _torch = None
-_F = None
+_functional = None
 try:
     import torch as _torch
-    import torch.nn.functional as _F
+    import torch.nn.functional as _functional
 
     if _torch.cuda.is_available():
         _TORCH_CUDA_AVAILABLE = True
@@ -34,6 +34,7 @@ class OCRModel:
         model_file: str,
         input_layer: str,
         output_layer: str,
+        *,
         squeeze_channel: bool,
         swap_hw: bool,
         apply_log_softmax: bool = True,
@@ -84,11 +85,14 @@ class OCRModel:
         Returns:
             Tuple of (log_probs, keep_indices) where keep_indices is None if no pruning.
         """
+        if _torch is None or _functional is None:
+            raise RuntimeError("GPU operations requested but PyTorch is not available")
+
         # Convert to PyTorch tensor on GPU
         logits_tensor = _torch.from_numpy(logits).cuda()
 
         # Apply log_softmax on vocab axis
-        log_probs_tensor = _F.log_softmax(logits_tensor, dim=vocab_axis)
+        log_probs_tensor = _functional.log_softmax(logits_tensor, dim=vocab_axis)
 
         # Apply vocabulary pruning on GPU if threshold is set
         keep_indices = None
@@ -103,14 +107,15 @@ class OCRModel:
                 max_per_token = max_per_token.max(dim=0).values
 
             # Create mask for tokens above threshold (always keep blank at index 0)
-            keep_mask = max_per_token > self._vocab_prune_threshold
+            threshold_tensor = _torch.tensor(self._vocab_prune_threshold, device=log_probs_tensor.device)
+            keep_mask = max_per_token > threshold_tensor
             keep_mask[0] = True  # Always keep blank token
 
             # Get indices of kept tokens
             keep_indices = _torch.where(keep_mask)[0].cpu().numpy()
 
             # Prune vocabulary dimension
-            if logits.ndim == 2:
+            if logits.ndim == 2:  # noqa: SIM108
                 # (vocab, time) -> (pruned_vocab, time)
                 log_probs_tensor = log_probs_tensor[keep_mask, :]
             else:
@@ -150,7 +155,7 @@ class OCRModel:
             keep_indices = np.where(keep_mask)[0]
 
             # Prune vocabulary dimension
-            if logits.ndim == 2:
+            if logits.ndim == 2:  # noqa: SIM108
                 # (vocab, time) -> (pruned_vocab, time)
                 log_probs = log_probs[keep_mask, :]
             else:
@@ -246,15 +251,18 @@ class OCRModel:
         Returns:
             List of log_probs arrays (numpy, on CPU)
         """
+        if _torch is None or _functional is None:
+            raise RuntimeError("GPU operations requested but PyTorch is not available")
+
         log_probs_list = []
         for logits in logits_list:
             logits_tensor = _torch.from_numpy(logits).cuda()
-            log_probs_tensor = _F.log_softmax(logits_tensor, dim=0)  # vocab axis
+            log_probs_tensor = _functional.log_softmax(logits_tensor, dim=0)  # vocab axis
             log_probs_list.append(log_probs_tensor.cpu().numpy().astype(np.float32))
         return log_probs_list
 
     def _prune_batch_gpu(
-        self, processed_list: list[npt.NDArray], original_logits_list: list[npt.NDArray], apply_softmax: bool
+        self, processed_list: list[npt.NDArray], original_logits_list: list[npt.NDArray], *, apply_softmax: bool
     ) -> tuple[list[npt.NDArray], list[npt.NDArray | None]]:
         """Apply vocabulary pruning per-line on GPU.
 
@@ -266,6 +274,9 @@ class OCRModel:
         Returns:
             Tuple of (list of pruned arrays, list of keep_indices per line)
         """
+        if _torch is None or _functional is None:
+            raise RuntimeError("GPU operations requested but PyTorch is not available")
+
         keep_indices_list = []
         pruned_list = []
 
@@ -277,13 +288,14 @@ class OCRModel:
             else:
                 # Need to compute log_softmax temporarily just for threshold comparison
                 logits_tensor = _torch.from_numpy(original_logits_list[i]).cuda()
-                log_probs_tensor = _F.log_softmax(logits_tensor, dim=0)
+                log_probs_tensor = _functional.log_softmax(logits_tensor, dim=0)
 
             # Find max log prob per vocab token for this line only
             max_per_token = log_probs_tensor.max(dim=1).values  # max over time
 
             # Create mask for tokens above threshold
-            keep_mask = max_per_token > self._vocab_prune_threshold
+            threshold_tensor = _torch.tensor(self._vocab_prune_threshold, device=log_probs_tensor.device)
+            keep_mask = max_per_token > threshold_tensor
             keep_mask[0] = True  # Always keep blank token
 
             keep_indices = _torch.where(keep_mask)[0].cpu().numpy()
@@ -313,7 +325,7 @@ class OCRModel:
         return log_probs_list
 
     def _prune_batch_cpu(
-        self, processed_list: list[npt.NDArray], original_logits_list: list[npt.NDArray], apply_softmax: bool
+        self, processed_list: list[npt.NDArray], original_logits_list: list[npt.NDArray], *, apply_softmax: bool
     ) -> tuple[list[npt.NDArray], list[npt.NDArray | None]]:
         """Apply vocabulary pruning per-line on CPU.
 

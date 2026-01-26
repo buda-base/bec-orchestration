@@ -41,6 +41,189 @@ from .parquet_writer import StreamingParquetWriter
 logger = logging.getLogger(__name__)
 
 
+# =============================================================================
+# Line Segment Merging Utilities
+# =============================================================================
+
+@dataclass
+class LineSegment:
+    """Represents a line segment with contour and bounding box info."""
+    contour: npt.NDArray  # numpy contour array
+    bbox: tuple[int, int, int, int]  # (x, y, w, h)
+    center: tuple[int, int]  # (x_center, y_center)
+
+
+def _build_line_segment(contour: npt.NDArray) -> LineSegment:
+    """Create a LineSegment from a contour."""
+    # Ensure contour is in standard OpenCV format (N, 1, 2)
+    if contour.ndim == 2:
+        contour = contour.reshape(-1, 1, 2)
+    x, y, w, h = cv2.boundingRect(contour)
+    x_center = x + (w // 2)
+    y_center = y + (h // 2)
+    return LineSegment(contour=contour, bbox=(x, y, w, h), center=(x_center, y_center))
+
+
+def _sort_bbox_centers(
+    bbox_centers: list[tuple[int, int]], line_threshold: float = 20
+) -> list[list[tuple[int, int]]]:
+    """
+    Sort bounding box centers into horizontal lines based on y-position.
+    
+    Args:
+        bbox_centers: List of (x, y) center coordinates
+        line_threshold: Vertical distance threshold for grouping
+        
+    Returns:
+        List of lists, each containing centers on the same line
+    """
+    if not bbox_centers:
+        return []
+
+    sorted_bbox_centers = []
+    tmp_line = []
+
+    for i in range(len(bbox_centers)):
+        if len(tmp_line) > 0:
+            # Use mean y of current line group for comparison
+            ys = [y[1] for y in tmp_line]
+            mean_y = np.mean(ys)
+            y_diff = abs(mean_y - bbox_centers[i][1])
+
+            if y_diff > line_threshold:
+                tmp_line.sort(key=lambda x: x[0])
+                sorted_bbox_centers.append(tmp_line.copy())
+                tmp_line.clear()
+
+            tmp_line.append(bbox_centers[i])
+        else:
+            tmp_line.append(bbox_centers[i])
+
+    # Add the last tmp_line if not empty
+    if tmp_line:
+        sorted_bbox_centers.append(tmp_line)
+
+    # Sort each line by x-coordinate
+    for line in sorted_bbox_centers:
+        line.sort(key=lambda x: x[0])
+
+    sorted_bbox_centers.reverse()
+    return sorted_bbox_centers
+
+
+def _group_line_segments(
+    sorted_bbox_centers: list[list[tuple[int, int]]], segments: list[LineSegment]
+) -> list[LineSegment]:
+    """
+    Group line segments that belong to the same horizontal line into unified segments.
+    
+    Args:
+        sorted_bbox_centers: Sorted bounding box centers by lines
+        segments: Original LineSegment objects
+        
+    Returns:
+        List of merged LineSegment objects
+    """
+    new_segments = []
+    
+    for bbox_centers in sorted_bbox_centers:
+        if len(bbox_centers) > 1:
+            # Multiple segments on same line - merge them
+            contour_stack = []
+            
+            for box_center in bbox_centers:
+                for segment in segments:
+                    if box_center == segment.center:
+                        contour_stack.append(segment.contour)
+                        break
+            
+            if contour_stack:
+                # Stack and create convex hull
+                stacked_contour = np.vstack(contour_stack)
+                stacked_contour = cv2.convexHull(stacked_contour)
+                new_segments.append(_build_line_segment(stacked_contour))
+        else:
+            # Single segment - keep as is
+            for bcenter in bbox_centers:
+                for segment in segments:
+                    if bcenter == segment.center:
+                        new_segments.append(segment)
+                        break
+    
+    return new_segments
+
+
+def _estimate_line_threshold(segments: list[LineSegment]) -> float:
+    """
+    Estimate a reasonable line threshold based on segment heights.
+    
+    Uses median height of segments as a baseline for grouping threshold.
+    """
+    if not segments:
+        return 20.0
+    
+    heights = [seg.bbox[3] for seg in segments]  # bbox[3] is height
+    median_height = float(np.median(heights))
+    # Use half the median height as threshold
+    return max(10.0, median_height * 0.5)
+
+
+def _merge_line_segments(
+    contours: list[list[dict]], line_threshold: float | None = None
+) -> list[list[dict]]:
+    """
+    Merge line segment contours that belong to the same horizontal line.
+    
+    Args:
+        contours: List of contours, where each contour is a list of {"x": x, "y": y} dicts
+        line_threshold: Vertical threshold for grouping (auto-calculated if None)
+        
+    Returns:
+        List of merged contours in the same format
+    """
+    if not contours:
+        return []
+    
+    # Convert dict format to numpy contours and build LineSegments
+    segments = []
+    for contour_points in contours:
+        if not contour_points:
+            continue
+        pts = np.array([[p["x"], p["y"]] for p in contour_points], dtype=np.int32)
+        segments.append(_build_line_segment(pts))
+    
+    if not segments:
+        return []
+    
+    # Calculate threshold if not provided
+    if line_threshold is None:
+        line_threshold = _estimate_line_threshold(segments)
+    
+    # Get centers and sort into lines
+    bbox_centers = [seg.center for seg in segments]
+    
+    # Sort by y-coordinate first (top to bottom)
+    sorted_indices = sorted(range(len(bbox_centers)), key=lambda i: bbox_centers[i][1])
+    bbox_centers_sorted = [bbox_centers[i] for i in sorted_indices]
+    
+    sorted_bbox_centers = _sort_bbox_centers(bbox_centers_sorted, line_threshold=line_threshold)
+    
+    # Group segments
+    merged_segments = _group_line_segments(sorted_bbox_centers, segments)
+    
+    # Convert back to dict format
+    merged_contours = []
+    for segment in merged_segments:
+        contour_dicts = [{"x": int(pt[0][0]), "y": int(pt[0][1])} for pt in segment.contour]
+        merged_contours.append(contour_dicts)
+    
+    return merged_contours
+
+
+# =============================================================================
+# CTC Decoding Utilities
+# =============================================================================
+
 def _decode_single_line(
     cropped_logits: npt.NDArray,
     vocab: list[str],
@@ -166,6 +349,8 @@ class AsyncOCRPipeline:
         use_nemo_decoder: bool = False,
         kenlm_path: str | None = None,
         use_line_prepadding: bool = True,
+        merge_line_segments: bool = True,
+        line_merge_threshold: float | None = None,
     ):
         self.ocr_model = ocr_model
         self.ctc_decoder = ctc_decoder
@@ -185,6 +370,8 @@ class AsyncOCRPipeline:
         self.use_hybrid_decode = use_hybrid_decode
         self.greedy_confidence_threshold = greedy_confidence_threshold
         self.use_nemo_decoder = use_nemo_decoder
+        self.merge_line_segments = merge_line_segments
+        self.line_merge_threshold = line_merge_threshold
         self.kenlm_path = kenlm_path
         self.use_line_prepadding = use_line_prepadding
         self._nemo_decoder = None  # Lazy init when needed
@@ -425,11 +612,13 @@ class AsyncOCRPipeline:
 
         all_texts = results
         decode_time = time.perf_counter() - decode_start
-        avg_ipc_in = total_ipc_in / len(all_texts) if all_texts else 0
-        avg_ipc_out = total_ipc_out / len(all_texts) if all_texts else 0
+        num_texts = len(all_texts) if all_texts else 0
+        avg_ipc_in = total_ipc_in / num_texts if num_texts > 0 else 0
+        avg_ipc_out = total_ipc_out / num_texts if num_texts > 0 else 0
+        ms_per_line = decode_time * 1000 / num_texts if num_texts > 0 else 0
         logger.info(
-            f"[Phase 2] All {len(all_texts)} lines decoded in {decode_time:.2f}s "
-            f"({decode_time * 1000 / len(all_texts):.1f}ms/line, avg_ipc_in={avg_ipc_in:.1f}ms, avg_ipc_out={avg_ipc_out:.1f}ms)"
+            f"[Phase 2] All {num_texts} lines decoded in {decode_time:.2f}s "
+            f"({ms_per_line:.1f}ms/line, avg_ipc_in={avg_ipc_in:.1f}ms, avg_ipc_out={avg_ipc_out:.1f}ms)"
         )
 
         # Group results by page
@@ -673,6 +862,15 @@ class AsyncOCRPipeline:
                 ]
                 scaled_contours.append(scaled_points)
             contours = scaled_contours
+
+        # Merge line segments that belong to the same horizontal line
+        if self.merge_line_segments:
+            original_count = len(contours)
+            contours = _merge_line_segments(contours, line_threshold=self.line_merge_threshold)
+            if len(contours) != original_count:
+                logger.debug(
+                    f"[ImageProcessor] {fetched.filename}: merged {original_count} segments into {len(contours)} lines"
+                )
 
         line_tensors = []
         mask_buffer = np.zeros((image.shape[0], image.shape[1]), dtype=np.uint8)

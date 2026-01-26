@@ -23,26 +23,120 @@ import numpy as np
 import numpy.typing as npt
 from botocore.client import BaseClient
 
-from .data_structures import LineLogits, PageInFlight, PendingTensor
+from .data_structures import (
+    LineLogits,
+    LineResult,
+    PageInFlight,
+    PageOCRResult,
+    PageResult,
+    PendingTensor,
+    SegmentResult,
+)
+from .line import BBox, build_line_data, sort_lines_by_threshold
 
 if TYPE_CHECKING:
     from .config import OCRV1Config
 
 from .ctc_decoder import (
     CTCDecoder,
+    LineDecodeResult,
     decode_logits_beam_search,
-    decode_logits_greedy,
-    decode_logits_hybrid_global,
+    decode_logits_with_segments,
     init_worker_process,
 )
 from .line_decoder import FetchedBytes, LineDecoder, ProcessedPage
 from .model import OCRModel
-from .parquet_writer import StreamingParquetWriter
+from .output_writer import OutputWriter
 
 logger = logging.getLogger(__name__)
 
 # Default vocabulary size for fallback logits
 DEFAULT_VOCAB_SIZE = 84
+
+# =============================================================================
+# OCR Result Building Utilities
+# =============================================================================
+
+
+def _build_page_ocr_result(
+    processed_page: ProcessedPage,
+    line_decode_results: list[LineDecodeResult],
+) -> PageOCRResult:
+    """Build PageOCRResult from processed page and line decode results."""
+    if processed_page.error:
+        return PageOCRResult(
+            img_file_name=processed_page.filename,
+            source_etag=processed_page.source_etag,
+            rotation_angle=processed_page.rotation_angle,
+            tps_points=processed_page.tps_points,
+            lines=[],
+            error=processed_page.error,
+        )
+
+    # Group line segments into logical lines
+    line_objects = [
+        build_line_data(processed_line.contours[0] if processed_line.contours else [])
+        for i, processed_line in enumerate(processed_page.lines)
+        if i < len(line_decode_results)
+    ]
+
+    # Sort and group lines
+    grouped_lines = sort_lines_by_threshold(line_objects)
+
+    # Build LineResult objects
+    line_results = []
+    for line_idx, line_group in enumerate(grouped_lines):
+        # Combine all segments in this logical line
+        segments = []
+        line_text_parts = []
+        total_weighted_confidence = 0.0
+        total_chars = 0
+
+        for line_obj in line_group:
+            # Find the corresponding ProcessedLine and decode result
+            processed_line_idx = next(
+                (i for i, pl in enumerate(processed_page.lines) if pl.contours and line_obj.center == pl.bbox[:2]), 0
+            )
+
+            if processed_line_idx < len(line_decode_results):
+                decode_result = line_decode_results[processed_line_idx]
+                processed_line = processed_page.lines[processed_line_idx]
+
+                # Create SegmentResult
+                x, y, w, h = processed_line.bbox
+                segment_result = SegmentResult(
+                    segment_idx=len(segments),
+                    bbox=BBox(x=x, y=y, w=w, h=h),
+                    text=decode_result.text,
+                    confidence=decode_result.line_confidence,
+                    syllables=decode_result.segments,
+                )
+                segments.append(segment_result)
+                line_text_parts.append(decode_result.text)
+
+                # Weight confidence by character count
+                char_count = len(decode_result.text)
+                total_weighted_confidence += decode_result.line_confidence * char_count
+                total_chars += char_count
+
+        # Create LineResult
+        line_confidence = total_weighted_confidence / total_chars if total_chars > 0 else 0.0
+        line_result = LineResult(
+            line_idx=line_idx,
+            text=" ".join(line_text_parts),
+            confidence=line_confidence,
+            segments=segments,
+        )
+        line_results.append(line_result)
+
+    return PageOCRResult(
+        img_file_name=processed_page.filename,
+        source_etag=processed_page.source_etag,
+        rotation_angle=processed_page.rotation_angle,
+        tps_points=processed_page.tps_points,
+        lines=line_results,
+    )
+
 
 # =============================================================================
 # CTC Decoding Utilities
@@ -81,6 +175,44 @@ def _decode_single_line(
     return text.strip().replace("§", " "), elapsed_ms, ipc_in_ms, os.getpid()
 
 
+def _decode_single_line_with_segments(
+    cropped_logits: npt.NDArray,
+    vocab: list[str],
+    original_width: int,
+    beam_width: int | None = None,
+    token_min_logp: float | None = None,
+    submit_time: float | None = None,
+) -> tuple[LineDecodeResult, float, float, int]:
+    """
+    Decode a single line's pre-cropped logits with structured segment data.
+
+    Args:
+        cropped_logits: Pre-cropped logits in (time, vocab) shape (already pruned by model)
+        vocab: Vocabulary list (already pruned by model)
+        original_width: Original width of the line image
+        beam_width: Beam width for decoding (passed to worker)
+        token_min_logp: Token min log prob (passed to worker)
+        submit_time: Time when task was submitted (for IPC measurement)
+
+    Returns:
+        Tuple of (line_decode_result, decode_time_ms, ipc_overhead_ms, worker_pid)
+    """
+
+    arrival_time = time.perf_counter()
+    ipc_in_ms = (arrival_time - submit_time) * 1000 if submit_time else 0.0
+
+    start = time.perf_counter()
+    decode_result = decode_logits_with_segments(
+        cropped_logits,
+        vocab,
+        original_width,
+        beam_width=beam_width,
+        token_min_logp=token_min_logp,
+    )
+    elapsed_ms = (time.perf_counter() - start) * 1000
+    return decode_result, elapsed_ms, ipc_in_ms, os.getpid()
+
+
 def _decode_page_lines(
     cropped_logits_list: list[npt.NDArray],
     vocab: list[str],
@@ -111,15 +243,7 @@ class InferredPage:
     filename: str
     source_etag: str
     logits_list: list[LineLogits]  # Structured line logits data
-    error: str | None = None
-
-
-@dataclass
-class PageResult:
-    page_idx: int
-    filename: str
-    source_etag: str
-    texts: list[str]
+    processed_page: ProcessedPage  # Original processed page data for line grouping
     error: str | None = None
 
 
@@ -218,7 +342,7 @@ class AsyncOCRPipeline:
             asyncio.create_task(self._image_processor(), name="image_processor"),
             asyncio.create_task(self._gpu_inference(), name="gpu_inference"),
             asyncio.create_task(self._ctc_decoder_stage(), name="ctc_decoder"),
-            asyncio.create_task(self._parquet_writer(output_parquet_uri, total_pages), name="writer"),
+            asyncio.create_task(self._output_writer(output_parquet_uri, total_pages), name="writer"),
         ]
 
         # Wait for all tasks
@@ -335,11 +459,14 @@ class AsyncOCRPipeline:
             submit_time = time.perf_counter()
             pruned_vocab = [vocab[i] for i in keep_indices] if keep_indices is not None else vocab
 
+            # Use decode_logits_with_segments for structured output
+            original_width = inferred.processed_page.orig_width
             future = loop.run_in_executor(
                 self._ctc_executor,
-                _decode_single_line,
+                _decode_single_line_with_segments,
                 cropped,
                 pruned_vocab,
+                original_width,
                 self.cfg.beam_width,
                 self.cfg.token_min_logp,
                 submit_time,
@@ -350,7 +477,6 @@ class AsyncOCRPipeline:
         decode_start = time.perf_counter()
         total_lines = len(futures)
         completed = 0
-        all_texts = []
 
         # Wait for all decodes and log each line as it completes
         pending = {
@@ -365,52 +491,45 @@ class AsyncOCRPipeline:
             for future in done:
                 page_idx, line_idx, inferred, submit_time = pending.pop(future)
                 result_time = time.perf_counter()
-                text, decode_ms, ipc_in_ms, worker_pid = future.result()
+                line_decode_result, decode_ms, ipc_in_ms, worker_pid = future.result()
                 ipc_out_ms = (time.perf_counter() - result_time) * 1000  # Time to deserialize result
                 total_roundtrip_ms = (result_time - submit_time) * 1000
                 total_ipc_in += ipc_in_ms
                 total_ipc_out += ipc_out_ms
                 idx = next(i for i, f in enumerate(futures) if f[2] is future)
-                results[idx] = text
+                results[idx] = line_decode_result
                 completed += 1
                 logger.info(
                     f"[CTC] line {completed}/{total_lines} page={page_idx} line={line_idx} worker={worker_pid} "
                     f"decode={decode_ms:.1f}ms ipc_in={ipc_in_ms:.1f}ms roundtrip={total_roundtrip_ms:.1f}ms"
                 )
 
-        all_texts = results
+        all_decode_results = results
         decode_time = time.perf_counter() - decode_start
-        num_texts = len(all_texts) if all_texts else 0
-        avg_ipc_in = total_ipc_in / num_texts if num_texts > 0 else 0
-        avg_ipc_out = total_ipc_out / num_texts if num_texts > 0 else 0
-        ms_per_line = decode_time * 1000 / num_texts if num_texts > 0 else 0
+        num_results = len(all_decode_results) if all_decode_results else 0
+        avg_ipc_in = total_ipc_in / num_results if num_results > 0 else 0
+        avg_ipc_out = total_ipc_out / num_results if num_results > 0 else 0
+        ms_per_line = decode_time * 1000 / num_results if num_results > 0 else 0
         logger.info(
-            f"[Phase 2] All {num_texts} lines decoded in {decode_time:.2f}s "
+            f"[Phase 2] All {num_results} lines decoded in {decode_time:.2f}s "
             f"({ms_per_line:.1f}ms/line, avg_ipc_in={avg_ipc_in:.1f}ms, avg_ipc_out={avg_ipc_out:.1f}ms)"
         )
 
         # Group results by page
-        page_results: dict[int, tuple[InferredPage, list[tuple[int, str]]]] = {}
-        for (page_idx, line_idx, _, inferred, _), text in zip(futures, all_texts, strict=True):
+        page_results: dict[int, tuple[InferredPage, list[LineDecodeResult]]] = {}
+        for (page_idx, _, _, inferred, _), decode_result in zip(futures, all_decode_results, strict=True):
             if page_idx not in page_results:
                 page_results[page_idx] = (inferred, [])
-            page_results[page_idx][1].append((line_idx, text))
+            page_results[page_idx][1].append(decode_result)
 
-        # Sort lines within each page and build PageResult objects
+        # Build PageOCRResult objects for each page
         results_to_write = []
         for page_idx in sorted(page_results.keys()):
-            inferred, line_texts = page_results[page_idx]
-            line_texts.sort(key=lambda x: x[0])
-            texts = [t for _, t in line_texts]
-            results_to_write.append(
-                PageResult(
-                    page_idx=page_idx,
-                    filename=inferred.filename,
-                    source_etag=inferred.source_etag,
-                    texts=texts,
-                    error=None,
-                )
-            )
+            inferred, line_decode_results = page_results[page_idx]
+
+            # Build PageOCRResult using the structured approach
+            page_result = _build_page_ocr_result(inferred.processed_page, line_decode_results)
+            results_to_write.append(page_result)
             self.stats["decoded"] += 1
 
         # Emit results and write to parquet concurrently
@@ -421,7 +540,7 @@ class AsyncOCRPipeline:
 
         await asyncio.gather(
             emit_results(),
-            self._parquet_writer(output_parquet_uri, total_pages),
+            self._output_writer(output_parquet_uri, total_pages),
         )
 
         phase2_time = time.perf_counter() - phase2_start
@@ -676,7 +795,6 @@ class AsyncOCRPipeline:
     async def _ctc_decoder_stage(self) -> None:
         """Decode logits to text concurrently using ProcessPoolExecutor."""
         logger.info(f"[CTCDecoder] Starting with {self.cfg.ctc_workers} workers")
-        loop = asyncio.get_event_loop()
         pending_tasks: set[asyncio.Task] = set()
         pages_received = 0
 
@@ -688,7 +806,7 @@ class AsyncOCRPipeline:
 
         async def decode_one(inferred: InferredPage) -> None:
             if inferred.error or not inferred.logits_list:
-                await self.q_results.put(self._create_error_page(inferred, None))
+                await self.q_results.put(self._create_error_page_ocr(inferred, None))
                 return
 
             async with page_sem:
@@ -701,64 +819,33 @@ class AsyncOCRPipeline:
                     # NOTE: Each line may have different keep_indices if they were in different GPU batches
                     cropped_logits_list, pruned_vocab_list = self._prepare_logits_and_vocab(inferred)
 
-                    if self.cfg.use_greedy_decode:
-                        # Greedy decode is fast (~0.6ms/line), run directly without ProcessPoolExecutor
-                        texts = [
-                            decode_logits_greedy(cropped, vocab).strip().replace("§", " ")
-                            for cropped, vocab in zip(cropped_logits_list, pruned_vocab_list, strict=True)
-                        ]
-                    elif self.cfg.use_hybrid_decode:
-                        # Hybrid decode: greedy first, beam search fallback for low-confidence lines
-                        texts = [
-                            decode_logits_hybrid_global(
-                                cropped,
-                                vocab,
-                                confidence_threshold=self.cfg.greedy_confidence_threshold,
-                                beam_width=self.cfg.beam_width,
-                                token_min_logp=self.cfg.token_min_logp,
-                            )
-                            .strip()
-                            .replace("§", " ")
-                            for cropped, vocab in zip(cropped_logits_list, pruned_vocab_list, strict=True)
-                        ]
-                    else:
-                        # Beam search via ProcessPoolExecutor - submit each line for parallel decode
-                        futures = [
-                            loop.run_in_executor(
-                                self._ctc_executor,
-                                _decode_single_line,
-                                cropped,
-                                vocab,
-                                self.cfg.beam_width,
-                                self.cfg.token_min_logp,
-                                None,  # submit_time
-                            )
-                            for cropped, vocab in zip(cropped_logits_list, pruned_vocab_list, strict=True)
-                        ]
-
-                        # Wait for all lines to complete in parallel
-                        # _decode_single_line returns (text, decode_ms, ipc_in_ms, worker_pid)
-                        results = list(await asyncio.gather(*futures))
-                        texts = [r[0] for r in results]
+                    # Use decode_logits_with_segments for structured output
+                    line_decode_results = []
+                    for cropped, vocab in zip(cropped_logits_list, pruned_vocab_list, strict=True):
+                        # Get original width for this line from the processed page
+                        original_width = inferred.processed_page.orig_width
+                        decode_result = decode_logits_with_segments(
+                            cropped,
+                            vocab,
+                            original_width,
+                            beam_width=self.cfg.beam_width,
+                            token_min_logp=self.cfg.token_min_logp,
+                        )
+                        line_decode_results.append(decode_result)
 
                     decode_ms = (time.perf_counter() - start_time) * 1000
                     logger.info(
                         f"[CTCDecoder] Page {inferred.page_idx} decoded {num_lines} lines in {decode_ms:.0f}ms ({decode_ms / max(1, num_lines):.0f}ms/line)"
                     )
 
-                    await self.q_results.put(
-                        PageResult(
-                            page_idx=inferred.page_idx,
-                            filename=inferred.filename,
-                            source_etag=inferred.source_etag,
-                            texts=texts,
-                        )
-                    )
+                    # Build PageOCRResult using the structured approach
+                    page_result = _build_page_ocr_result(inferred.processed_page, line_decode_results)
+                    await self.q_results.put(page_result)
                     self.stats["decoded"] += 1
 
                 except Exception as e:
                     logger.warning(f"[CTCDecoder] Failed to decode {inferred.filename}: {e}")
-                    await self.q_results.put(self._create_error_page(inferred, str(e)))
+                    await self.q_results.put(self._create_error_page_ocr(inferred, str(e)))
                     self.stats["errors"] += 1
 
         while True:
@@ -781,11 +868,14 @@ class AsyncOCRPipeline:
 
         logger.info(f"[CTCDecoder] Done, decoded {self.stats['decoded']} pages")
 
-    async def _parquet_writer(self, output_uri: str, total_pages: int) -> None:
-        """Write results to parquet using streaming writer."""
-        logger.info(f"[ParquetWriter] Starting, expecting {total_pages} pages")
+    async def _output_writer(self, output_prefix: str, total_pages: int) -> None:
+        """Write results to both Parquet and JSONL.gz using OutputWriter."""
+        logger.info(f"[OutputWriter] Starting, expecting {total_pages} pages")
 
-        writer = StreamingParquetWriter(output_uri, batch_size=100)
+        # Extract volume_id from output_prefix (assuming format like s3://bucket/path/volume_id/)
+        volume_id = output_prefix.split("/")[-2] if "/" in output_prefix else "unknown"
+
+        writer = OutputWriter(volume_id, output_prefix)
         pages_written = 0
 
         try:
@@ -794,21 +884,16 @@ class AsyncOCRPipeline:
                 if isinstance(msg, EndOfStream):
                     break
 
-                result: PageResult = msg
-                writer.write_record(
-                    filename=result.filename,
-                    source_etag=result.source_etag,
-                    texts=result.texts,
-                    error=result.error,
-                )
+                result: PageOCRResult = msg
+                writer.write_page(result)
                 pages_written += 1
 
                 if pages_written % 100 == 0:
-                    logger.info(f"[ParquetWriter] Progress: {pages_written}/{total_pages}")
+                    logger.info(f"[OutputWriter] Progress: {pages_written}/{total_pages}")
         finally:
             writer.close()
 
-        logger.info(f"[ParquetWriter] Done, wrote {pages_written} pages")
+        logger.info(f"[OutputWriter] Done, wrote {pages_written} pages")
 
     def _create_error_page(self, inferred: InferredPage, error: str | None) -> PageResult:
         """Create a PageResult for error cases."""
@@ -817,6 +902,17 @@ class AsyncOCRPipeline:
             filename=inferred.filename,
             source_etag=inferred.source_etag,
             texts=[],
+            error=error or inferred.error,
+        )
+
+    def _create_error_page_ocr(self, inferred: InferredPage, error: str | None) -> PageOCRResult:
+        """Create a PageOCRResult for error cases."""
+        return PageOCRResult(
+            img_file_name=inferred.filename,
+            source_etag=inferred.source_etag,
+            rotation_angle=inferred.processed_page.rotation_angle,
+            tps_points=inferred.processed_page.tps_points,
+            lines=[],
             error=error or inferred.error,
         )
 
@@ -841,6 +937,7 @@ class AsyncOCRPipeline:
             filename=page.filename,
             source_etag=page.source_etag,
             logits_list=logits_list,
+            processed_page=page,
             error=page.error,
         )
 

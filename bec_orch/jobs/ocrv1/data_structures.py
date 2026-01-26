@@ -5,7 +5,10 @@ from typing import TYPE_CHECKING
 
 import numpy.typing as npt
 
+from .line import BBox
+
 if TYPE_CHECKING:
+    from .ctc_decoder import SyllableSegment
     from .line_decoder import ProcessedPage
 
 
@@ -54,3 +57,68 @@ class PageInFlight:
     processed_page: "ProcessedPage"  # The processed page with line tensors
     expected_lines: int  # Number of lines expected for this page
     line_logits: dict[int, LineLogits]  # Collected LineLogits objects by line index
+
+
+# =============================================================================
+# New data structures for dual output format
+# =============================================================================
+
+
+@dataclass
+class SegmentResult:
+    """Result for a single text segment with OCR output and bounding box."""
+
+    segment_idx: int
+    bbox: BBox
+    text: str
+    confidence: float
+    syllables: list["SyllableSegment"]  # from CTC decoder, always populated
+
+
+@dataclass
+class LineResult:
+    """Result for a logical line (may contain multiple segments)."""
+
+    line_idx: int
+    text: str  # segments joined with space
+    confidence: float  # weighted average
+    segments: list[SegmentResult]
+
+
+@dataclass
+class PageOCRResult:
+    """Complete OCR result for a page with structured line/segment/syllable data."""
+
+    img_file_name: str
+    source_etag: str
+    rotation_angle: float
+    tps_points: tuple | None
+    lines: list[LineResult]
+    error: str | None = None
+
+    @property
+    def page_text(self) -> str:
+        """Get the full page text by joining all lines."""
+        return "\n".join(line.text for line in self.lines)
+
+    @property
+    def page_confidence(self) -> float:
+        """Get the overall page confidence as weighted average by character count."""
+        if not self.lines:
+            return 0.0
+
+        total_weighted_confidence = sum(line.confidence * len(line.text) for line in self.lines)
+        total_chars = sum(len(line.text) for line in self.lines)
+
+        return total_weighted_confidence / total_chars if total_chars > 0 else 0.0
+
+
+@dataclass
+class PageResult:
+    """Legacy page result for backward compatibility."""
+
+    page_idx: int
+    filename: str
+    source_etag: str
+    texts: list[str]
+    error: str | None = None

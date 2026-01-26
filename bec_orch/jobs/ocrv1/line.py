@@ -9,6 +9,7 @@ This module contains functions for:
 """
 
 import logging
+from dataclasses import dataclass
 
 import cv2
 import numpy as np
@@ -19,6 +20,29 @@ GRAYSCALE_NDIM = 2
 MIN_K_FACTOR = 0.1
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class BBox:
+    """Bounding box with coordinates and dimensions."""
+
+    x: int
+    y: int
+    w: int
+    h: int
+
+    def as_list(self) -> list[int]:
+        """Return bbox as [x, y, w, h] list."""
+        return [self.x, self.y, self.w, self.h]
+
+
+@dataclass
+class Line:
+    """Line representation with contour and bounding box."""
+
+    contour: npt.NDArray  # NumPy array of points
+    bbox: BBox
+    center: tuple[float, float]  # (cx, cy) center of bbox
 
 
 def mask_n_crop(image: npt.NDArray, mask: npt.NDArray) -> npt.NDArray:
@@ -103,3 +127,109 @@ def get_line_image(
         # Create a small blank image as fallback
         fallback_img = np.zeros((bbox_h, bbox_h * 2, 3), dtype=np.uint8)
         return fallback_img, k_factor
+
+
+# =============================================================================
+# Line grouping and sorting functions (moved from line_decoder.py)
+# =============================================================================
+
+
+def build_line_data(contour: list[dict[str, int]] | npt.NDArray) -> Line:
+    """Build a Line object from a contour (dict list or numpy array)."""
+    # Convert to numpy if needed
+    if isinstance(contour, list):
+        pts = np.array([[p["x"], p["y"]] for p in contour], dtype=np.int32)
+    else:
+        # Normalize shape to (N, 1, 2) for cv2 compatibility
+        if contour.ndim == 2:
+            contour = contour.reshape(-1, 1, 2)
+        pts = contour.reshape(-1, 2)
+
+    x, y, w, h = cv2.boundingRect(pts)
+    cx = x + w / 2.0
+    cy = y + h / 2.0
+
+    return Line(
+        contour=pts.reshape(-1, 1, 2),
+        bbox=BBox(x=x, y=y, w=w, h=h),
+        center=(cx, cy),
+    )
+
+
+def sort_bbox_centers(
+    bbox_centers: list[tuple[float, float]], line_threshold: float
+) -> list[list[tuple[float, float]]]:
+    """Group bbox centers by vertical proximity to form lines."""
+    if not bbox_centers:
+        return []
+
+    # Sort by y-coordinate
+    sorted_centers = sorted(bbox_centers, key=lambda c: c[1])
+
+    groups: list[list[tuple[float, float]]] = []
+    current_group: list[tuple[float, float]] = [sorted_centers[0]]
+    current_y = sorted_centers[0][1]
+
+    for center in sorted_centers[1:]:
+        if abs(center[1] - current_y) <= line_threshold:
+            current_group.append(center)
+        else:
+            groups.append(current_group)
+            current_group = [center]
+            current_y = center[1]
+
+    if current_group:
+        groups.append(current_group)
+
+    # Sort centers within each group by x-coordinate (left to right)
+    for group in groups:
+        group.sort(key=lambda c: c[0])
+
+    # Reverse to get bottom-to-top order (matching reading order)
+    groups.reverse()
+
+    return groups
+
+
+def group_line_chunks(sorted_centers: list[list[tuple[float, float]]], lines: list[Line]) -> list[list[Line]]:
+    """Group line chunks into logical lines based on sorted centers."""
+    if not sorted_centers or not lines:
+        return []
+
+    # Create mapping from center to line
+    center_to_line = {line.center: line for line in lines}
+
+    # Build groups of lines
+    return [
+        [center_to_line[center] for center in center_group if center in center_to_line]
+        for center_group in sorted_centers
+        if any(center in center_to_line for center in center_group)
+    ]
+
+
+def get_line_threshold(line_prediction: list[Line]) -> float:
+    """Auto-calculate line grouping threshold from median line height."""
+    if not line_prediction:
+        return 20.0
+
+    heights = [line.bbox.h for line in line_prediction]
+    median_height = float(np.median(heights))
+    return median_height * 0.5
+
+
+def sort_lines_by_threshold(line_prediction: list[Line]) -> list[list[Line]]:
+    """Main entry point: combines threshold calculation + sorting + grouping."""
+    if not line_prediction:
+        return []
+
+    # Calculate threshold
+    line_threshold = get_line_threshold(line_prediction)
+
+    # Get bbox centers
+    bbox_centers = [line.center for line in line_prediction]
+
+    # Sort and group centers
+    sorted_centers = sort_bbox_centers(bbox_centers, line_threshold)
+
+    # Group lines and return
+    return group_line_chunks(sorted_centers, line_prediction)

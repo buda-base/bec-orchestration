@@ -178,14 +178,17 @@ class CTCDecoderNemo:
 
     def decode_batch(self, batch_logits: list[npt.NDArray]) -> list[str]:
         """
-        Decode a batch of logits efficiently on GPU.
+        Decode a batch of logits using NeMo's BeamCTCInfer.
 
         Args:
-            batch_logits: list of logits arrays, each shape (time, vocab) or (vocab, time)
+            batch_logits: List of logits arrays, each shape (time, vocab) or (vocab, time)
 
         Returns:
             List of decoded text strings
         """
+        import time
+        start_time = time.perf_counter()
+        
         if not batch_logits:
             return []
 
@@ -209,6 +212,18 @@ class CTCDecoderNemo:
         max_len = max(lengths)
         max_vocab = max(vocab_sizes)
 
+        # Convert all logits to torch tensors at once (more efficient)
+        torch_tensors = []
+        for logits in processed:
+            t = logits.shape[0]
+            v = logits.shape[1]
+            # Pad vocab dimension if needed
+            if v < max_vocab:
+                logits_padded = np.pad(logits, ((0, 0), (0, max_vocab - v)), constant_values=-1000.0)
+            else:
+                logits_padded = logits
+            torch_tensors.append(_logits_to_torch(logits_padded, self.device))
+        
         # Pad and stack on GPU
         # Use very negative value for padding
         padded = torch.full(
@@ -218,12 +233,9 @@ class CTCDecoderNemo:
             dtype=torch.float32,
         )
 
-        for i, logits in enumerate(processed):
-            t = logits.shape[0]
-            v = logits.shape[1]
-            # Pad vocab dimension if needed
-            logits_padded = np.pad(logits, ((0, 0), (0, max_vocab - v)), constant_values=-1000.0)
-            padded[i, :t, :] = _logits_to_torch(logits_padded, self.device)
+        for i, tensor in enumerate(torch_tensors):
+            t = processed[i].shape[0]
+            padded[i, :t, :] = tensor
 
         # Create lengths tensor
         lengths_tensor = torch.tensor(lengths, dtype=torch.long, device=self.device)
@@ -275,4 +287,9 @@ class CTCDecoderNemo:
         else:
             texts = [""] * batch_size
 
+        elapsed = (time.perf_counter() - start_time) * 1000
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.info(f"[CTCDecoderNemo] decode_batch: {len(batch_logits)} lines in {elapsed:.1f}ms ({elapsed/len(batch_logits):.1f}ms/line)")
+        
         return texts

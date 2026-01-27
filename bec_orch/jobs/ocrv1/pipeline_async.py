@@ -25,6 +25,7 @@ from botocore.client import BaseClient
 
 from .data_structures import (
     EndOfStream,
+    ImageTask,
     InferredPage,
     LineLogits,
     LineResult,
@@ -274,6 +275,10 @@ class AsyncOCRPipeline:
         self._parquet_data: dict[str, dict] | None = None  # filename -> ld_row
         self._parquet_error: str | None = None
 
+        # Task tracking for timeout/cleanup
+        self._stage_tasks: list[asyncio.Task] = []
+        self._is_running = False
+
         # Stats
         self.stats = {
             "fetched": 0,
@@ -285,19 +290,50 @@ class AsyncOCRPipeline:
 
     async def run(
         self,
-        pages: list[tuple[int, str]],  # (page_idx, filename)
+        tasks: list[ImageTask],
+        ld_parquet_uri: str,
+        output_parquet_uri: str,
+        timeout_s: float | None = None,
+    ) -> dict:
+        """Run the full pipeline with optional timeout protection.
+        
+        Args:
+            tasks: List of ImageTask objects identifying pages to process
+            ld_parquet_uri: S3 URI of the line detection parquet file
+            output_parquet_uri: S3 URI for output
+            timeout_s: Optional timeout in seconds. If None, uses cfg.volume_timeout_s
+        
+        Raises:
+            asyncio.TimeoutError: If pipeline exceeds timeout (after graceful cleanup)
+        """
+        timeout = timeout_s or getattr(self.cfg, 'volume_timeout_s', 600.0)
+        
+        try:
+            return await asyncio.wait_for(
+                self._run_pipeline(tasks, ld_parquet_uri, output_parquet_uri),
+                timeout=timeout
+            )
+        except asyncio.TimeoutError:
+            # Log diagnostic state before cleanup
+            diagnostic_state = self.get_diagnostic_state()
+            logger.error(
+                f"[AsyncOCRPipeline] Timeout after {timeout}s. "
+                f"Diagnostic: {diagnostic_state}"
+            )
+            # Try graceful cleanup
+            await self._graceful_shutdown()
+            raise
+
+    async def _run_pipeline(
+        self,
+        tasks: list[ImageTask],
         ld_parquet_uri: str,
         output_parquet_uri: str,
     ) -> dict:
-        """Run the full pipeline.
-        
-        Args:
-            pages: List of (page_idx, filename) tuples
-            ld_parquet_uri: S3 URI of the line detection parquet file
-            output_parquet_uri: S3 URI for output
-        """
+        """Internal pipeline execution (called by run with timeout)."""
         start_time = time.perf_counter()
-        total_pages = len(pages)
+        total_pages = len(tasks)
+        self._is_running = True
 
         logger.info(f"[AsyncOCRPipeline] Starting pipeline for {total_pages} pages")
 
@@ -312,25 +348,30 @@ class AsyncOCRPipeline:
 
         monitor_task = asyncio.create_task(monitor_queues(), name="monitor")
 
-        # Start all stages as concurrent tasks (parquet loader runs in parallel with prefetcher)
-        tasks = [
-            asyncio.create_task(self._parquet_loader(ld_parquet_uri), name="parquet_loader"),
-            asyncio.create_task(self._prefetcher(pages), name="prefetcher"),
-            asyncio.create_task(self._image_processor(), name="image_processor"),
-            asyncio.create_task(self._gpu_inference(), name="gpu_inference"),
-            asyncio.create_task(self._ctc_decoder_stage(), name="ctc_decoder"),
-            asyncio.create_task(self._output_writer(output_parquet_uri, total_pages), name="writer"),
-        ]
+        try:
+            # Start all stages as concurrent tasks (parquet loader runs in parallel with prefetcher)
+            self._stage_tasks = [
+                asyncio.create_task(self._parquet_loader(ld_parquet_uri), name="parquet_loader"),
+                asyncio.create_task(self._prefetcher(tasks), name="prefetcher"),
+                asyncio.create_task(self._image_processor(), name="image_processor"),
+                asyncio.create_task(self._gpu_inference(), name="gpu_inference"),
+                asyncio.create_task(self._ctc_decoder_stage(), name="ctc_decoder"),
+                asyncio.create_task(self._output_writer(output_parquet_uri, total_pages), name="writer"),
+            ]
 
-        # Wait for all tasks
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        monitor_task.cancel()
+            # Wait for all tasks
+            results = await asyncio.gather(*self._stage_tasks, return_exceptions=True)
 
-        # Check for errors
-        stage_names = ["parquet_loader", "prefetcher", "image_processor", "gpu_inference", "ctc_decoder", "writer"]
-        for name, result in zip(stage_names, results, strict=True):
-            if isinstance(result, Exception):
-                logger.error(f"Pipeline stage '{name}' failed: {result}", exc_info=result)
+            # Check for errors
+            stage_names = ["parquet_loader", "prefetcher", "image_processor", "gpu_inference", "ctc_decoder", "writer"]
+            for name, result in zip(stage_names, results, strict=True):
+                if isinstance(result, Exception):
+                    logger.error(f"Pipeline stage '{name}' failed: {result}", exc_info=result)
+
+        finally:
+            monitor_task.cancel()
+            self._is_running = False
+            self._stage_tasks = []
 
         elapsed = time.perf_counter() - start_time
         logger.info(
@@ -342,11 +383,83 @@ class AsyncOCRPipeline:
 
         return self.stats
 
+    async def _graceful_shutdown(self) -> None:
+        """Gracefully shutdown the pipeline on timeout.
+        
+        Tries to let the writer flush before cancelling all tasks.
+        """
+        if not self._stage_tasks:
+            return
+
+        logger.info("[AsyncOCRPipeline] Starting graceful shutdown...")
+
+        # Find writer task
+        writer_task = None
+        for t in self._stage_tasks:
+            if t.get_name() == "writer":
+                writer_task = t
+            elif not t.done():
+                t.cancel()
+
+        # Wait briefly for non-writer tasks to cancel
+        non_writer_tasks = [t for t in self._stage_tasks if t.get_name() != "writer"]
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(*non_writer_tasks, return_exceptions=True),
+                timeout=2.0
+            )
+        except asyncio.TimeoutError:
+            pass
+
+        # Try to send EOS to writer to let it flush
+        if writer_task and not writer_task.done():
+            try:
+                await asyncio.wait_for(
+                    self.q_results.put(EndOfStream(stream="results", producer="timeout_shutdown")),
+                    timeout=1.0
+                )
+                # Wait briefly for writer to flush
+                await asyncio.wait_for(writer_task, timeout=5.0)
+                logger.info("[AsyncOCRPipeline] Writer flushed successfully")
+            except asyncio.TimeoutError:
+                logger.warning("[AsyncOCRPipeline] Writer did not flush in time, cancelling")
+                writer_task.cancel()
+                try:
+                    await asyncio.wait_for(writer_task, timeout=1.0)
+                except (asyncio.TimeoutError, asyncio.CancelledError):
+                    pass
+
+        self._stage_tasks = []
+        self._is_running = False
+        logger.info("[AsyncOCRPipeline] Graceful shutdown complete")
+
+    def get_diagnostic_state(self) -> dict:
+        """Return diagnostic state for debugging stuck pipelines.
+        
+        Called when timeout occurs to help identify where the pipeline is stuck.
+        """
+        return {
+            "is_running": self._is_running,
+            "queues": {
+                "q_fetched": f"{self.q_fetched.qsize()}/64",
+                "q_processed": f"{self.q_processed.qsize()}/32",
+                "q_inferred": f"{self.q_inferred.qsize()}/32",
+                "q_results": f"{self.q_results.qsize()}/64",
+            },
+            "stats": dict(self.stats),
+            "parquet_ready": self._parquet_ready.is_set(),
+            "parquet_error": self._parquet_error,
+            "active_tasks": [
+                t.get_name() for t in self._stage_tasks if not t.done()
+            ] if self._stage_tasks else [],
+        }
+
     async def run_sequential(
         self,
-        pages: list[tuple[int, str]],  # (page_idx, filename)
+        tasks: list[ImageTask],
         ld_parquet_uri: str,
         output_parquet_uri: str,
+        timeout_s: float | None = None,
     ) -> dict:
         """
         Run pipeline in two phases to eliminate CPU contention:
@@ -354,12 +467,40 @@ class AsyncOCRPipeline:
         Phase 2: CTC Decode all collected logits + Write to Parquet
         
         Args:
-            pages: List of (page_idx, filename) tuples
+            tasks: List of ImageTask objects identifying pages to process
             ld_parquet_uri: S3 URI of the line detection parquet file
             output_parquet_uri: S3 URI for output
+            timeout_s: Optional timeout in seconds. If None, uses cfg.volume_timeout_s
+        
+        Raises:
+            asyncio.TimeoutError: If pipeline exceeds timeout (after graceful cleanup)
         """
+        timeout = timeout_s or getattr(self.cfg, 'volume_timeout_s', 600.0)
+        
+        try:
+            return await asyncio.wait_for(
+                self._run_sequential_pipeline(tasks, ld_parquet_uri, output_parquet_uri),
+                timeout=timeout
+            )
+        except asyncio.TimeoutError:
+            diagnostic_state = self.get_diagnostic_state()
+            logger.error(
+                f"[AsyncOCRPipeline] Sequential timeout after {timeout}s. "
+                f"Diagnostic: {diagnostic_state}"
+            )
+            await self._graceful_shutdown()
+            raise
+
+    async def _run_sequential_pipeline(
+        self,
+        tasks: list[ImageTask],
+        ld_parquet_uri: str,
+        output_parquet_uri: str,
+    ) -> dict:
+        """Internal sequential pipeline execution (called by run_sequential with timeout)."""
         start_time = time.perf_counter()
-        total_pages = len(pages)
+        total_pages = len(tasks)
+        self._is_running = True
 
         logger.info(f"[AsyncOCRPipeline] Starting SEQUENTIAL pipeline for {total_pages} pages")
 
@@ -385,163 +526,168 @@ class AsyncOCRPipeline:
 
         monitor_task = asyncio.create_task(monitor_queues(), name="monitor")
 
-        # Phase 1: Run prefetch + image processing + GPU inference
-        # Parquet loader runs in parallel with prefetcher
-        logger.info("[Phase 1] Starting GPU inference phase...")
-        phase1_tasks = [
-            asyncio.create_task(self._parquet_loader(ld_parquet_uri), name="parquet_loader"),
-            asyncio.create_task(self._prefetcher(pages), name="prefetcher"),
-            asyncio.create_task(self._image_processor(), name="image_processor"),
-            asyncio.create_task(self._gpu_inference(), name="gpu_inference"),
-            asyncio.create_task(collect_inferred(), name="collector"),
-        ]
+        try:
+            # Phase 1: Run prefetch + image processing + GPU inference
+            # Parquet loader runs in parallel with prefetcher
+            logger.info("[Phase 1] Starting GPU inference phase...")
+            self._stage_tasks = [
+                asyncio.create_task(self._parquet_loader(ld_parquet_uri), name="parquet_loader"),
+                asyncio.create_task(self._prefetcher(tasks), name="prefetcher"),
+                asyncio.create_task(self._image_processor(), name="image_processor"),
+                asyncio.create_task(self._gpu_inference(), name="gpu_inference"),
+                asyncio.create_task(collect_inferred(), name="collector"),
+            ]
 
-        await asyncio.gather(*phase1_tasks, return_exceptions=True)
-        monitor_task.cancel()  # Stop monitor after Phase 1
-        phase1_time = time.perf_counter() - start_time
-        logger.info(f"[Phase 1] GPU inference complete in {phase1_time:.2f}s - collected {len(all_inferred)} pages")
+            await asyncio.gather(*self._stage_tasks, return_exceptions=True)
+            monitor_task.cancel()  # Stop monitor after Phase 1
+            phase1_time = time.perf_counter() - start_time
+            logger.info(f"[Phase 1] GPU inference complete in {phase1_time:.2f}s - collected {len(all_inferred)} pages")
 
-        # Phase 2: CTC decode all collected logits at once (max parallelism)
-        logger.info("[Phase 2] Starting CTC decode phase...")
-        phase2_start = time.perf_counter()
+            # Phase 2: CTC decode all collected logits at once (max parallelism)
+            logger.info("[Phase 2] Starting CTC decode phase...")
+            phase2_start = time.perf_counter()
 
-        vocab = self.ctc_decoder.ctc_vocab
-        loop = asyncio.get_event_loop()
+            vocab = self.ctc_decoder.ctc_vocab
+            loop = asyncio.get_event_loop()
 
-        # Prepare all lines from all pages for batch submission
-        # Each entry: (page_idx, line_idx, cropped_logits, inferred, keep_indices)
-        all_decode_tasks: list[tuple[int, int, npt.NDArray, InferredPage, npt.NDArray | None]] = []
+            # Prepare all lines from all pages for batch submission
+            # Each entry: (page_idx, line_idx, cropped_logits, inferred, keep_indices)
+            all_decode_tasks: list[tuple[int, int, npt.NDArray, InferredPage, npt.NDArray | None]] = []
 
-        for inferred in all_inferred:
-            if inferred.error or not inferred.logits_list:
-                await self.q_results.put(self._create_error_page(inferred, None))
-                continue
+            for inferred in all_inferred:
+                if inferred.error or not inferred.logits_list:
+                    await self.q_results.put(self._create_error_page(inferred, None))
+                    continue
 
-            for line_idx, line_logits in enumerate(inferred.logits_list):
-                # Logits are already cropped to remove padding (done in model before softmax)
-                # Just need to transpose from (vocab, time) -> (time, vocab) if needed
-                actual_vocab_size = line_logits.vocab_size
-                needs_transpose = line_logits.logits.shape[0] == actual_vocab_size
-                cropped = line_logits.logits.T if needs_transpose else line_logits.logits
-                all_decode_tasks.append((inferred.page_idx, line_idx, cropped, inferred, line_logits.keep_indices))
+                for line_idx, line_logits in enumerate(inferred.logits_list):
+                    # Logits are already cropped to remove padding (done in model before softmax)
+                    # Just need to transpose from (vocab, time) -> (time, vocab) if needed
+                    actual_vocab_size = line_logits.vocab_size
+                    needs_transpose = line_logits.logits.shape[0] == actual_vocab_size
+                    cropped = line_logits.logits.T if needs_transpose else line_logits.logits
+                    all_decode_tasks.append((inferred.page_idx, line_idx, cropped, inferred, line_logits.keep_indices))
 
-        # Count how many have GPU pruning
-        gpu_pruned_count = sum(1 for _, _, _, _, ki in all_decode_tasks if ki is not None)
-        if gpu_pruned_count > 0:
-            sample_ki = next((ki for _, _, _, _, ki in all_decode_tasks if ki is not None), None)
-            logger.info(
-                f"[Phase 2] Submitting {len(all_decode_tasks)} lines to {self.cfg.ctc_workers} workers... "
-                f"({gpu_pruned_count} GPU-pruned, sample_keep_indices={len(sample_ki) if sample_ki is not None else 'N/A'})"
-            )
-        else:
-            logger.info(
-                f"[Phase 2] Submitting {len(all_decode_tasks)} lines to {self.cfg.ctc_workers} workers... (0 GPU-pruned)"
-            )
-
-        # Submit ALL lines at once to ProcessPoolExecutor
-        futures = []
-        for page_idx, line_idx, cropped, inferred, keep_indices in all_decode_tasks:
-            submit_time = time.perf_counter()
-            pruned_vocab = [vocab[i] for i in keep_indices] if keep_indices is not None else vocab
-
-            # Use decode_logits_with_segments for structured output
-            original_width = inferred.processed_page.orig_width
-            future = loop.run_in_executor(
-                self._ctc_executor,
-                _decode_single_line_with_segments,
-                cropped,
-                pruned_vocab,
-                original_width,
-                self.cfg.beam_width,
-                self.cfg.token_min_logp,
-                submit_time,
-            )
-            futures.append((page_idx, line_idx, future, inferred, submit_time))
-
-        # Wait for decodes with progress logging
-        decode_start = time.perf_counter()
-        total_lines = len(futures)
-        completed = 0
-
-        # Wait for all decodes and log each line as it completes
-        pending = {
-            f[2]: (f[0], f[1], f[3], f[4]) for f in futures
-        }  # future -> (page_idx, line_idx, inferred, submit_time)
-        results = [None] * total_lines
-        total_ipc_in = 0.0
-        total_ipc_out = 0.0
-
-        while pending:
-            done, _ = await asyncio.wait(pending.keys(), return_when=asyncio.FIRST_COMPLETED)
-            for future in done:
-                page_idx, line_idx, inferred, submit_time = pending.pop(future)
-                result_time = time.perf_counter()
-                line_decode_result, decode_ms, ipc_in_ms, worker_pid = future.result()
-                ipc_out_ms = (time.perf_counter() - result_time) * 1000  # Time to deserialize result
-                total_roundtrip_ms = (result_time - submit_time) * 1000
-                total_ipc_in += ipc_in_ms
-                total_ipc_out += ipc_out_ms
-                idx = next(i for i, f in enumerate(futures) if f[2] is future)
-                results[idx] = line_decode_result
-                completed += 1
+            # Count how many have GPU pruning
+            gpu_pruned_count = sum(1 for _, _, _, _, ki in all_decode_tasks if ki is not None)
+            if gpu_pruned_count > 0:
+                sample_ki = next((ki for _, _, _, _, ki in all_decode_tasks if ki is not None), None)
                 logger.info(
-                    f"[CTC] line {completed}/{total_lines} page={page_idx} line={line_idx} worker={worker_pid} "
-                    f"decode={decode_ms:.1f}ms ipc_in={ipc_in_ms:.1f}ms roundtrip={total_roundtrip_ms:.1f}ms"
+                    f"[Phase 2] Submitting {len(all_decode_tasks)} lines to {self.cfg.ctc_workers} workers... "
+                    f"({gpu_pruned_count} GPU-pruned, sample_keep_indices={len(sample_ki) if sample_ki is not None else 'N/A'})"
+                )
+            else:
+                logger.info(
+                    f"[Phase 2] Submitting {len(all_decode_tasks)} lines to {self.cfg.ctc_workers} workers... (0 GPU-pruned)"
                 )
 
-        all_decode_results = results
-        decode_time = time.perf_counter() - decode_start
-        num_results = len(all_decode_results) if all_decode_results else 0
-        avg_ipc_in = total_ipc_in / num_results if num_results > 0 else 0
-        avg_ipc_out = total_ipc_out / num_results if num_results > 0 else 0
-        ms_per_line = decode_time * 1000 / num_results if num_results > 0 else 0
-        logger.info(
-            f"[Phase 2] All {num_results} lines decoded in {decode_time:.2f}s "
-            f"({ms_per_line:.1f}ms/line, avg_ipc_in={avg_ipc_in:.1f}ms, avg_ipc_out={avg_ipc_out:.1f}ms)"
-        )
+            # Submit ALL lines at once to ProcessPoolExecutor
+            futures = []
+            for page_idx, line_idx, cropped, inferred, keep_indices in all_decode_tasks:
+                submit_time = time.perf_counter()
+                pruned_vocab = [vocab[i] for i in keep_indices] if keep_indices is not None else vocab
 
-        # Group results by page
-        page_results: dict[int, tuple[InferredPage, list[LineDecodeResult]]] = {}
-        for (page_idx, _, _, inferred, _), decode_result in zip(futures, all_decode_results, strict=True):
-            if page_idx not in page_results:
-                page_results[page_idx] = (inferred, [])
-            page_results[page_idx][1].append(decode_result)
+                # Use decode_logits_with_segments for structured output
+                original_width = inferred.processed_page.orig_width
+                future = loop.run_in_executor(
+                    self._ctc_executor,
+                    _decode_single_line_with_segments,
+                    cropped,
+                    pruned_vocab,
+                    original_width,
+                    self.cfg.beam_width,
+                    self.cfg.token_min_logp,
+                    submit_time,
+                )
+                futures.append((page_idx, line_idx, future, inferred, submit_time))
 
-        # Build PageOCRResult objects for each page
-        results_to_write = []
-        for page_idx in sorted(page_results.keys()):
-            inferred, line_decode_results = page_results[page_idx]
+            # Wait for decodes with progress logging
+            decode_start = time.perf_counter()
+            total_lines = len(futures)
+            completed = 0
 
-            # Build PageOCRResult using the structured approach
-            page_result = _build_page_ocr_result(inferred.processed_page, line_decode_results)
-            results_to_write.append(page_result)
-            self.stats["decoded"] += 1
+            # Wait for all decodes and log each line as it completes
+            pending = {
+                f[2]: (f[0], f[1], f[3], f[4]) for f in futures
+            }  # future -> (page_idx, line_idx, inferred, submit_time)
+            results = [None] * total_lines
+            total_ipc_in = 0.0
+            total_ipc_out = 0.0
 
-        # Emit results and write to parquet concurrently
-        async def emit_results() -> None:
-            for result in results_to_write:
-                await self.q_results.put(result)
-            await self.q_results.put(EndOfStream(stream="results", producer="run_sequential"))
+            while pending:
+                done, _ = await asyncio.wait(pending.keys(), return_when=asyncio.FIRST_COMPLETED)
+                for future in done:
+                    page_idx, line_idx, inferred, submit_time = pending.pop(future)
+                    result_time = time.perf_counter()
+                    line_decode_result, decode_ms, ipc_in_ms, worker_pid = future.result()
+                    ipc_out_ms = (time.perf_counter() - result_time) * 1000  # Time to deserialize result
+                    total_roundtrip_ms = (result_time - submit_time) * 1000
+                    total_ipc_in += ipc_in_ms
+                    total_ipc_out += ipc_out_ms
+                    idx = next(i for i, f in enumerate(futures) if f[2] is future)
+                    results[idx] = line_decode_result
+                    completed += 1
+                    logger.info(
+                        f"[CTC] line {completed}/{total_lines} page={page_idx} line={line_idx} worker={worker_pid} "
+                        f"decode={decode_ms:.1f}ms ipc_in={ipc_in_ms:.1f}ms roundtrip={total_roundtrip_ms:.1f}ms"
+                    )
 
-        await asyncio.gather(
-            emit_results(),
-            self._output_writer(output_parquet_uri, total_pages),
-        )
+            all_decode_results = results
+            decode_time = time.perf_counter() - decode_start
+            num_results = len(all_decode_results) if all_decode_results else 0
+            avg_ipc_in = total_ipc_in / num_results if num_results > 0 else 0
+            avg_ipc_out = total_ipc_out / num_results if num_results > 0 else 0
+            ms_per_line = decode_time * 1000 / num_results if num_results > 0 else 0
+            logger.info(
+                f"[Phase 2] All {num_results} lines decoded in {decode_time:.2f}s "
+                f"({ms_per_line:.1f}ms/line, avg_ipc_in={avg_ipc_in:.1f}ms, avg_ipc_out={avg_ipc_out:.1f}ms)"
+            )
 
-        phase2_time = time.perf_counter() - phase2_start
-        logger.info(
-            f"[Phase 2] CTC decode + write complete in {phase2_time:.2f}s - decoded {self.stats['decoded']} pages"
-        )
+            # Group results by page
+            page_results: dict[int, tuple[InferredPage, list[LineDecodeResult]]] = {}
+            for (page_idx, _, _, inferred, _), decode_result in zip(futures, all_decode_results, strict=True):
+                if page_idx not in page_results:
+                    page_results[page_idx] = (inferred, [])
+                page_results[page_idx][1].append(decode_result)
 
-        elapsed = time.perf_counter() - start_time
-        logger.info(
-            f"[AsyncOCRPipeline] SEQUENTIAL completed in {elapsed:.2f}s - "
-            f"fetched={self.stats['fetched']}, processed={self.stats['processed']}, "
-            f"inferred={self.stats['inferred']}, decoded={self.stats['decoded']}, "
-            f"errors={self.stats['errors']}"
-        )
+            # Build PageOCRResult objects for each page
+            results_to_write = []
+            for page_idx in sorted(page_results.keys()):
+                inferred, line_decode_results = page_results[page_idx]
 
-        return self.stats
+                # Build PageOCRResult using the structured approach
+                page_result = _build_page_ocr_result(inferred.processed_page, line_decode_results)
+                results_to_write.append(page_result)
+                self.stats["decoded"] += 1
+
+            # Emit results and write to parquet concurrently
+            async def emit_results() -> None:
+                for result in results_to_write:
+                    await self.q_results.put(result)
+                await self.q_results.put(EndOfStream(stream="results", producer="run_sequential"))
+
+            await asyncio.gather(
+                emit_results(),
+                self._output_writer(output_parquet_uri, total_pages),
+            )
+
+            phase2_time = time.perf_counter() - phase2_start
+            logger.info(
+                f"[Phase 2] CTC decode + write complete in {phase2_time:.2f}s - decoded {self.stats['decoded']} pages"
+            )
+
+            elapsed = time.perf_counter() - start_time
+            logger.info(
+                f"[AsyncOCRPipeline] SEQUENTIAL completed in {elapsed:.2f}s - "
+                f"fetched={self.stats['fetched']}, processed={self.stats['processed']}, "
+                f"inferred={self.stats['inferred']}, decoded={self.stats['decoded']}, "
+                f"errors={self.stats['errors']}"
+            )
+
+            return self.stats
+
+        finally:
+            self._is_running = False
+            self._stage_tasks = []
 
     async def _parquet_loader(self, ld_parquet_uri: str) -> None:
         """Load LD parquet file asynchronously.
@@ -570,7 +716,7 @@ class AsyncOCRPipeline:
             # Signal that parquet loading is complete (success or failure)
             self._parquet_ready.set()
 
-    async def _prefetcher(self, pages: list[tuple[int, str]]) -> None:
+    async def _prefetcher(self, tasks: list[ImageTask]) -> None:
         """Fetch images from S3 with high concurrency.
         
         Outputs PrefetchedBytes (raw bytes without LD metadata).
@@ -578,10 +724,10 @@ class AsyncOCRPipeline:
         """
         logger.info(f"[Prefetcher] Starting with {self.cfg.prefetch_concurrency} concurrency")
 
-        async def fetch_one(page_idx: int, filename: str) -> None:
+        async def fetch_one(task: ImageTask) -> None:
             async with self._s3_sem:
                 try:
-                    key = f"{self.volume_prefix}/{filename}"
+                    key = f"{self.volume_prefix}/{task.filename}"
                     loop = asyncio.get_event_loop()
 
                     def _fetch() -> tuple[str, bytes]:
@@ -592,8 +738,7 @@ class AsyncOCRPipeline:
 
                     await self.q_fetched.put(
                         PrefetchedBytes(
-                            page_idx=page_idx,
-                            filename=filename,
+                            task=task,
                             source_etag=source_etag,
                             file_bytes=file_bytes,
                         )
@@ -604,12 +749,11 @@ class AsyncOCRPipeline:
                         logger.info(f"[Prefetcher] Fetched {self.stats['fetched']} pages")
 
                 except Exception as e:
-                    logger.warning(f"[Prefetcher] Failed to fetch {filename}: {e}")
+                    logger.warning(f"[Prefetcher] Failed to fetch {task.filename}: {e}")
                     await self.q_fetched.put(
                         PipelineError(
                             stage="Prefetcher",
-                            page_idx=page_idx,
-                            filename=filename,
+                            task=task,
                             source_etag=None,
                             error_type=type(e).__name__,
                             message=str(e),
@@ -619,7 +763,7 @@ class AsyncOCRPipeline:
 
         # Create all fetch tasks
         fetch_tasks = [
-            asyncio.create_task(fetch_one(page_idx, filename)) for page_idx, filename in pages
+            asyncio.create_task(fetch_one(task)) for task in tasks
         ]
 
         # Wait for all fetches
@@ -656,8 +800,7 @@ class AsyncOCRPipeline:
                 await self.q_processed.put(
                     PipelineError(
                         stage="ImageProcessor",
-                        page_idx=prefetched.page_idx,
-                        filename=prefetched.filename,
+                        task=prefetched.task,
                         source_etag=prefetched.source_etag,
                         error_type="ParquetLoadError",
                         message=f"LD parquet loading failed: {self._parquet_error}",
@@ -694,8 +837,7 @@ class AsyncOCRPipeline:
                     await self.q_processed.put(
                         PipelineError(
                             stage="ImageProcessor",
-                            page_idx=fetched.page_idx,
-                            filename=fetched.filename,
+                            task=fetched.task,
                             source_etag=fetched.source_etag,
                             error_type=type(e).__name__,
                             message=str(e),
@@ -725,8 +867,7 @@ class AsyncOCRPipeline:
                 await self.q_processed.put(
                     PipelineError(
                         stage="ImageProcessor",
-                        page_idx=prefetched.page_idx,
-                        filename=prefetched.filename,
+                        task=prefetched.task,
                         source_etag=prefetched.source_etag,
                         error_type="MissingLDData",
                         message=f"No LD data found for {prefetched.filename} in parquet",
@@ -737,8 +878,7 @@ class AsyncOCRPipeline:
             
             # Combine prefetched bytes with LD row to create FetchedBytes
             fetched = FetchedBytes(
-                page_idx=prefetched.page_idx,
-                filename=prefetched.filename,
+                task=prefetched.task,
                 source_etag=prefetched.source_etag,
                 file_bytes=prefetched.file_bytes,
                 ld_row=ld_row,
@@ -956,8 +1096,7 @@ class AsyncOCRPipeline:
                     await self.q_results.put(
                         PipelineError(
                             stage="CTCDecoder",
-                            page_idx=inferred.page_idx,
-                            filename=inferred.filename,
+                            task=inferred.task,
                             source_etag=inferred.source_etag,
                             error_type=type(e).__name__,
                             message=str(e),
@@ -1031,8 +1170,7 @@ class AsyncOCRPipeline:
     def _create_error_page(self, inferred: InferredPage, error: str | None) -> PageResult:
         """Create a PageResult for error cases."""
         return PageResult(
-            page_idx=inferred.page_idx,
-            filename=inferred.filename,
+            task=inferred.task,
             source_etag=inferred.source_etag,
             texts=[],
             error=error or inferred.error,
@@ -1052,8 +1190,7 @@ class AsyncOCRPipeline:
     def _create_inferred_page(self, page: ProcessedPage, logits_list: list) -> InferredPage:
         """Create InferredPage from ProcessedPage and logits."""
         return InferredPage(
-            page_idx=page.page_idx,
-            filename=page.filename,
+            task=page.task,
             source_etag=page.source_etag,
             logits_list=logits_list,
             processed_page=page,

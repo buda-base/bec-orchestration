@@ -26,6 +26,7 @@ if TYPE_CHECKING:
 
 from .config import TIBETAN_WORD_DELIMITERS, OCRV1Config
 from .ctc_decoder import CTCDecoder
+from .data_structures import ImageTask
 from .model import OCRModel
 from .pipeline_async import AsyncOCRPipeline
 
@@ -153,9 +154,9 @@ class OCRV1JobWorkerAsync:
         total_images = len(manifest_filenames)
         sorted_filenames = sorted(manifest_filenames)
 
-        # Build page list (just page_idx and filename - parquet loaded async by pipeline)
-        pages: list[tuple[int, str]] = [
-            (page_idx, filename)
+        # Build ImageTask list (parquet loaded async by pipeline)
+        tasks = [
+            ImageTask(page_idx=page_idx, filename=filename)
             for page_idx, filename in enumerate(sorted_filenames)
         ]
 
@@ -176,9 +177,9 @@ class OCRV1JobWorkerAsync:
 
         try:
             if self.cfg.use_sequential_pipeline:
-                stats = await pipeline.run_sequential(pages, ld_parquet_uri, output_parquet_uri)
+                stats = await pipeline.run_sequential(tasks, ld_parquet_uri, output_parquet_uri)
             else:
-                stats = await pipeline.run(pages, ld_parquet_uri, output_parquet_uri)
+                stats = await pipeline.run(tasks, ld_parquet_uri, output_parquet_uri)
         finally:
             await pipeline.close()
 

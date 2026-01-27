@@ -63,6 +63,7 @@ class OCRV1Config:
     ctc_workers: int = 8  # Process pool size for CTC decoding
     gpu_batch_size: int = 16  # Batch size for GPU inference
     use_sequential_pipeline: bool = False  # Run GPU first, then CTC (reduces contention)
+    volume_timeout_s: float = 600.0  # Timeout for volume processing (10 minutes)
 
     # -------------------------------------------------------------------------
     # CTC Decoding

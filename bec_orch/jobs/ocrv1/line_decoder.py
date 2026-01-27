@@ -26,6 +26,8 @@ from .line import get_line_image
 if TYPE_CHECKING:
     from .config import OCRV1Config
 
+from .data_structures import ImageTask
+
 logger = logging.getLogger(__name__)
 
 
@@ -41,21 +43,37 @@ class PrefetchedBytes:
     This is produced by the prefetcher before the parquet file is loaded.
     """
 
-    page_idx: int
-    filename: str
+    task: ImageTask
     source_etag: str
     file_bytes: bytes
+
+    # Convenience properties
+    @property
+    def page_idx(self) -> int:
+        return self.task.page_idx
+
+    @property
+    def filename(self) -> str:
+        return self.task.filename
 
 
 @dataclass
 class FetchedBytes:
     """Input for LineDecoder - raw image bytes with LD metadata."""
 
-    page_idx: int
-    filename: str
+    task: ImageTask
     source_etag: str
     file_bytes: bytes
     ld_row: dict  # Contains contours, rotation_angle, tps_points, etc.
+
+    # Convenience properties
+    @property
+    def page_idx(self) -> int:
+        return self.task.page_idx
+
+    @property
+    def filename(self) -> str:
+        return self.task.filename
 
 
 @dataclass
@@ -75,8 +93,7 @@ class ProcessedLine:
 class ProcessedPage:
     """Output of LineDecoder for one page."""
 
-    page_idx: int
-    filename: str
+    task: ImageTask
     source_etag: str
     lines: list[ProcessedLine]
     # Page-level metadata for coordinate reconstruction
@@ -89,6 +106,15 @@ class ProcessedPage:
     tps_points: tuple | None = None  # ((input_pts, output_pts), alpha) or None
     scale_factor: float = 1.0  # Scale factor from original to resized image (resized/original)
     error: str | None = None
+
+    # Convenience properties
+    @property
+    def page_idx(self) -> int:
+        return self.task.page_idx
+
+    @property
+    def filename(self) -> str:
+        return self.task.filename
 
 
 # -----------------------------------------------------------------------------
@@ -261,8 +287,7 @@ class LineDecoder:
         except Exception as e:
             logger.warning(f"[LineDecoder] Failed to process {fetched.filename}: {e}")
             return ProcessedPage(
-                page_idx=fetched.page_idx,
-                filename=fetched.filename,
+                task=fetched.task,
                 source_etag=fetched.source_etag,
                 lines=[],
                 orig_width=0,
@@ -329,8 +354,7 @@ class LineDecoder:
         contours = ld_row.get("contours", [])
         if not contours:
             return ProcessedPage(
-                page_idx=fetched.page_idx,
-                filename=fetched.filename,
+                task=fetched.task,
                 source_etag=fetched.source_etag,
                 lines=[],
                 orig_width=orig_w,
@@ -406,8 +430,7 @@ class LineDecoder:
             )
 
         return ProcessedPage(
-            page_idx=fetched.page_idx,
-            filename=fetched.filename,
+            task=fetched.task,
             source_etag=fetched.source_etag,
             lines=lines,
             orig_width=orig_w,

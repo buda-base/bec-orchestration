@@ -21,6 +21,24 @@ if TYPE_CHECKING:
 
 
 # =============================================================================
+# Task Identity
+# =============================================================================
+
+
+@dataclass(frozen=True)
+class ImageTask:
+    """
+    Identity of a single image/page to process.
+    
+    Frozen dataclass that uniquely identifies a page in the pipeline.
+    Replaces tuple-based (page_idx, filename) passing.
+    """
+
+    page_idx: int
+    filename: str
+
+
+# =============================================================================
 # Pipeline Control Messages
 # =============================================================================
 
@@ -58,11 +76,19 @@ class PipelineError:
         "OutputWriter",
         "Pipeline",
     ]
-    page_idx: int
-    filename: str
+    task: ImageTask
     source_etag: Optional[str]
     error_type: str
     message: str
+
+    # Convenience properties for backward compatibility
+    @property
+    def page_idx(self) -> int:
+        return self.task.page_idx
+
+    @property
+    def filename(self) -> str:
+        return self.task.filename
 
 
 # =============================================================================
@@ -126,12 +152,20 @@ class InferredPage:
     ProcessedPage data needed for building the final result.
     """
 
-    page_idx: int
-    filename: str
+    task: ImageTask
     source_etag: str
     logits_list: list[LineLogits]
     processed_page: "ProcessedPage"
     error: Optional[str] = None
+
+    # Convenience properties
+    @property
+    def page_idx(self) -> int:
+        return self.task.page_idx
+
+    @property
+    def filename(self) -> str:
+        return self.task.filename
 
 
 # =============================================================================
@@ -204,8 +238,16 @@ class PageOCRResult:
 class PageResult:
     """Legacy page result for backward compatibility."""
 
-    page_idx: int
-    filename: str
+    task: ImageTask
     source_etag: str
     texts: list[str]
     error: str | None = None
+
+    # Convenience properties
+    @property
+    def page_idx(self) -> int:
+        return self.task.page_idx
+
+    @property
+    def filename(self) -> str:
+        return self.task.filename

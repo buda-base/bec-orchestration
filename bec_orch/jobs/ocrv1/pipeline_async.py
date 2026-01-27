@@ -24,12 +24,15 @@ import numpy.typing as npt
 from botocore.client import BaseClient
 
 from .data_structures import (
+    EndOfStream,
+    InferredPage,
     LineLogits,
     LineResult,
     PageInFlight,
     PageOCRResult,
     PageResult,
     PendingTensor,
+    PipelineError,
 )
 from .line import BBox
 
@@ -209,23 +212,7 @@ def _decode_page_lines(
 
 
 # FetchedBytes and ProcessedPage are imported from line_decoder
-
-
-@dataclass
-class InferredPage:
-    page_idx: int
-    filename: str
-    source_etag: str
-    logits_list: list[LineLogits]  # Structured line logits data
-    processed_page: ProcessedPage  # Original processed page data for line grouping
-    error: str | None = None
-
-
-class EndOfStream:
-    pass
-
-
-EOS = EndOfStream()
+# InferredPage, EndOfStream, PipelineError are imported from data_structures
 
 
 class AsyncOCRPipeline:
@@ -510,7 +497,7 @@ class AsyncOCRPipeline:
         async def emit_results() -> None:
             for result in results_to_write:
                 await self.q_results.put(result)
-            await self.q_results.put(EOS)
+            await self.q_results.put(EndOfStream(stream="results", producer="run_sequential"))
 
         await asyncio.gather(
             emit_results(),
@@ -558,7 +545,16 @@ class AsyncOCRPipeline:
 
                 except Exception as e:
                     logger.warning(f"[Prefetcher] Failed to fetch {filename}: {e}")
-                    await self.q_fetched.put(self._create_fetched_bytes(page_idx, filename, ld_row))
+                    await self.q_fetched.put(
+                        PipelineError(
+                            stage="Prefetcher",
+                            page_idx=page_idx,
+                            filename=filename,
+                            source_etag=None,
+                            error_type=type(e).__name__,
+                            message=str(e),
+                        )
+                    )
                     self.stats["errors"] += 1
 
         # Create all fetch tasks
@@ -570,7 +566,7 @@ class AsyncOCRPipeline:
         await asyncio.gather(*fetch_tasks)
 
         # Signal end of stream
-        await self.q_fetched.put(EOS)
+        await self.q_fetched.put(EndOfStream(stream="fetched", producer="Prefetcher"))
         logger.info(f"[Prefetcher] Done, fetched {self.stats['fetched']} pages")
 
     async def _image_processor(self) -> None:
@@ -584,10 +580,6 @@ class AsyncOCRPipeline:
 
         async def process_one(fetched: FetchedBytes) -> None:
             async with sem:
-                if not fetched.file_bytes:
-                    await self.q_processed.put(self._create_processed_page(fetched, "Failed to fetch image"))
-                    return
-
                 try:
                     processed = await loop.run_in_executor(
                         self._image_executor,
@@ -602,7 +594,16 @@ class AsyncOCRPipeline:
 
                 except Exception as e:
                     logger.warning(f"[ImageProcessor] Failed to process {fetched.filename}: {e}")
-                    await self.q_processed.put(self._create_processed_page(fetched, str(e)))
+                    await self.q_processed.put(
+                        PipelineError(
+                            stage="ImageProcessor",
+                            page_idx=fetched.page_idx,
+                            filename=fetched.filename,
+                            source_etag=fetched.source_etag,
+                            error_type=type(e).__name__,
+                            message=str(e),
+                        )
+                    )
                     self.stats["errors"] += 1
 
         while True:
@@ -611,8 +612,13 @@ class AsyncOCRPipeline:
                 # Wait for all pending tasks
                 if pending_tasks:
                     await asyncio.gather(*pending_tasks, return_exceptions=True)
-                await self.q_processed.put(EOS)
+                await self.q_processed.put(EndOfStream(stream="processed", producer="ImageProcessor"))
                 break
+
+            # Forward PipelineError downstream
+            if isinstance(msg, PipelineError):
+                await self.q_processed.put(msg)
+                continue
 
             fetched: FetchedBytes = msg
             task = asyncio.create_task(process_one(fetched))
@@ -725,8 +731,13 @@ class AsyncOCRPipeline:
                     await self.q_inferred.put(self._create_inferred_page(page_flight.processed_page, logits_list))
                     self.stats["inferred"] += 1
 
-                await self.q_inferred.put(EOS)
+                await self.q_inferred.put(EndOfStream(stream="inferred", producer="GPUInference"))
                 break
+
+            # Forward PipelineError downstream
+            if isinstance(msg, PipelineError):
+                await self.q_inferred.put(msg)
+                continue
 
             processed: ProcessedPage = msg
             pages_received += 1
@@ -819,7 +830,16 @@ class AsyncOCRPipeline:
 
                 except Exception as e:
                     logger.warning(f"[CTCDecoder] Failed to decode {inferred.filename}: {e}")
-                    await self.q_results.put(self._create_error_page_ocr(inferred, str(e)))
+                    await self.q_results.put(
+                        PipelineError(
+                            stage="CTCDecoder",
+                            page_idx=inferred.page_idx,
+                            filename=inferred.filename,
+                            source_etag=inferred.source_etag,
+                            error_type=type(e).__name__,
+                            message=str(e),
+                        )
+                    )
                     self.stats["errors"] += 1
 
         while True:
@@ -827,8 +847,13 @@ class AsyncOCRPipeline:
             if isinstance(msg, EndOfStream):
                 if pending_tasks:
                     await asyncio.gather(*pending_tasks, return_exceptions=True)
-                await self.q_results.put(EOS)
+                await self.q_results.put(EndOfStream(stream="results", producer="CTCDecoder"))
                 break
+
+            # Forward PipelineError downstream
+            if isinstance(msg, PipelineError):
+                await self.q_results.put(msg)
+                continue
 
             inferred: InferredPage = msg
             pages_received += 1
@@ -851,12 +876,19 @@ class AsyncOCRPipeline:
 
         writer = OutputWriter(volume_id, output_prefix)
         pages_written = 0
+        errors_received = 0
 
         try:
             while True:
                 msg = await self.q_results.get()
                 if isinstance(msg, EndOfStream):
                     break
+
+                # Handle PipelineError
+                if isinstance(msg, PipelineError):
+                    writer.write_error(msg)
+                    errors_received += 1
+                    continue
 
                 result: PageOCRResult = msg
                 writer.write_page(result)
@@ -867,7 +899,11 @@ class AsyncOCRPipeline:
         finally:
             writer.close()
 
-        logger.info(f"[OutputWriter] Done, wrote {pages_written} pages")
+        error_stats = writer.get_error_stats()
+        logger.info(
+            f"[OutputWriter] Done, wrote {pages_written} pages, {errors_received} errors. "
+            f"Stats: {error_stats}"
+        )
 
     def _create_error_page(self, inferred: InferredPage, error: str | None) -> PageResult:
         """Create a PageResult for error cases."""

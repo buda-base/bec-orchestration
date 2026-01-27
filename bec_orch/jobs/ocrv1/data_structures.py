@@ -1,7 +1,15 @@
-"""Shared data structures for OCR pipeline."""
+"""Shared data structures for OCR pipeline.
+
+This module defines:
+- Pipeline message types (EndOfStream, PipelineError)
+- Intermediate data structures (LineLogits, InferredPage, etc.)
+- Output data structures (PageOCRResult, LineResult, etc.)
+"""
+
+from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal, Optional, Union
 
 import numpy.typing as npt
 
@@ -9,7 +17,57 @@ from .line import BBox
 
 if TYPE_CHECKING:
     from .ctc_decoder import SyllableSegment
-    from .line_decoder import ProcessedPage
+    from .line_decoder import FetchedBytes, ProcessedPage
+
+
+# =============================================================================
+# Pipeline Control Messages
+# =============================================================================
+
+
+@dataclass(frozen=True)
+class EndOfStream:
+    """
+    Explicit end-of-stream marker for pipeline stages.
+
+    Each stage sends this when it has finished producing messages.
+    The stream field identifies which queue this EOS is for.
+    """
+
+    stream: Literal["fetched", "processed", "inferred", "results"]
+    producer: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class PipelineError:
+    """
+    Error message that can flow through queues.
+
+    When a stage encounters an error processing a page, it creates a PipelineError
+    and sends it downstream instead of the normal data. This allows:
+    - Errors to be tracked and logged by the writer
+    - Other pages to continue processing
+    - Consistent error handling across all stages
+    """
+
+    stage: Literal[
+        "Prefetcher",
+        "ImageProcessor",
+        "GPUInference",
+        "CTCDecoder",
+        "OutputWriter",
+        "Pipeline",
+    ]
+    page_idx: int
+    filename: str
+    source_etag: Optional[str]
+    error_type: str
+    message: str
+
+
+# =============================================================================
+# Internal Pipeline Data Structures
+# =============================================================================
 
 
 @dataclass
@@ -59,8 +117,47 @@ class PageInFlight:
     line_logits: dict[int, LineLogits]  # Collected LineLogits objects by line index
 
 
+@dataclass
+class InferredPage:
+    """
+    Output of GPU inference stage, input to CTC decoder.
+
+    Contains the logits for all lines in a page, plus the original
+    ProcessedPage data needed for building the final result.
+    """
+
+    page_idx: int
+    filename: str
+    source_etag: str
+    logits_list: list[LineLogits]
+    processed_page: "ProcessedPage"
+    error: Optional[str] = None
+
+
 # =============================================================================
-# New data structures for dual output format
+# Queue Message Type Unions
+# =============================================================================
+
+# Each queue can receive one of these message types:
+# - The normal data payload
+# - A PipelineError (if processing failed for this page)
+# - EndOfStream (when the producer is done)
+
+# q_fetched: Prefetcher -> ImageProcessor
+FetchedBytesMsg = Union["FetchedBytes", PipelineError, EndOfStream]
+
+# q_processed: ImageProcessor -> GPUInference
+ProcessedPageMsg = Union["ProcessedPage", PipelineError, EndOfStream]
+
+# q_inferred: GPUInference -> CTCDecoder
+InferredPageMsg = Union[InferredPage, PipelineError, EndOfStream]
+
+# q_results: CTCDecoder -> OutputWriter
+PageOCRResultMsg = Union["PageOCRResult", PipelineError, EndOfStream]
+
+
+# =============================================================================
+# Output Data Structures
 # =============================================================================
 
 
@@ -72,12 +169,12 @@ class LineResult:
     bbox: BBox
     text: str
     confidence: float
-    syllables: list["SyllableSegment"]  # from CTC decoder, always populated
+    syllables: list["SyllableSegment"]  # from CTC decoder
 
 
 @dataclass
 class PageOCRResult:
-    """Complete OCR result for a page with structured line/syllable data."""
+    """Complete OCR result for a page with structured line/segment/syllable data."""
 
     img_file_name: str
     source_etag: str

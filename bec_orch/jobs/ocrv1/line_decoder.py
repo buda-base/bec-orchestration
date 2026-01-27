@@ -74,6 +74,7 @@ class ProcessedPage:
     # Transform parameters applied to get from original to transformed coordinates
     rotation_angle: float = 0.0  # Rotation angle in degrees
     tps_points: tuple | None = None  # ((input_pts, output_pts), alpha) or None
+    scale_factor: float = 1.0  # Scale factor from original to resized image (resized/original)
     error: str | None = None
 
 
@@ -285,11 +286,18 @@ class LineDecoder:
                     f"{orig_w}x{orig_h} -> {actual_w}x{actual_h} (scale={scale_factor:.3f})"
                 )
 
-        # Extract and scale TPS points if present
+        # Extract TPS points if present
         rotation_angle = ld_row.get("rotation_angle", 0.0) or 0.0
         tps_points = ld_row.get("tps_points")
         tps_alpha = ld_row.get("tps_alpha", 0.5)
 
+        # Keep original TPS points for output (in original image coordinates)
+        tps_info = None
+        if tps_points:
+            orig_input_pts, orig_output_pts = tps_points
+            tps_info = ((orig_input_pts, orig_output_pts), tps_alpha)
+
+        # Scale TPS points for internal processing on resized image
         tps_input_pts = None
         tps_output_pts = None
         if tps_points:
@@ -300,14 +308,9 @@ class LineDecoder:
                 if tps_output_pts is not None:
                     tps_output_pts = [[p[0] * scale_factor, p[1] * scale_factor] for p in tps_output_pts]
 
-        # Apply transforms (rotation + TPS)
+        # Apply transforms (rotation + TPS) using scaled points
         image = apply_transform_1(image, rotation_angle, tps_input_pts, tps_output_pts, tps_alpha)
         transformed_h, transformed_w = image.shape[:2]
-
-        # Build TPS info for output (scaled points + alpha)
-        tps_info = None
-        if tps_input_pts is not None or tps_output_pts is not None:
-            tps_info = ((tps_input_pts, tps_output_pts), tps_alpha)
 
         # Get contours from LD row
         contours = ld_row.get("contours", [])
@@ -323,6 +326,7 @@ class LineDecoder:
                 transformed_height=transformed_h,
                 rotation_angle=rotation_angle,
                 tps_points=tps_info,
+                scale_factor=scale_factor,
             )
 
         # Scale contours to match resized image
@@ -399,6 +403,7 @@ class LineDecoder:
             transformed_height=transformed_h,
             rotation_angle=rotation_angle,
             tps_points=tps_info,
+            scale_factor=scale_factor,
         )
 
     def _extract_line(

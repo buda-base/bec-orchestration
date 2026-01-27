@@ -136,7 +136,7 @@ class GzipJsonlWriter:
         self._gzip = gzip.GzipFile(fileobj=self._file, mode="wb")
 
     def write_page(self, result: PageOCRResult) -> None:
-        """Write one page with all lines/segments/syllables as a single JSON line."""
+        """Write one page with all lines/syllables as a single JSON line."""
         if self._gzip is None:
             self._open_writer()
 
@@ -159,25 +159,16 @@ class GzipJsonlWriter:
                 "lines": [
                     {
                         "line_idx": line.line_idx,
+                        "bbox": line.bbox.as_list(),
                         "text": line.text,
                         "confidence": line.confidence,
-                        "segments": [
+                        "syllables": [
                             {
-                                "segment_idx": seg.segment_idx,
-                                "bbox": seg.bbox.as_list(),
-                                "text": seg.text,
-                                "confidence": seg.confidence,
-                                "syllables": [
-                                    {
-                                        "px": [s.start_pixel, s.end_pixel],
-                                        "t": s.text,
-                                        "d": s.trailing_delimiters,
-                                        "c": s.confidence,
-                                    }
-                                    for s in seg.syllables
-                                ],
+                                "px": [s.start_pixel, s.end_pixel],
+                                "t": s.text,
+                                "c": s.confidence,
                             }
-                            for seg in line.segments
+                            for s in line.syllables
                         ],
                     }
                     for line in result.lines

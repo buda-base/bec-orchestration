@@ -21,25 +21,18 @@ class SyllableSegment:
     Attributes:
         start_pixel: Starting pixel position (x-coordinate) in the line image
         end_pixel: Ending pixel position (x-coordinate) in the line image
-        text: The clean decoded text (syllable without trailing delimiters)
-        trailing_delimiters: Delimiter(s) that follow this syllable (e.g., "་" or "།")
+        text: The decoded text including any trailing delimiters
         confidence: Confidence score (normalized log probability, typically -inf to 0)
     """
 
     start_pixel: int
     end_pixel: int
     text: str
-    trailing_delimiters: str
     confidence: float
 
-    @property
-    def full_text(self) -> str:
-        """Return text with trailing delimiters included."""
-        return self.text + self.trailing_delimiters
-
     def as_tuple(self) -> tuple[int, int, str, float]:
-        """Return (start_pixel, end_pixel, full_text, confidence) tuple."""
-        return (self.start_pixel, self.end_pixel, self.full_text, self.confidence)
+        """Return (start_pixel, end_pixel, text, confidence) tuple."""
+        return (self.start_pixel, self.end_pixel, self.text, self.confidence)
 
 
 @dataclass
@@ -505,12 +498,14 @@ def _process_segments_from_beam(
         start_pixel = int(start_frame * pixels_per_frame)
         end_pixel = int(end_frame * pixels_per_frame)
 
+        # Combine syllable text with trailing delimiters
+        full_text = syllable + trailing
+
         segments.append(
             SyllableSegment(
                 start_pixel=start_pixel,
                 end_pixel=end_pixel,
-                text=syllable,
-                trailing_delimiters=trailing,
+                text=full_text,
                 confidence=seg_conf,
             )
         )

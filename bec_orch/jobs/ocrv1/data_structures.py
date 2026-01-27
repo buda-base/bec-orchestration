@@ -65,10 +65,10 @@ class PageInFlight:
 
 
 @dataclass
-class SegmentResult:
-    """Result for a single text segment with OCR output and bounding box."""
+class LineResult:
+    """Result for a single OCR line with text, bounding box, and syllable details."""
 
-    segment_idx: int
+    line_idx: int
     bbox: BBox
     text: str
     confidence: float
@@ -76,18 +76,8 @@ class SegmentResult:
 
 
 @dataclass
-class LineResult:
-    """Result for a logical line (may contain multiple segments)."""
-
-    line_idx: int
-    text: str  # segments joined with space
-    confidence: float  # weighted average
-    segments: list[SegmentResult]
-
-
-@dataclass
 class PageOCRResult:
-    """Complete OCR result for a page with structured line/segment/syllable data."""
+    """Complete OCR result for a page with structured line/syllable data."""
 
     img_file_name: str
     source_etag: str

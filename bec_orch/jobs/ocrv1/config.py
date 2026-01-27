@@ -44,7 +44,7 @@ class OCRV1Config:
     # -------------------------------------------------------------------------
     input_width: int  # Model input width (e.g., 2048)
     input_height: int  # Model input height (e.g., 64)
-    apply_log_softmax: bool = True  # Set to false for the new version of the model
+    apply_log_softmax: bool = False  # Set to false for the new version of the model
 
     # -------------------------------------------------------------------------
     # Image processing

@@ -30,9 +30,8 @@ from .data_structures import (
     PageOCRResult,
     PageResult,
     PendingTensor,
-    SegmentResult,
 )
-from .line import BBox, build_line_data, sort_lines_by_threshold
+from .line import BBox
 
 if TYPE_CHECKING:
     from .config import OCRV1Config
@@ -62,7 +61,12 @@ def _build_page_ocr_result(
     processed_page: ProcessedPage,
     line_decode_results: list[LineDecodeResult],
 ) -> PageOCRResult:
-    """Build PageOCRResult from processed page and line decode results."""
+    """Build PageOCRResult from processed page and line decode results.
+
+    Each ProcessedLine is already a complete logical line (line segments are merged
+    in line_decoder.py if merge_line_segments is enabled). We create a 1:1 mapping
+    from ProcessedLine to LineResult.
+    """
     if processed_page.error:
         return PageOCRResult(
             img_file_name=processed_page.filename,
@@ -73,59 +77,29 @@ def _build_page_ocr_result(
             error=processed_page.error,
         )
 
-    # Group line segments into logical lines
-    line_objects = [
-        build_line_data(processed_line.contours[0] if processed_line.contours else [])
-        for i, processed_line in enumerate(processed_page.lines)
-        if i < len(line_decode_results)
-    ]
+    # Build LineResult objects - one per ProcessedLine (already grouped/merged)
+    # Convert bbox from resized image coordinates to original image coordinates
+    scale_factor = processed_page.scale_factor
+    inv_scale = 1.0 / scale_factor if scale_factor != 0 else 1.0
 
-    # Sort and group lines
-    grouped_lines = sort_lines_by_threshold(line_objects)
-
-    # Build LineResult objects
     line_results = []
-    for line_idx, line_group in enumerate(grouped_lines):
-        # Combine all segments in this logical line
-        segments = []
-        line_text_parts = []
-        total_weighted_confidence = 0.0
-        total_chars = 0
+    for line_idx, (processed_line, decode_result) in enumerate(
+        zip(processed_page.lines, line_decode_results, strict=False)
+    ):
+        x, y, w, h = processed_line.bbox
 
-        for line_obj in line_group:
-            # Find the corresponding ProcessedLine and decode result
-            processed_line_idx = next(
-                (i for i, pl in enumerate(processed_page.lines) if pl.contours and line_obj.center == pl.bbox[:2]), 0
-            )
+        # Scale bbox back to original image coordinates
+        orig_x = int(x * inv_scale)
+        orig_y = int(y * inv_scale)
+        orig_w = int(w * inv_scale)
+        orig_h = int(h * inv_scale)
 
-            if processed_line_idx < len(line_decode_results):
-                decode_result = line_decode_results[processed_line_idx]
-                processed_line = processed_page.lines[processed_line_idx]
-
-                # Create SegmentResult
-                x, y, w, h = processed_line.bbox
-                segment_result = SegmentResult(
-                    segment_idx=len(segments),
-                    bbox=BBox(x=x, y=y, w=w, h=h),
-                    text=decode_result.text,
-                    confidence=decode_result.line_confidence,
-                    syllables=decode_result.segments,
-                )
-                segments.append(segment_result)
-                line_text_parts.append(decode_result.text)
-
-                # Weight confidence by character count
-                char_count = len(decode_result.text)
-                total_weighted_confidence += decode_result.line_confidence * char_count
-                total_chars += char_count
-
-        # Create LineResult
-        line_confidence = total_weighted_confidence / total_chars if total_chars > 0 else 0.0
         line_result = LineResult(
             line_idx=line_idx,
-            text=" ".join(line_text_parts),
-            confidence=line_confidence,
-            segments=segments,
+            bbox=BBox(x=orig_x, y=orig_y, w=orig_w, h=orig_h),
+            text=decode_result.text,
+            confidence=decode_result.line_confidence,
+            syllables=decode_result.segments,
         )
         line_results.append(line_result)
 

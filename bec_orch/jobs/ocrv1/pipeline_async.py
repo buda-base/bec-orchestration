@@ -46,11 +46,14 @@ from .ctc_decoder import (
     decode_logits_with_segments,
     init_worker_process,
 )
-from .line_decoder import FetchedBytes, LineDecoder, ProcessedPage
+from .line_decoder import FetchedBytes, LineDecoder, PrefetchedBytes, ProcessedPage
 from .model import OCRModel
 from .output_writer import OutputWriter
 
 logger = logging.getLogger(__name__)
+
+# Import for parquet loading
+import pyarrow.parquet as pq
 
 # Default vocabulary size for fallback logits
 DEFAULT_VOCAB_SIZE = 84
@@ -266,6 +269,11 @@ class AsyncOCRPipeline:
         # Semaphore for S3 concurrency
         self._s3_sem = asyncio.Semaphore(cfg.prefetch_concurrency)
 
+        # Parquet loading state (loaded asynchronously)
+        self._parquet_ready = asyncio.Event()
+        self._parquet_data: dict[str, dict] | None = None  # filename -> ld_row
+        self._parquet_error: str | None = None
+
         # Stats
         self.stats = {
             "fetched": 0,
@@ -277,10 +285,17 @@ class AsyncOCRPipeline:
 
     async def run(
         self,
-        pages: list[tuple[int, str, dict]],  # (page_idx, filename, ld_row)
+        pages: list[tuple[int, str]],  # (page_idx, filename)
+        ld_parquet_uri: str,
         output_parquet_uri: str,
     ) -> dict:
-        """Run the full pipeline."""
+        """Run the full pipeline.
+        
+        Args:
+            pages: List of (page_idx, filename) tuples
+            ld_parquet_uri: S3 URI of the line detection parquet file
+            output_parquet_uri: S3 URI for output
+        """
         start_time = time.perf_counter()
         total_pages = len(pages)
 
@@ -297,8 +312,9 @@ class AsyncOCRPipeline:
 
         monitor_task = asyncio.create_task(monitor_queues(), name="monitor")
 
-        # Start all stages as concurrent tasks
+        # Start all stages as concurrent tasks (parquet loader runs in parallel with prefetcher)
         tasks = [
+            asyncio.create_task(self._parquet_loader(ld_parquet_uri), name="parquet_loader"),
             asyncio.create_task(self._prefetcher(pages), name="prefetcher"),
             asyncio.create_task(self._image_processor(), name="image_processor"),
             asyncio.create_task(self._gpu_inference(), name="gpu_inference"),
@@ -311,7 +327,7 @@ class AsyncOCRPipeline:
         monitor_task.cancel()
 
         # Check for errors
-        stage_names = ["prefetcher", "image_processor", "gpu_inference", "ctc_decoder", "writer"]
+        stage_names = ["parquet_loader", "prefetcher", "image_processor", "gpu_inference", "ctc_decoder", "writer"]
         for name, result in zip(stage_names, results, strict=True):
             if isinstance(result, Exception):
                 logger.error(f"Pipeline stage '{name}' failed: {result}", exc_info=result)
@@ -328,13 +344,19 @@ class AsyncOCRPipeline:
 
     async def run_sequential(
         self,
-        pages: list[tuple[int, str, dict]],  # (page_idx, filename, ld_row)
+        pages: list[tuple[int, str]],  # (page_idx, filename)
+        ld_parquet_uri: str,
         output_parquet_uri: str,
     ) -> dict:
         """
         Run pipeline in two phases to eliminate CPU contention:
         Phase 1: Prefetch + Image Processing + GPU Inference (collect all logits in memory)
         Phase 2: CTC Decode all collected logits + Write to Parquet
+        
+        Args:
+            pages: List of (page_idx, filename) tuples
+            ld_parquet_uri: S3 URI of the line detection parquet file
+            output_parquet_uri: S3 URI for output
         """
         start_time = time.perf_counter()
         total_pages = len(pages)
@@ -364,8 +386,10 @@ class AsyncOCRPipeline:
         monitor_task = asyncio.create_task(monitor_queues(), name="monitor")
 
         # Phase 1: Run prefetch + image processing + GPU inference
+        # Parquet loader runs in parallel with prefetcher
         logger.info("[Phase 1] Starting GPU inference phase...")
         phase1_tasks = [
+            asyncio.create_task(self._parquet_loader(ld_parquet_uri), name="parquet_loader"),
             asyncio.create_task(self._prefetcher(pages), name="prefetcher"),
             asyncio.create_task(self._image_processor(), name="image_processor"),
             asyncio.create_task(self._gpu_inference(), name="gpu_inference"),
@@ -519,11 +543,42 @@ class AsyncOCRPipeline:
 
         return self.stats
 
-    async def _prefetcher(self, pages: list[tuple[int, str, dict]]) -> None:
-        """Fetch images from S3 with high concurrency."""
+    async def _parquet_loader(self, ld_parquet_uri: str) -> None:
+        """Load LD parquet file asynchronously.
+        
+        This runs in parallel with the prefetcher so image fetching can start
+        before the parquet file is fully loaded.
+        """
+        logger.info(f"[ParquetLoader] Starting to load {ld_parquet_uri}")
+        start_time = time.perf_counter()
+        loop = asyncio.get_event_loop()
+
+        def _load_parquet() -> dict[str, dict]:
+            """Load parquet in thread pool to not block event loop."""
+            table = pq.read_table(ld_parquet_uri)
+            return {row["img_file_name"]: row for row in table.to_pylist()}
+
+        try:
+            self._parquet_data = await loop.run_in_executor(None, _load_parquet)
+            elapsed = time.perf_counter() - start_time
+            logger.info(f"[ParquetLoader] Loaded {len(self._parquet_data)} rows in {elapsed:.2f}s")
+        except Exception as e:
+            elapsed = time.perf_counter() - start_time
+            self._parquet_error = f"{type(e).__name__}: {e}"
+            logger.error(f"[ParquetLoader] Failed to load parquet in {elapsed:.2f}s: {self._parquet_error}")
+        finally:
+            # Signal that parquet loading is complete (success or failure)
+            self._parquet_ready.set()
+
+    async def _prefetcher(self, pages: list[tuple[int, str]]) -> None:
+        """Fetch images from S3 with high concurrency.
+        
+        Outputs PrefetchedBytes (raw bytes without LD metadata).
+        The image processor will combine with parquet data.
+        """
         logger.info(f"[Prefetcher] Starting with {self.cfg.prefetch_concurrency} concurrency")
 
-        async def fetch_one(page_idx: int, filename: str, ld_row: dict) -> None:
+        async def fetch_one(page_idx: int, filename: str) -> None:
             async with self._s3_sem:
                 try:
                     key = f"{self.volume_prefix}/{filename}"
@@ -536,7 +591,12 @@ class AsyncOCRPipeline:
                     source_etag, file_bytes = await loop.run_in_executor(None, _fetch)
 
                     await self.q_fetched.put(
-                        self._create_fetched_bytes(page_idx, filename, ld_row, file_bytes, source_etag)
+                        PrefetchedBytes(
+                            page_idx=page_idx,
+                            filename=filename,
+                            source_etag=source_etag,
+                            file_bytes=file_bytes,
+                        )
                     )
                     self.stats["fetched"] += 1
 
@@ -559,7 +619,7 @@ class AsyncOCRPipeline:
 
         # Create all fetch tasks
         fetch_tasks = [
-            asyncio.create_task(fetch_one(page_idx, filename, ld_row)) for page_idx, filename, ld_row in pages
+            asyncio.create_task(fetch_one(page_idx, filename)) for page_idx, filename in pages
         ]
 
         # Wait for all fetches
@@ -570,8 +630,45 @@ class AsyncOCRPipeline:
         logger.info(f"[Prefetcher] Done, fetched {self.stats['fetched']} pages")
 
     async def _image_processor(self) -> None:
-        """Process images concurrently using semaphore for backpressure."""
+        """Process images concurrently using semaphore for backpressure.
+        
+        Waits for parquet to be loaded before processing. Combines PrefetchedBytes
+        with LD row data to create FetchedBytes for the line decoder.
+        """
         logger.info(f"[ImageProcessor] Starting with {self.cfg.image_processor_workers} concurrent workers")
+        
+        # Wait for parquet to be loaded before processing any images
+        logger.info("[ImageProcessor] Waiting for parquet data...")
+        await self._parquet_ready.wait()
+        
+        if self._parquet_error:
+            # Parquet loading failed - drain the queue and emit errors
+            logger.error(f"[ImageProcessor] Parquet loading failed: {self._parquet_error}")
+            while True:
+                msg = await self.q_fetched.get()
+                if isinstance(msg, EndOfStream):
+                    break
+                if isinstance(msg, PipelineError):
+                    await self.q_processed.put(msg)
+                    continue
+                # Emit error for each prefetched page
+                prefetched: PrefetchedBytes = msg
+                await self.q_processed.put(
+                    PipelineError(
+                        stage="ImageProcessor",
+                        page_idx=prefetched.page_idx,
+                        filename=prefetched.filename,
+                        source_etag=prefetched.source_etag,
+                        error_type="ParquetLoadError",
+                        message=f"LD parquet loading failed: {self._parquet_error}",
+                    )
+                )
+                self.stats["errors"] += 1
+            await self.q_processed.put(EndOfStream(stream="processed", producer="ImageProcessor"))
+            logger.info(f"[ImageProcessor] Aborted due to parquet error, {self.stats['errors']} errors")
+            return
+        
+        logger.info(f"[ImageProcessor] Parquet ready with {len(self._parquet_data or {})} rows")
         loop = asyncio.get_event_loop()
 
         # Semaphore limits concurrent processing
@@ -620,7 +717,33 @@ class AsyncOCRPipeline:
                 await self.q_processed.put(msg)
                 continue
 
-            fetched: FetchedBytes = msg
+            prefetched: PrefetchedBytes = msg
+            
+            # Look up LD row data from parquet
+            ld_row = self._parquet_data.get(prefetched.filename) if self._parquet_data else None
+            if ld_row is None:
+                await self.q_processed.put(
+                    PipelineError(
+                        stage="ImageProcessor",
+                        page_idx=prefetched.page_idx,
+                        filename=prefetched.filename,
+                        source_etag=prefetched.source_etag,
+                        error_type="MissingLDData",
+                        message=f"No LD data found for {prefetched.filename} in parquet",
+                    )
+                )
+                self.stats["errors"] += 1
+                continue
+            
+            # Combine prefetched bytes with LD row to create FetchedBytes
+            fetched = FetchedBytes(
+                page_idx=prefetched.page_idx,
+                filename=prefetched.filename,
+                source_etag=prefetched.source_etag,
+                file_bytes=prefetched.file_bytes,
+                ld_row=ld_row,
+            )
+            
             task = asyncio.create_task(process_one(fetched))
             pending_tasks.add(task)
             task.add_done_callback(pending_tasks.discard)
@@ -926,20 +1049,6 @@ class AsyncOCRPipeline:
             error=error or inferred.error,
         )
 
-    def _create_processed_page(self, fetched: FetchedBytes, error: str | None) -> ProcessedPage:
-        """Create ProcessedPage with error handling."""
-        return ProcessedPage(
-            page_idx=fetched.page_idx,
-            filename=fetched.filename,
-            source_etag=fetched.source_etag,
-            lines=[],
-            orig_width=0,
-            orig_height=0,
-            transformed_width=0,
-            transformed_height=0,
-            error=error,
-        )
-
     def _create_inferred_page(self, page: ProcessedPage, logits_list: list) -> InferredPage:
         """Create InferredPage from ProcessedPage and logits."""
         return InferredPage(
@@ -949,23 +1058,6 @@ class AsyncOCRPipeline:
             logits_list=logits_list,
             processed_page=page,
             error=page.error,
-        )
-
-    def _create_fetched_bytes(
-        self,
-        page_idx: int,
-        filename: str,
-        ld_row: dict,
-        file_bytes: bytes = b"",
-        source_etag: str = "",
-    ) -> FetchedBytes:
-        """Create FetchedBytes with error handling."""
-        return FetchedBytes(
-            page_idx=page_idx,
-            filename=filename,
-            source_etag=source_etag,
-            file_bytes=file_bytes,
-            ld_row=ld_row,
         )
 
     def _prepare_logits_and_vocab(self, inferred: InferredPage) -> tuple[list[npt.NDArray], list[list[str]]]:

@@ -35,6 +35,19 @@ logger = logging.getLogger(__name__)
 
 
 @dataclass
+class PrefetchedBytes:
+    """Raw image bytes from S3 before LD metadata is attached.
+    
+    This is produced by the prefetcher before the parquet file is loaded.
+    """
+
+    page_idx: int
+    filename: str
+    source_etag: str
+    file_bytes: bytes
+
+
+@dataclass
 class FetchedBytes:
     """Input for LineDecoder - raw image bytes with LD metadata."""
 

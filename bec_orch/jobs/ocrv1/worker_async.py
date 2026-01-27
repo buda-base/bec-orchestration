@@ -14,7 +14,6 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 import boto3
-import pyarrow.parquet as pq
 import s3fs
 from botocore.config import Config as BotoConfig
 
@@ -142,36 +141,25 @@ class OCRV1JobWorkerAsync:
             )
         logger.info(f"LD success marker found: {ld_success_uri}")
 
-        # Read LD parquet
+        # Get URIs (parquet will be loaded async by pipeline)
         ld_parquet_uri = self._get_ld_parquet_uri(ctx)
         output_parquet_uri = self._get_output_parquet_uri(ctx)
 
-        logger.info(f"Reading LD parquet from {ld_parquet_uri}")
-        input_table = pq.read_table(ld_parquet_uri)
-        logger.info(f"Read {len(input_table)} rows from parquet")
-
-        parquet_rows_by_filename: dict[str, dict] = {row["img_file_name"]: row for row in input_table.to_pylist()}
-        logger.info(f"Indexed {len(parquet_rows_by_filename)} files from parquet")
-
+        # Get manifest filenames
         manifest_filenames: set[str] = {
             str(item["filename"]) for item in ctx.volume_manifest.manifest if item.get("filename")
         }
 
-        missing_in_parquet = manifest_filenames - set(parquet_rows_by_filename.keys())
-        if missing_in_parquet:
-            raise TerminalTaskError(
-                f"LD parquet missing {len(missing_in_parquet)} images from manifest: "
-                f"{sorted(missing_in_parquet)[:5]}{'...' if len(missing_in_parquet) > 5 else ''}"
-            )
-
         total_images = len(manifest_filenames)
         sorted_filenames = sorted(manifest_filenames)
 
-        # Build page list
-        pages = [
-            (page_idx, filename, parquet_rows_by_filename[filename])
+        # Build page list (just page_idx and filename - parquet loaded async by pipeline)
+        pages: list[tuple[int, str]] = [
+            (page_idx, filename)
             for page_idx, filename in enumerate(sorted_filenames)
         ]
+
+        logger.info(f"Starting pipeline for {total_images} images, parquet: {ld_parquet_uri}")
 
         # Get volume prefix for S3
         volume_prefix = self._get_volume_prefix(ctx)
@@ -188,9 +176,9 @@ class OCRV1JobWorkerAsync:
 
         try:
             if self.cfg.use_sequential_pipeline:
-                stats = await pipeline.run_sequential(pages, output_parquet_uri)
+                stats = await pipeline.run_sequential(pages, ld_parquet_uri, output_parquet_uri)
             else:
-                stats = await pipeline.run(pages, output_parquet_uri)
+                stats = await pipeline.run(pages, ld_parquet_uri, output_parquet_uri)
         finally:
             await pipeline.close()
 

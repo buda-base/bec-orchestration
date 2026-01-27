@@ -17,7 +17,7 @@ from .line import BBox
 
 if TYPE_CHECKING:
     from .ctc_decoder import SyllableSegment
-    from .line_decoder import FetchedBytes, ProcessedPage
+    from .line_decoder import FetchedBytes, PrefetchedBytes, ProcessedPage
 
 
 # =============================================================================
@@ -143,8 +143,8 @@ class InferredPage:
 # - A PipelineError (if processing failed for this page)
 # - EndOfStream (when the producer is done)
 
-# q_fetched: Prefetcher -> ImageProcessor
-FetchedBytesMsg = Union["FetchedBytes", PipelineError, EndOfStream]
+# q_fetched: Prefetcher -> ImageProcessor (PrefetchedBytes, no LD metadata yet)
+PrefetchedBytesMsg = Union["PrefetchedBytes", PipelineError, EndOfStream]
 
 # q_processed: ImageProcessor -> GPUInference
 ProcessedPageMsg = Union["ProcessedPage", PipelineError, EndOfStream]

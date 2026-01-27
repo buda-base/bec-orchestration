@@ -391,11 +391,12 @@ class AsyncOCRPipeline:
         volume_id = output_parquet_uri.split("/")[-2] if "/" in output_parquet_uri else "unknown"
         
         # Create output writer stage for this run
+        expected_filenames = [t.filename for t in tasks]
         output_writer = OutputWriterStage(
             volume_id=volume_id,
             output_prefix=output_parquet_uri.rsplit("/", 1)[0] if "/" in output_parquet_uri else output_parquet_uri,
             q_in=self.q_results,
-            total_pages=total_pages,
+            expected_filenames=expected_filenames,
             stats=self.stats,
         )
 
@@ -718,11 +719,12 @@ class AsyncOCRPipeline:
 
             # Create output writer stage for this run
             volume_id = output_parquet_uri.split("/")[-2] if "/" in output_parquet_uri else "unknown"
+            expected_filenames = [t.filename for t in tasks]
             output_writer = OutputWriterStage(
                 volume_id=volume_id,
                 output_prefix=output_parquet_uri.rsplit("/", 1)[0] if "/" in output_parquet_uri else output_parquet_uri,
                 q_in=self.q_results,
-                total_pages=total_pages,
+                expected_filenames=expected_filenames,
                 stats=self.stats,
             )
 

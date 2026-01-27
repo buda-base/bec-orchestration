@@ -83,8 +83,9 @@ class ProcessedLine:
     tensor: npt.NDArray  # (1, H, W) float32 normalized [-1, 1]
     content_width: int  # Width of content region in tensor
     left_pad_width: int  # Width of left padding in tensor
-    # Coordinates on the TRANSFORMED image (post-rotation, post-TPS, pre-model-resize)
-    bbox: tuple[int, int, int, int]  # (x, y, w, h) bounding box on transformed image
+    # bbox coordinates are relative to the RESIZED image (after scaling by scale_factor).
+    # To convert to original image coordinates, multiply by (1 / scale_factor).
+    bbox: tuple[int, int, int, int]  # (x, y, w, h) on resized image
     # Original contours that make up this line (can be multiple if merged)
     contours: list[list[dict]]  # List of contours, each contour is list of {x, y} dicts
 
@@ -99,12 +100,16 @@ class ProcessedPage:
     # Page-level metadata for coordinate reconstruction
     orig_width: int  # Original image width before any scaling
     orig_height: int  # Original image height before any scaling
-    transformed_width: int  # Width after transforms (rotation + TPS)
-    transformed_height: int  # Height after transforms (rotation + TPS)
+    transformed_width: int  # Width after transforms (rotation + TPS), before model resize
+    transformed_height: int  # Height after transforms (rotation + TPS), before model resize
     # Transform parameters applied to get from original to transformed coordinates
     rotation_angle: float = 0.0  # Rotation angle in degrees
-    tps_points: tuple | None = None  # ((input_pts, output_pts), alpha) or None
-    scale_factor: float = 1.0  # Scale factor from original to resized image (resized/original)
+    # tps_points coordinates are relative to the ORIGINAL image (before any transforms).
+    # Format: ((input_pts, output_pts), alpha) where pts are in original image coordinates.
+    tps_points: tuple | None = None
+    # scale_factor = resized_dimension / original_dimension
+    # Line bboxes are in resized coordinates; multiply by (1/scale_factor) for original coords.
+    scale_factor: float = 1.0
     error: str | None = None
 
     # Convenience properties

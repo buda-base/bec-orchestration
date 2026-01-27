@@ -601,21 +601,29 @@ class CTCDecoderStage:
 
 
 class OutputWriterStage:
-    """Writes results to Parquet and JSONL output files."""
+    """Writes results to Parquet and JSONL output files.
+    
+    Tracks expected vs received pages and creates error records for any
+    missing pages at EndOfStream (like ldv1's ParquetWriter).
+    """
 
     def __init__(
         self,
         volume_id: str,
         output_prefix: str,
         q_in: asyncio.Queue,
-        total_pages: int,
+        expected_filenames: list[str],
         stats: dict[str, int],
     ) -> None:
         self.volume_id = volume_id
         self.output_prefix = output_prefix
         self.q_in = q_in
-        self.total_pages = total_pages
+        self.expected_filenames = set(expected_filenames)
+        self.total_pages = len(expected_filenames)
         self.stats = stats
+        
+        # Track received filenames for missing page detection
+        self._received_filenames: set[str] = set()
 
     async def run(self) -> None:
         """Write results to output files."""
@@ -635,16 +643,30 @@ class OutputWriterStage:
                     break
 
                 if isinstance(msg, PipelineError):
+                    # Track received filename
+                    if msg.filename:
+                        self._received_filenames.add(msg.filename)
                     writer.write_error(msg)
                     errors_received += 1
                     continue
 
                 result: PageOCRResult = msg
+                # Track received filename (PageOCRResult has img_file_name, PageResult has filename)
+                filename = getattr(result, "img_file_name", None) or getattr(result, "filename", None)
+                if filename:
+                    self._received_filenames.add(filename)
                 writer.write_page(result)
                 pages_written += 1
 
                 if pages_written % 100 == 0:
                     logger.info(f"[OutputWriter] Progress: {pages_written}/{self.total_pages}")
+            
+            # Fill missing pages with errors before closing
+            dropped_count = self._fill_missing_pages(writer)
+            if dropped_count > 0:
+                errors_received += dropped_count
+                self.stats["errors"] += dropped_count
+
         finally:
             writer.close()
 
@@ -653,3 +675,37 @@ class OutputWriterStage:
             f"[OutputWriter] Done, wrote {pages_written} pages, {errors_received} errors. "
             f"Stats: {error_stats}"
         )
+
+    def _fill_missing_pages(self, writer: "OutputWriter") -> int:
+        """Create error records for any expected pages that were never received.
+        
+        Returns:
+            Number of missing pages that were filled.
+        """
+        from .data_structures import ImageTask
+        
+        missing = self.expected_filenames - self._received_filenames
+        if not missing:
+            return 0
+        
+        # Log summary with sample of missing files
+        missing_sorted = sorted(missing)
+        sample = missing_sorted[:5]
+        suffix = f" ... (+{len(missing_sorted) - 5} more)" if len(missing_sorted) > 5 else ""
+        logger.warning(
+            f"[OutputWriter] {len(missing)} pages never received. "
+            f"Creating error records for: {sample}{suffix}"
+        )
+        
+        for filename in missing_sorted:
+            # Create synthetic error for missing page
+            synthetic_error = PipelineError(
+                stage="Pipeline",
+                task=ImageTask(page_idx=-1, filename=filename),
+                source_etag=None,
+                error_type="DroppedByPipeline",
+                message=f"Page never received by output writer (lost in pipeline)",
+            )
+            writer.write_error(synthetic_error)
+        
+        return len(missing)

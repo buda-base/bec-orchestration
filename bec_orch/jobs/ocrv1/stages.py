@@ -318,24 +318,33 @@ class GPUInferenceStage:
             if not pending_tensors:
                 return
 
-            batch_tensors = [pt.tensor for pt in pending_tensors]
-            batch_stack = np.stack(batch_tensors, axis=0)
+            batch_size = len(pending_tensors)
+            start_time = time.perf_counter()
 
-            logits_batch = self.ocr_model.run_batch(batch_stack)
+            # Stack tensors and collect content widths and left pad widths
+            tensors = np.concatenate([pt.tensor for pt in pending_tensors], axis=0)
+            content_widths = [pt.content_width for pt in pending_tensors]
+            left_pad_widths = [pt.left_pad_width for pt in pending_tensors]
 
-            for i, pt in enumerate(pending_tensors):
-                logits = logits_batch[i]
-                line_logits = LineLogits(
-                    logits=logits,
-                    content_width=pt.content_width,
-                    left_pad_width=pt.left_pad_width,
-                    keep_indices=None,
-                )
+            # Run inference in executor to not block event loop
+            # Model crops time dimension BEFORE softmax/pruning to save computation
+            loop = asyncio.get_event_loop()
+            line_logits_list = await loop.run_in_executor(
+                None, lambda: self.ocr_model.predict(tensors, content_widths, left_pad_widths, self.cfg.input_width)
+            )
 
+            # Distribute results back to pages
+            for pt, line_logits in zip(pending_tensors, line_logits_list, strict=True):
                 if pt.page_idx in pages_in_flight:
                     pages_in_flight[pt.page_idx].line_logits[pt.line_idx] = line_logits
 
             pending_tensors.clear()
+
+            batch_ms = (time.perf_counter() - start_time) * 1000
+            logger.info(
+                f"[GPUInference] Batch {batch_size} lines in {batch_ms:.0f}ms "
+                f"({batch_ms / batch_size:.0f}ms/line). {pages_emitted} pages emitted"
+            )
 
         async def try_emit_completed_pages() -> None:
             nonlocal pages_emitted
@@ -430,4 +439,217 @@ class GPUInferenceStage:
             logits_list=logits_list,
             processed_page=page,
             error=page.error,
+        )
+
+
+class CTCDecoderStage:
+    """Decodes logits to text using CTC beam search.
+    
+    Runs decoding in a process pool for parallelism.
+    """
+
+    def __init__(
+        self,
+        cfg: "OCRV1Config",
+        ctc_decoder: "CTCDecoder",
+        q_in: asyncio.Queue,
+        q_out: asyncio.Queue,
+        executor: ProcessPoolExecutor,
+        stats: dict[str, int],
+    ) -> None:
+        self.cfg = cfg
+        self.ctc_decoder = ctc_decoder
+        self.q_in = q_in
+        self.q_out = q_out
+        self.executor = executor
+        self.stats = stats
+
+    async def run(self) -> None:
+        """Decode pages from GPU inference."""
+        from .ctc_decoder import decode_logits_with_segments
+        from .line import BBox
+        from .data_structures import LineResult, PageOCRResult
+
+        logger.info("[CTCDecoder] Starting")
+
+        sem = asyncio.Semaphore(self.cfg.ctc_workers * 2)
+        pending_tasks: set[asyncio.Task] = set()
+        pages_received = 0
+
+        async def decode_one(inferred: InferredPage) -> None:
+            async with sem:
+                try:
+                    vocab = self.ctc_decoder.ctc_vocab
+                    loop = asyncio.get_event_loop()
+                    line_decode_results = []
+
+                    num_lines = len(inferred.logits_list)
+                    start_time = time.perf_counter()
+
+                    for line_logits in inferred.logits_list:
+                        actual_vocab_size = line_logits.vocab_size
+                        needs_transpose = line_logits.logits.shape[0] == actual_vocab_size
+                        cropped = line_logits.logits.T if needs_transpose else line_logits.logits
+
+                        pruned_vocab = (
+                            [vocab[i] for i in line_logits.keep_indices]
+                            if line_logits.keep_indices is not None
+                            else vocab
+                        )
+
+                        original_width = inferred.processed_page.orig_width
+                        decode_result = decode_logits_with_segments(
+                            cropped,
+                            pruned_vocab,
+                            original_width,
+                            beam_width=self.cfg.beam_width,
+                            token_min_logp=self.cfg.token_min_logp,
+                        )
+                        line_decode_results.append(decode_result)
+
+                    decode_ms = (time.perf_counter() - start_time) * 1000
+                    logger.debug(
+                        f"[CTCDecoder] Page {inferred.page_idx} decoded {num_lines} lines "
+                        f"in {decode_ms:.0f}ms ({decode_ms / max(1, num_lines):.0f}ms/line)"
+                    )
+
+                    page_result = self._build_page_ocr_result(inferred.processed_page, line_decode_results)
+                    await self.q_out.put(page_result)
+                    self.stats["decoded"] += 1
+
+                except Exception as e:
+                    logger.warning(f"[CTCDecoder] Failed to decode {inferred.filename}: {e}")
+                    await self.q_out.put(
+                        PipelineError(
+                            stage="CTCDecoder",
+                            task=inferred.task,
+                            source_etag=inferred.source_etag,
+                            error_type=type(e).__name__,
+                            message=str(e),
+                        )
+                    )
+                    self.stats["errors"] += 1
+
+        while True:
+            msg = await self.q_in.get()
+            if isinstance(msg, EndOfStream):
+                if pending_tasks:
+                    await asyncio.gather(*pending_tasks, return_exceptions=True)
+                await self.q_out.put(EndOfStream(stream="results", producer="CTCDecoder"))
+                break
+
+            if isinstance(msg, PipelineError):
+                await self.q_out.put(msg)
+                continue
+
+            inferred: InferredPage = msg
+            pages_received += 1
+
+            if pages_received % 20 == 0:
+                logger.info(f"[CTCDecoder] Received {pages_received} pages")
+
+            task = asyncio.create_task(decode_one(inferred))
+            pending_tasks.add(task)
+            task.add_done_callback(pending_tasks.discard)
+
+        logger.info(f"[CTCDecoder] Done, decoded {self.stats['decoded']} pages")
+
+    def _build_page_ocr_result(self, processed_page: ProcessedPage, line_decode_results: list) -> "PageOCRResult":
+        """Build PageOCRResult from processed page and line decode results."""
+        from .line import BBox
+        from .data_structures import LineResult, PageOCRResult
+
+        if processed_page.error:
+            return PageOCRResult(
+                img_file_name=processed_page.filename,
+                source_etag=processed_page.source_etag,
+                rotation_angle=processed_page.rotation_angle,
+                tps_points=processed_page.tps_points,
+                lines=[],
+                error=processed_page.error,
+            )
+
+        scale_factor = processed_page.scale_factor
+        inv_scale = 1.0 / scale_factor if scale_factor != 0 else 1.0
+
+        line_results = []
+        for line_idx, (processed_line, decode_result) in enumerate(
+            zip(processed_page.lines, line_decode_results, strict=False)
+        ):
+            x, y, w, h = processed_line.bbox
+            orig_x = int(x * inv_scale)
+            orig_y = int(y * inv_scale)
+            orig_w = int(w * inv_scale)
+            orig_h = int(h * inv_scale)
+
+            line_result = LineResult(
+                line_idx=line_idx,
+                bbox=BBox(x=orig_x, y=orig_y, w=orig_w, h=orig_h),
+                text=decode_result.text,
+                confidence=decode_result.line_confidence,
+                syllables=decode_result.segments,
+            )
+            line_results.append(line_result)
+
+        return PageOCRResult(
+            img_file_name=processed_page.filename,
+            source_etag=processed_page.source_etag,
+            rotation_angle=processed_page.rotation_angle,
+            tps_points=processed_page.tps_points,
+            lines=line_results,
+        )
+
+
+class OutputWriterStage:
+    """Writes results to Parquet and JSONL output files."""
+
+    def __init__(
+        self,
+        volume_id: str,
+        output_prefix: str,
+        q_in: asyncio.Queue,
+        total_pages: int,
+        stats: dict[str, int],
+    ) -> None:
+        self.volume_id = volume_id
+        self.output_prefix = output_prefix
+        self.q_in = q_in
+        self.total_pages = total_pages
+        self.stats = stats
+
+    async def run(self) -> None:
+        """Write results to output files."""
+        from .output_writer import OutputWriter
+        from .data_structures import PageOCRResult
+
+        logger.info(f"[OutputWriter] Starting, expecting {self.total_pages} pages")
+
+        writer = OutputWriter(self.volume_id, self.output_prefix)
+        pages_written = 0
+        errors_received = 0
+
+        try:
+            while True:
+                msg = await self.q_in.get()
+                if isinstance(msg, EndOfStream):
+                    break
+
+                if isinstance(msg, PipelineError):
+                    writer.write_error(msg)
+                    errors_received += 1
+                    continue
+
+                result: PageOCRResult = msg
+                writer.write_page(result)
+                pages_written += 1
+
+                if pages_written % 100 == 0:
+                    logger.info(f"[OutputWriter] Progress: {pages_written}/{self.total_pages}")
+        finally:
+            writer.close()
+
+        error_stats = writer.get_error_stats()
+        logger.info(
+            f"[OutputWriter] Done, wrote {pages_written} pages, {errors_received} errors. "
+            f"Stats: {error_stats}"
         )

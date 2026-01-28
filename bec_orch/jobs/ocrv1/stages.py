@@ -581,6 +581,10 @@ class CTCDecoderStage:
         for line_idx, (processed_line, decode_result) in enumerate(
             zip(processed_page.lines, line_decode_results, strict=False)
         ):
+            # Skip empty lines (or lines with only whitespace)
+            if not decode_result.text or not decode_result.text.strip():
+                continue
+            
             x, y, w, h = processed_line.bbox
             orig_x = int(x * inv_scale)
             orig_y = int(y * inv_scale)
@@ -615,7 +619,7 @@ class OutputWriterStage:
     def __init__(
         self,
         parquet_uri: str,
-        jsonl_uri: str,
+        jsonl_uri: str | None,
         q_in: asyncio.Queue,
         expected_filenames: list[str],
         stats: dict[str, int],

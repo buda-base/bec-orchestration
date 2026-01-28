@@ -79,6 +79,11 @@ class OCRV1Config:
     word_delimiters: frozenset[str] = field(default_factory=lambda: DEFAULT_WORD_DELIMITERS)
 
     # -------------------------------------------------------------------------
+    # Output Configuration
+    # -------------------------------------------------------------------------
+    enable_jsonl_output: bool = False  # Write JSONL.gz output alongside Parquet
+
+    # -------------------------------------------------------------------------
     # Debug
     # -------------------------------------------------------------------------
     debug_output_dir: str | None = None  # Directory to save preprocessed line images

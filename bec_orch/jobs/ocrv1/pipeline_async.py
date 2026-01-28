@@ -101,6 +101,10 @@ def _build_page_ocr_result(
     for line_idx, (processed_line, decode_result) in enumerate(
         zip(processed_page.lines, line_decode_results, strict=False)
     ):
+        # Skip empty lines (or lines with only whitespace)
+        if not decode_result.text or not decode_result.text.strip():
+            continue
+        
         x, y, w, h = processed_line.bbox
 
         # Scale bbox back to original image coordinates
@@ -332,7 +336,7 @@ class AsyncOCRPipeline:
         tasks: list[ImageTask],
         ld_parquet_uri: str,
         output_parquet_uri: str,
-        output_jsonl_uri: str,
+        output_jsonl_uri: str | None,
         timeout_s: float | None = None,
     ) -> dict:
         """Run the full pipeline with optional timeout protection.
@@ -341,7 +345,7 @@ class AsyncOCRPipeline:
             tasks: List of ImageTask objects identifying pages to process
             ld_parquet_uri: S3 URI of the line detection parquet file
             output_parquet_uri: S3 URI for output parquet file
-            output_jsonl_uri: S3 URI for output JSONL file
+            output_jsonl_uri: S3 URI for output JSONL file (None to disable)
             timeout_s: Optional timeout in seconds. If None, uses cfg.volume_timeout_s
         
         Raises:
@@ -370,7 +374,7 @@ class AsyncOCRPipeline:
         tasks: list[ImageTask],
         ld_parquet_uri: str,
         output_parquet_uri: str,
-        output_jsonl_uri: str,
+        output_jsonl_uri: str | None,
     ) -> dict:
         """Internal pipeline execution (called by run with timeout)."""
         start_time = time.perf_counter()
@@ -511,7 +515,7 @@ class AsyncOCRPipeline:
         tasks: list[ImageTask],
         ld_parquet_uri: str,
         output_parquet_uri: str,
-        output_jsonl_uri: str,
+        output_jsonl_uri: str | None,
         timeout_s: float | None = None,
     ) -> dict:
         """
@@ -523,7 +527,7 @@ class AsyncOCRPipeline:
             tasks: List of ImageTask objects identifying pages to process
             ld_parquet_uri: S3 URI of the line detection parquet file
             output_parquet_uri: S3 URI for output parquet file
-            output_jsonl_uri: S3 URI for output JSONL file
+            output_jsonl_uri: S3 URI for output JSONL file (None to disable)
             timeout_s: Optional timeout in seconds. If None, uses cfg.volume_timeout_s
         
         Raises:
@@ -550,7 +554,7 @@ class AsyncOCRPipeline:
         tasks: list[ImageTask],
         ld_parquet_uri: str,
         output_parquet_uri: str,
-        output_jsonl_uri: str,
+        output_jsonl_uri: str | None,
     ) -> dict:
         """Internal sequential pipeline execution (called by run_sequential with timeout)."""
         start_time = time.perf_counter()

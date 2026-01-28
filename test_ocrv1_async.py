@@ -383,14 +383,32 @@ def main() -> None:
             logger.info("=== Creating debug visualizations ===")
             debug_output_dir = Path("debug_output_ocr")
             try:
-                create_debug_visualizations(
-                    jsonl_uri=f"s3://{current_jsonl_s3}",
-                    source_image_bucket=source_image_bucket,
-                    w_id=w_id,
-                    i_id=i_id,
-                    output_dir=debug_output_dir,
-                    max_images=10,  # Limit to first 10 images for quick debugging
-                )
+                # Check if JSONL output exists (may be disabled in config)
+                jsonl_exists = s3.exists(current_jsonl_s3)
+                
+                if jsonl_exists:
+                    logger.info("Using JSONL for detailed syllable-level visualizations")
+                    create_debug_visualizations(
+                        jsonl_uri=f"s3://{current_jsonl_s3}",
+                        source_image_bucket=source_image_bucket,
+                        w_id=w_id,
+                        i_id=i_id,
+                        output_dir=debug_output_dir,
+                        max_images=10,  # Limit to first 10 images for quick debugging
+                    )
+                else:
+                    logger.info("JSONL output not found (may be disabled in config)")
+                    logger.info("Using parquet for page-level visualizations only")
+                    from bec_orch.jobs.ocrv1.debug_visualizer import create_debug_visualizations_from_parquet
+                    create_debug_visualizations_from_parquet(
+                        parquet_uri=f"s3://{current_parquet_s3}",
+                        jsonl_uri=None,
+                        source_image_bucket=source_image_bucket,
+                        w_id=w_id,
+                        i_id=i_id,
+                        output_dir=debug_output_dir,
+                        max_images=10,
+                    )
                 logger.info(f"Debug visualizations saved to {debug_output_dir}/")
             except Exception as e:
                 logger.error(f"Failed to create debug visualizations: {e}", exc_info=True)

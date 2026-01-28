@@ -176,6 +176,7 @@ def visualize_ocr_result(
     output_path: Path,
     draw_text: bool = True,
     draw_confidence: bool = True,
+    draw_syllables: bool = True,
 ) -> None:
     """
     Create a visualization of OCR result on the transformed image.
@@ -186,6 +187,7 @@ def visualize_ocr_result(
         output_path: Path to save visualization image
         draw_text: Whether to draw decoded text on lines
         draw_confidence: Whether to draw confidence scores
+        draw_syllables: Whether to draw syllable bounding boxes
     """
     # Decode image
     result = bytes_to_frame(ocr_record['img_file_name'], image_bytes)
@@ -233,9 +235,10 @@ def visualize_ocr_result(
         # Draw line bbox in red
         _draw_line_bbox(vis_image, bbox, color=(0, 0, 255), thickness=2)
         
-        # Draw syllables in blue
-        for syllable in line.get("syllables", []):
-            _draw_syllable_bbox(vis_image, bbox, syllable, scale_factor, color=(255, 0, 0), thickness=1)
+        # Draw syllables in blue (if enabled and available)
+        if draw_syllables:
+            for syllable in line.get("syllables", []):
+                _draw_syllable_bbox(vis_image, bbox, syllable, scale_factor, color=(255, 0, 0), thickness=1)
         
         # Optionally draw text and confidence
         if draw_text or draw_confidence:
@@ -353,7 +356,7 @@ def create_debug_visualizations(
 
 def create_debug_visualizations_from_parquet(
     parquet_uri: str,
-    jsonl_uri: str,
+    jsonl_uri: str | None,
     source_image_bucket: str,
     w_id: str,
     i_id: str,
@@ -361,26 +364,141 @@ def create_debug_visualizations_from_parquet(
     max_images: int | None = None,
 ) -> None:
     """
-    Create debug visualizations using both Parquet and JSONL output.
+    Create debug visualizations using Parquet output (and optionally JSONL for syllable details).
     
-    This is a convenience wrapper that uses the JSONL for detailed data
-    and optionally validates against the Parquet.
+    If jsonl_uri is None, creates line-level visualizations from parquet only.
+    If jsonl_uri is provided, uses JSONL for detailed syllable data.
     
     Args:
         parquet_uri: S3 URI or local path to parquet file
-        jsonl_uri: S3 URI or local path to JSONL.gz file
+        jsonl_uri: S3 URI or local path to JSONL.gz file (None if JSONL output disabled)
         source_image_bucket: S3 bucket containing source images
         w_id: Work ID
         i_id: Image group ID
         output_dir: Directory to save visualizations
         max_images: Optional limit on number of images to visualize
     """
-    # For now, just use JSONL which has all the detailed data we need
-    create_debug_visualizations(
-        jsonl_uri=jsonl_uri,
-        source_image_bucket=source_image_bucket,
-        w_id=w_id,
-        i_id=i_id,
-        output_dir=output_dir,
-        max_images=max_images,
-    )
+    if jsonl_uri:
+        # JSONL available - use it for detailed syllable-level visualization
+        create_debug_visualizations(
+            jsonl_uri=jsonl_uri,
+            source_image_bucket=source_image_bucket,
+            w_id=w_id,
+            i_id=i_id,
+            output_dir=output_dir,
+            max_images=max_images,
+        )
+    else:
+        # JSONL not available - use parquet for line-level visualization only
+        _create_debug_visualizations_from_parquet_only(
+            parquet_uri=parquet_uri,
+            source_image_bucket=source_image_bucket,
+            w_id=w_id,
+            i_id=i_id,
+            output_dir=output_dir,
+            max_images=max_images,
+        )
+
+
+def _create_debug_visualizations_from_parquet_only(
+    parquet_uri: str,
+    source_image_bucket: str,
+    w_id: str,
+    i_id: str,
+    output_dir: Path,
+    max_images: int | None = None,
+) -> None:
+    """
+    Create debug visualizations from parquet only (line-level, no syllables).
+    
+    This is used when JSONL output is disabled. It reads the parquet file
+    and creates visualizations with line bounding boxes and text.
+    
+    Args:
+        parquet_uri: S3 URI or local path to parquet file
+        source_image_bucket: S3 bucket containing source images
+        w_id: Work ID
+        i_id: Image group ID
+        output_dir: Directory to save visualizations
+        max_images: Optional limit on number of images to visualize
+    """
+    logger.info(f"Loading OCR results from parquet: {parquet_uri}")
+    df = _load_parquet(parquet_uri)
+    
+    # Filter to successful results only
+    df = df[df["ok"] == True]  # noqa: E712
+    
+    if max_images:
+        df = df.head(max_images)
+    
+    logger.info(f"Creating line-level visualizations for {len(df)} images in {output_dir}")
+    
+    for i, row in df.iterrows():
+        filename = row["img_file_name"]
+        
+        try:
+            # Fetch source image
+            logger.info(f"[{i+1}/{len(df)}] Processing {filename}")
+            image_bytes = _fetch_image_from_s3(source_image_bucket, filename, w_id, i_id)
+            
+            # Parse TPS points from parquet (list of lists format like ldv1)
+            tps_points = None
+            if row.get("tps_points") is not None and len(row["tps_points"]) == 2:
+                try:
+                    input_pts = row["tps_points"][0]  # list of [x, y] pairs
+                    output_pts = row["tps_points"][1]  # list of [x, y] pairs
+                    tps_alpha = row.get("tps_alpha")
+                    tps_points = ((input_pts, output_pts), tps_alpha)
+                except Exception as e:
+                    logger.warning(f"Failed to parse TPS points for {filename}: {e}")
+            
+            # Parse line-level data from parquet (native types, not JSON)
+            line_bboxes = []
+            line_texts = []
+            
+            if row.get("line_bboxes") is not None:
+                # line_bboxes is a list of structs with x, y, w, h
+                for bbox_struct in row["line_bboxes"]:
+                    line_bboxes.append([
+                        int(bbox_struct["x"]),
+                        int(bbox_struct["y"]),
+                        int(bbox_struct["w"]),
+                        int(bbox_struct["h"]),
+                    ])
+            
+            if row.get("line_texts") is not None:
+                # line_texts is already a list of strings
+                line_texts = list(row["line_texts"])
+            
+            # Build OCR record from parquet data (mimics JSONL structure but without syllables)
+            # Note: We don't have per-line confidence in parquet, so we omit it
+            ocr_record = {
+                "img_file_name": filename,
+                "rotation_angle": float(row.get("rotation_angle", 0.0)),
+                "tps_points": tps_points,
+                "lines": [
+                    {
+                        "bbox": bbox,
+                        "text": text,
+                        "confidence": 0.0,  # Not available in parquet (no line_confidences or page_confidence)
+                        "syllables": [],  # No syllable data in parquet
+                    }
+                    for bbox, text in zip(line_bboxes, line_texts, strict=False)
+                ],
+            }
+            
+            # Create visualization using the standard function (but syllables will be empty)
+            output_path = output_dir / f"{filename}_debug.jpg"
+            visualize_ocr_result(
+                image_bytes,
+                ocr_record,
+                output_path,
+                draw_text=True,
+                draw_confidence=False,  # Don't draw since we're using page confidence as proxy
+                draw_syllables=False,  # No syllable data in parquet
+            )
+        except Exception as e:
+            logger.error(f"Failed to visualize {filename}: {e}", exc_info=True)
+    
+    logger.info(f"Completed {len(df)} visualizations in {output_dir}")
+

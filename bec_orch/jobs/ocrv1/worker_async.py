@@ -145,7 +145,7 @@ class OCRV1JobWorkerAsync:
         # Get URIs (parquet will be loaded async by pipeline)
         ld_parquet_uri = self._get_ld_parquet_uri(ctx)
         output_parquet_uri = self._get_output_parquet_uri(ctx)
-        output_jsonl_uri = self._get_output_jsonl_uri(ctx)
+        output_jsonl_uri = self._get_output_jsonl_uri(ctx) if self.cfg.enable_jsonl_output else None
 
         # Get manifest filenames
         manifest_filenames: set[str] = {

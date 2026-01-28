@@ -54,8 +54,14 @@ def extract_lines_from_parquet(parquet_path: str) -> list[str]:
 
     all_lines = []
     for row in df.itertuples():
-        # New schema uses page_text (single string) instead of texts (list)
-        if hasattr(row, "page_text"):
+        # New schema uses line_texts (list of strings)
+        if hasattr(row, "line_texts") and row.line_texts is not None:
+            line_texts = row.line_texts
+            # line_texts is already a list of strings, just extend
+            if len(line_texts) > 0:
+                all_lines.extend(line_texts)
+        elif hasattr(row, "page_text"):
+            # Old schema with page_text (single string)
             page_text = row.page_text if row.page_text else ""
             # Split page text into individual lines
             lines = page_text.split("\n") if page_text else []
@@ -337,7 +343,7 @@ def main() -> None:
         use_greedy_decode=False,
         use_hybrid_decode=not args.reference,  # Disable hybrid for reference mode
         greedy_confidence_threshold=-0.2,  # Higher = more selective
-        use_sequential_pipeline=True,
+        use_sequential_pipeline=False,  # Use parallel pipeline (default)
         kenlm_path=str(Path(os.environ.get("BEC_OCR_MODEL_DIR", "ocr_models")) / "tibetan_5gram.binary"),
     )
 

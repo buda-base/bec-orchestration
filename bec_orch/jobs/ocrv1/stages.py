@@ -43,37 +43,153 @@ DEFAULT_VOCAB_SIZE = 84
 
 
 class ParquetLoaderStage:
-    """Loads LD parquet file asynchronously.
+    """Loads LD parquet file asynchronously with progressive row availability.
     
-    Runs in parallel with prefetcher so image fetching can start
-    before parquet is fully loaded.
+    Downloads parquet via boto3 (faster than PyArrow's S3 filesystem),
+    then reads from memory. Makes rows available progressively so
+    ImageProcessor can start before all rows are parsed.
     """
 
-    def __init__(self, parquet_ready: asyncio.Event) -> None:
-        self.parquet_ready = parquet_ready
-        self.parquet_data: dict[str, dict] | None = None
+    def __init__(self, s3_client: BaseClient | None = None) -> None:
+        self.s3_client = s3_client
+        self.parquet_data: dict[str, dict] = {}
+        self._row_events: dict[str, asyncio.Event] = {}
+        self._load_complete = asyncio.Event()
         self.parquet_error: str | None = None
 
+    async def get_row(self, filename: str) -> dict | None:
+        """Get row by filename, waiting if not yet loaded.
+        
+        Returns immediately if the row is already in memory.
+        Otherwise waits until the row's row group is loaded.
+        Returns None if the row doesn't exist in the parquet file.
+        """
+        # Fast path: already in memory
+        if filename in self.parquet_data:
+            return self.parquet_data[filename]
+        
+        # Load finished, row doesn't exist
+        if self._load_complete.is_set():
+            return None
+        
+        # Register interest in this filename
+        if filename not in self._row_events:
+            self._row_events[filename] = asyncio.Event()
+        
+        # Wait for either this row to be loaded or load completion
+        row_event = self._row_events[filename]
+        load_complete_task = asyncio.create_task(self._load_complete.wait())
+        row_event_task = asyncio.create_task(row_event.wait())
+        
+        try:
+            done, pending = await asyncio.wait(
+                [row_event_task, load_complete_task],
+                return_when=asyncio.FIRST_COMPLETED
+            )
+            # Cancel pending tasks to avoid warnings
+            for task in pending:
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+        except Exception:
+            # Ensure cleanup on any error
+            row_event_task.cancel()
+            load_complete_task.cancel()
+            raise
+        
+        return self.parquet_data.get(filename)
+
+    def _parse_s3_uri(self, uri: str) -> tuple[str, str]:
+        """Parse s3://bucket/key into (bucket, key)."""
+        if not uri.startswith("s3://"):
+            raise ValueError(f"Expected s3:// URI, got: {uri}")
+        path = uri[5:]  # Remove "s3://"
+        bucket, _, key = path.partition("/")
+        return bucket, key
+
     async def run(self, ld_parquet_uri: str) -> None:
-        """Load parquet file asynchronously."""
+        """Load parquet file and make rows available progressively.
+        
+        Downloads via boto3 (much faster than PyArrow's S3 filesystem),
+        then reads from memory. Processes rows in batches with yields
+        to the event loop so images can start processing as soon as
+        their row is parsed.
+        """
         logger.info(f"[ParquetLoader] Starting to load {ld_parquet_uri}")
         start_time = time.perf_counter()
         loop = asyncio.get_event_loop()
 
-        def _load_parquet() -> dict[str, dict]:
-            table = pq.read_table(ld_parquet_uri)
-            return {row["img_file_name"]: row for row in table.to_pylist()}
-
         try:
-            self.parquet_data = await loop.run_in_executor(None, _load_parquet)
+            # Download via boto3 (faster than PyArrow's S3 filesystem)
+            if self.s3_client and ld_parquet_uri.startswith("s3://"):
+                bucket, key = self._parse_s3_uri(ld_parquet_uri)
+                
+                def _download_and_parse():
+                    import io
+                    response = self.s3_client.get_object(Bucket=bucket, Key=key)
+                    file_bytes = response["Body"].read()
+                    file_size_bytes = len(file_bytes)
+                    
+                    # Read parquet from memory buffer
+                    buffer = io.BytesIO(file_bytes)
+                    table = pq.read_table(buffer)
+                    return table.to_pylist(), file_size_bytes
+                
+                all_rows, file_size_bytes = await loop.run_in_executor(None, _download_and_parse)
+            else:
+                # Fallback to PyArrow's S3 filesystem for non-S3 URIs or if no client
+                def _load_parquet():
+                    from pyarrow import fs
+                    filesystem, path = fs.FileSystem.from_uri(ld_parquet_uri)
+                    file_info = filesystem.get_file_info(path)
+                    file_size_bytes = file_info.size
+                    
+                    table = pq.read_table(ld_parquet_uri)
+                    return table.to_pylist(), file_size_bytes
+                
+                all_rows, file_size_bytes = await loop.run_in_executor(None, _load_parquet)
+            
+            download_time = time.perf_counter() - start_time
+            
+            # Format file size for logging
+            if file_size_bytes >= 1024 * 1024:
+                size_str = f"{file_size_bytes / (1024 * 1024):.2f} MB"
+            elif file_size_bytes >= 1024:
+                size_str = f"{file_size_bytes / 1024:.1f} KB"
+            else:
+                size_str = f"{file_size_bytes} bytes"
+            
+            speed_mbps = (file_size_bytes / (1024 * 1024)) / download_time if download_time > 0 else 0
+            logger.info(f"[ParquetLoader] Downloaded {len(all_rows)} rows ({size_str}) in {download_time:.2f}s ({speed_mbps:.1f} MB/s), processing...")
+
+            # Process rows in batches, yielding to event loop between batches
+            # This allows images to start processing as soon as their row is available
+            batch_size = 100
+            for i in range(0, len(all_rows), batch_size):
+                batch = all_rows[i:i + batch_size]
+                for row in batch:
+                    filename = row["img_file_name"]
+                    self.parquet_data[filename] = row
+                    if filename in self._row_events:
+                        self._row_events[filename].set()
+                
+                # Yield to event loop so waiting tasks can proceed
+                await asyncio.sleep(0)
+
             elapsed = time.perf_counter() - start_time
             logger.info(f"[ParquetLoader] Loaded {len(self.parquet_data)} rows in {elapsed:.2f}s")
+            
         except Exception as e:
             elapsed = time.perf_counter() - start_time
             self.parquet_error = f"{type(e).__name__}: {e}"
             logger.error(f"[ParquetLoader] Failed in {elapsed:.2f}s: {self.parquet_error}")
         finally:
-            self.parquet_ready.set()
+            self._load_complete.set()
+            # Signal all remaining waiters (in case they're waiting for rows that don't exist)
+            for event in self._row_events.values():
+                event.set()
 
 
 class PrefetcherStage:
@@ -175,26 +291,57 @@ class ImageProcessorStage:
         self.stats = stats
 
     async def run(self) -> None:
-        """Process images concurrently."""
+        """Process images concurrently.
+        
+        Uses streaming parquet loading - each image waits only for its
+        specific row to be loaded, not the entire parquet file.
+        """
         logger.info(f"[ImageProcessor] Starting with {self.cfg.image_processor_workers} workers")
 
-        # Wait for parquet to be loaded
-        logger.info("[ImageProcessor] Waiting for parquet data...")
-        await self.parquet_loader.parquet_ready.wait()
-
-        if self.parquet_loader.parquet_error:
-            logger.error(f"[ImageProcessor] Parquet loading failed: {self.parquet_loader.parquet_error}")
-            await self._drain_on_parquet_error()
-            return
-
-        logger.info(f"[ImageProcessor] Parquet ready with {len(self.parquet_loader.parquet_data or {})} rows")
         loop = asyncio.get_event_loop()
         sem = asyncio.Semaphore(self.cfg.image_processor_workers)
         pending_tasks: set[asyncio.Task] = set()
 
-        async def process_one(fetched: FetchedBytes) -> None:
+        async def process_one(prefetched: PrefetchedBytes) -> None:
             async with sem:
                 try:
+                    # Wait for this specific row (may return immediately if already loaded)
+                    ld_row = await self.parquet_loader.get_row(prefetched.filename)
+                    
+                    # Check for parquet error
+                    if self.parquet_loader.parquet_error:
+                        await self.q_out.put(
+                            PipelineError(
+                                stage="ImageProcessor",
+                                task=prefetched.task,
+                                source_etag=prefetched.source_etag,
+                                error_type="ParquetLoadError",
+                                message=f"LD parquet loading failed: {self.parquet_loader.parquet_error}",
+                            )
+                        )
+                        self.stats["errors"] += 1
+                        return
+                    
+                    if ld_row is None:
+                        await self.q_out.put(
+                            PipelineError(
+                                stage="ImageProcessor",
+                                task=prefetched.task,
+                                source_etag=prefetched.source_etag,
+                                error_type="MissingLDData",
+                                message=f"No LD data found for {prefetched.filename} in parquet",
+                            )
+                        )
+                        self.stats["errors"] += 1
+                        return
+
+                    fetched = FetchedBytes(
+                        task=prefetched.task,
+                        source_etag=prefetched.source_etag,
+                        file_bytes=prefetched.file_bytes,
+                        ld_row=ld_row,
+                    )
+
                     processed = await loop.run_in_executor(
                         self.executor,
                         self.line_decoder.process,
@@ -205,12 +352,12 @@ class ImageProcessorStage:
                     if processed.error:
                         self.stats["errors"] += 1
                 except Exception as e:
-                    logger.warning(f"[ImageProcessor] Failed to process {fetched.filename}: {e}")
+                    logger.warning(f"[ImageProcessor] Failed to process {prefetched.filename}: {e}")
                     await self.q_out.put(
                         PipelineError(
                             stage="ImageProcessor",
-                            task=fetched.task,
-                            source_etag=fetched.source_etag,
+                            task=prefetched.task,
+                            source_etag=prefetched.source_etag,
                             error_type=type(e).__name__,
                             message=str(e),
                         )
@@ -230,56 +377,12 @@ class ImageProcessorStage:
                 continue
 
             prefetched: PrefetchedBytes = msg
-            ld_row = self.parquet_loader.parquet_data.get(prefetched.filename) if self.parquet_loader.parquet_data else None
-
-            if ld_row is None:
-                await self.q_out.put(
-                    PipelineError(
-                        stage="ImageProcessor",
-                        task=prefetched.task,
-                        source_etag=prefetched.source_etag,
-                        error_type="MissingLDData",
-                        message=f"No LD data found for {prefetched.filename} in parquet",
-                    )
-                )
-                self.stats["errors"] += 1
-                continue
-
-            fetched = FetchedBytes(
-                task=prefetched.task,
-                source_etag=prefetched.source_etag,
-                file_bytes=prefetched.file_bytes,
-                ld_row=ld_row,
-            )
-
-            task = asyncio.create_task(process_one(fetched))
+            task = asyncio.create_task(process_one(prefetched))
             pending_tasks.add(task)
             task.add_done_callback(pending_tasks.discard)
 
         logger.info(f"[ImageProcessor] Done, processed {self.stats['processed']} pages")
 
-    async def _drain_on_parquet_error(self) -> None:
-        """Drain input queue on parquet error, emitting errors for each page."""
-        while True:
-            msg = await self.q_in.get()
-            if isinstance(msg, EndOfStream):
-                break
-            if isinstance(msg, PipelineError):
-                await self.q_out.put(msg)
-                continue
-            prefetched: PrefetchedBytes = msg
-            await self.q_out.put(
-                PipelineError(
-                    stage="ImageProcessor",
-                    task=prefetched.task,
-                    source_etag=prefetched.source_etag,
-                    error_type="ParquetLoadError",
-                    message=f"LD parquet loading failed: {self.parquet_loader.parquet_error}",
-                )
-            )
-            self.stats["errors"] += 1
-        await self.q_out.put(EndOfStream(stream="processed", producer="ImageProcessor"))
-        logger.info(f"[ImageProcessor] Aborted due to parquet error, {self.stats['errors']} errors")
 
 
 class GPUInferenceStage:
@@ -486,7 +589,7 @@ class CTCDecoderStage:
                     num_lines = len(inferred.logits_list)
                     start_time = time.perf_counter()
 
-                    for line_logits in inferred.logits_list:
+                    for line_idx, line_logits in enumerate(inferred.logits_list):
                         actual_vocab_size = line_logits.vocab_size
                         needs_transpose = line_logits.logits.shape[0] == actual_vocab_size
                         cropped = line_logits.logits.T if needs_transpose else line_logits.logits

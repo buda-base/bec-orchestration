@@ -289,7 +289,7 @@ class AsyncOCRPipeline:
         }
 
         # Create stage instances
-        self._parquet_loader = ParquetLoaderStage(asyncio.Event())
+        self._parquet_loader = ParquetLoaderStage(s3_client=s3_client)
         
         self._prefetcher = PrefetcherStage(
             cfg=cfg,
@@ -405,9 +405,17 @@ class AsyncOCRPipeline:
         )
 
         try:
-            # Start all stages as concurrent tasks (parquet loader runs in parallel with prefetcher)
+            # Phase 1: Download parquet first (small file, needs full bandwidth)
+            # This avoids competing with the prefetcher's 64 concurrent image fetches
+            parquet_task = asyncio.create_task(self._parquet_loader.run(ld_parquet_uri), name="parquet_loader")
+            await parquet_task
+            
+            if self._parquet_loader.parquet_error:
+                logger.error(f"[AsyncOCRPipeline] Parquet loading failed: {self._parquet_loader.parquet_error}")
+                # Still need to run stages to emit proper errors
+            
+            # Phase 2: Start all other stages (parquet already loaded)
             self._stage_tasks = [
-                asyncio.create_task(self._parquet_loader.run(ld_parquet_uri), name="parquet_loader"),
                 asyncio.create_task(self._prefetcher.run(tasks), name="prefetcher"),
                 asyncio.create_task(self._image_processor.run(), name="image_processor"),
                 asyncio.create_task(self._gpu_inference.run(), name="gpu_inference"),
@@ -419,7 +427,7 @@ class AsyncOCRPipeline:
             results = await asyncio.gather(*self._stage_tasks, return_exceptions=True)
 
             # Check for errors
-            stage_names = ["parquet_loader", "prefetcher", "image_processor", "gpu_inference", "ctc_decoder", "writer"]
+            stage_names = ["prefetcher", "image_processor", "gpu_inference", "ctc_decoder", "writer"]
             for name, result in zip(stage_names, results, strict=True):
                 if isinstance(result, Exception):
                     logger.error(f"Pipeline stage '{name}' failed: {result}", exc_info=result)
@@ -503,7 +511,7 @@ class AsyncOCRPipeline:
                 "q_results": f"{self.q_results.qsize()}/64",
             },
             "stats": dict(self.stats),
-            "parquet_ready": self._parquet_loader.parquet_ready.is_set(),
+            "parquet_ready": self._parquet_loader._load_complete.is_set(),
             "parquet_error": self._parquet_loader.parquet_error,
             "active_tasks": [
                 t.get_name() for t in self._stage_tasks if not t.done()
@@ -586,11 +594,17 @@ class AsyncOCRPipeline:
         monitor_task = asyncio.create_task(monitor_queues(), name="monitor")
 
         try:
+            # Download parquet first (small file, needs full bandwidth)
+            logger.info("[Phase 0] Downloading parquet...")
+            parquet_task = asyncio.create_task(self._parquet_loader.run(ld_parquet_uri), name="parquet_loader")
+            await parquet_task
+            
+            if self._parquet_loader.parquet_error:
+                logger.error(f"[AsyncOCRPipeline] Parquet loading failed: {self._parquet_loader.parquet_error}")
+            
             # Phase 1: Run prefetch + image processing + GPU inference
-            # Parquet loader runs in parallel with prefetcher
             logger.info("[Phase 1] Starting GPU inference phase...")
             self._stage_tasks = [
-                asyncio.create_task(self._parquet_loader.run(ld_parquet_uri), name="parquet_loader"),
                 asyncio.create_task(self._prefetcher.run(tasks), name="prefetcher"),
                 asyncio.create_task(self._image_processor.run(), name="image_processor"),
                 asyncio.create_task(self._gpu_inference.run(), name="gpu_inference"),

@@ -178,8 +178,10 @@ class OCRV1JobWorkerAsync:
 
         try:
             if self.cfg.use_sequential_pipeline:
+                logger.info(f"Using SEQUENTIAL pipeline mode for {total_images} images")
                 stats = await pipeline.run_sequential(tasks, ld_parquet_uri, output_parquet_uri, output_jsonl_uri)
             else:
+                logger.info(f"Using PARALLEL pipeline mode for {total_images} images")
                 stats = await pipeline.run(tasks, ld_parquet_uri, output_parquet_uri, output_jsonl_uri)
         finally:
             await pipeline.close()

@@ -28,6 +28,7 @@ import s3fs
 from bec_orch.core.models import ArtifactLocation, VolumeManifest, VolumeRef
 from bec_orch.jobs.base import JobContext
 from bec_orch.jobs.ocrv1.config import OCRV1Config
+from bec_orch.jobs.ocrv1.debug_visualizer import create_debug_visualizations
 from bec_orch.jobs.ocrv1.worker_async import OCRV1JobWorkerAsync
 
 logging.basicConfig(
@@ -53,25 +54,36 @@ def extract_lines_from_parquet(parquet_path: str) -> list[str]:
 
     all_lines = []
     for row in df.itertuples():
-        texts = row.texts if hasattr(row, "texts") else []
+        # New schema uses page_text (single string) instead of texts (list)
+        if hasattr(row, "page_text"):
+            page_text = row.page_text if row.page_text else ""
+            # Split page text into individual lines
+            lines = page_text.split("\n") if page_text else []
+            all_lines.extend(lines)
+        elif hasattr(row, "texts"):
+            # Legacy format (backwards compatibility)
+            texts = row.texts if row.texts else []
+            
+            # Convert to list if needed
+            if isinstance(texts, list):
+                pass  # Already a list
+            elif texts is None:
+                texts = []
+            elif hasattr(texts, "tolist") and callable(getattr(texts, "tolist", None)):
+                # Numpy array or similar with tolist method
+                texts = texts.tolist()
+            elif hasattr(texts, "__iter__") and not isinstance(texts, (str, bytes)):
+                # Convert iterable to list (but not strings)
+                texts = list(texts)
+            else:
+                # Single value, wrap in list
+                texts = [texts]
 
-        # Convert to list if needed
-        if isinstance(texts, list):
-            pass  # Already a list
-        elif texts is None:
-            texts = []
-        elif hasattr(texts, "tolist") and callable(getattr(texts, "tolist", None)):
-            # Numpy array or similar with tolist method
-            texts = texts.tolist()
-        elif hasattr(texts, "__iter__") and not isinstance(texts, (str, bytes)):
-            # Convert iterable to list (but not strings)
-            texts = list(texts)
+            # Add each text line, including empty ones
+            all_lines.extend(str(line) if line is not None else "" for line in texts)
         else:
-            # Single value, wrap in list
-            texts = [texts]
-
-        # Add each text line, including empty ones
-        all_lines.extend(str(line) if line is not None else "" for line in texts)
+            # No text data found, skip this row
+            pass
 
     return all_lines
 
@@ -248,7 +260,7 @@ def main() -> None:
     parser.add_argument(
         "--debug",
         action="store_true",
-        help="Save preprocessed line images to debug_output folder for inspection",
+        help="Create visual debug output showing images with line and syllable bboxes",
     )
     parser.add_argument(
         "--max-pages",
@@ -327,12 +339,10 @@ def main() -> None:
         greedy_confidence_threshold=-0.2,  # Higher = more selective
         use_sequential_pipeline=True,
         kenlm_path=str(Path(os.environ.get("BEC_OCR_MODEL_DIR", "ocr_models")) / "tibetan_5gram.binary"),
-        # Debug
-        debug_output_dir="debug_output" if args.debug else None,
     )
 
     if args.debug:
-        logger.info(f"Debug mode enabled - preprocessed lines will be saved to {cfg.debug_output_dir}/")
+        logger.info("Debug mode enabled - will create visual debug output after processing")
 
     worker = OCRV1JobWorkerAsync(cfg=cfg)
 
@@ -353,7 +363,8 @@ def main() -> None:
 
     # Download output parquet from S3
     s3 = s3fs.S3FileSystem()
-    current_parquet_s3 = f"{ocr_dest_bucket}/{artifacts_location.prefix}/{artifacts_location.basename}.parquet"
+    current_parquet_s3 = f"{ocr_dest_bucket}/{artifacts_location.prefix}/{artifacts_location.basename}_ocrv1.parquet"
+    current_jsonl_s3 = f"{ocr_dest_bucket}/{artifacts_location.prefix}/{artifacts_location.basename}_ocrv1.jsonl.gz"
     temp_parquet = "temp_current_output.parquet"
 
     try:
@@ -366,6 +377,24 @@ def main() -> None:
         else:
             # Compare with reference (exits if reference doesn't exist)
             compare_with_reference(temp_parquet)
+        
+        # Create debug visualizations if requested
+        if args.debug:
+            logger.info("=== Creating debug visualizations ===")
+            debug_output_dir = Path("debug_output_ocr")
+            try:
+                create_debug_visualizations(
+                    jsonl_uri=f"s3://{current_jsonl_s3}",
+                    source_image_bucket=source_image_bucket,
+                    w_id=w_id,
+                    i_id=i_id,
+                    output_dir=debug_output_dir,
+                    max_images=10,  # Limit to first 10 images for quick debugging
+                )
+                logger.info(f"Debug visualizations saved to {debug_output_dir}/")
+            except Exception as e:
+                logger.error(f"Failed to create debug visualizations: {e}", exc_info=True)
+    
     except Exception as e:
         logger.warning(f"Could not process output parquet: {e}")
     finally:

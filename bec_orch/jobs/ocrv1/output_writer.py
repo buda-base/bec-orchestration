@@ -147,9 +147,9 @@ class OutputWriter:
     PipelineErrors are tracked and reported.
     """
 
-    def __init__(self, volume_id: str, output_prefix: str) -> None:
-        self.parquet_uri = f"{output_prefix}/{volume_id}_ocr.parquet"
-        self.jsonl_uri = f"{output_prefix}/{volume_id}_ocr.jsonl.gz"
+    def __init__(self, parquet_uri: str, jsonl_uri: str) -> None:
+        self.parquet_uri = parquet_uri
+        self.jsonl_uri = jsonl_uri
 
         self.parquet_writer = ParquetWriter(self.parquet_uri)
         self._s3 = s3fs.S3FileSystem()

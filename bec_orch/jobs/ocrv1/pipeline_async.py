@@ -332,6 +332,7 @@ class AsyncOCRPipeline:
         tasks: list[ImageTask],
         ld_parquet_uri: str,
         output_parquet_uri: str,
+        output_jsonl_uri: str,
         timeout_s: float | None = None,
     ) -> dict:
         """Run the full pipeline with optional timeout protection.
@@ -339,7 +340,8 @@ class AsyncOCRPipeline:
         Args:
             tasks: List of ImageTask objects identifying pages to process
             ld_parquet_uri: S3 URI of the line detection parquet file
-            output_parquet_uri: S3 URI for output
+            output_parquet_uri: S3 URI for output parquet file
+            output_jsonl_uri: S3 URI for output JSONL file
             timeout_s: Optional timeout in seconds. If None, uses cfg.volume_timeout_s
         
         Raises:
@@ -349,7 +351,7 @@ class AsyncOCRPipeline:
         
         try:
             return await asyncio.wait_for(
-                self._run_pipeline(tasks, ld_parquet_uri, output_parquet_uri),
+                self._run_pipeline(tasks, ld_parquet_uri, output_parquet_uri, output_jsonl_uri),
                 timeout=timeout
             )
         except asyncio.TimeoutError:
@@ -368,6 +370,7 @@ class AsyncOCRPipeline:
         tasks: list[ImageTask],
         ld_parquet_uri: str,
         output_parquet_uri: str,
+        output_jsonl_uri: str,
     ) -> dict:
         """Internal pipeline execution (called by run with timeout)."""
         start_time = time.perf_counter()
@@ -387,14 +390,11 @@ class AsyncOCRPipeline:
 
         monitor_task = asyncio.create_task(monitor_queues(), name="monitor")
 
-        # Extract volume_id for output writer
-        volume_id = output_parquet_uri.split("/")[-2] if "/" in output_parquet_uri else "unknown"
-        
         # Create output writer stage for this run
         expected_filenames = [t.filename for t in tasks]
         output_writer = OutputWriterStage(
-            volume_id=volume_id,
-            output_prefix=output_parquet_uri.rsplit("/", 1)[0] if "/" in output_parquet_uri else output_parquet_uri,
+            parquet_uri=output_parquet_uri,
+            jsonl_uri=output_jsonl_uri,
             q_in=self.q_results,
             expected_filenames=expected_filenames,
             stats=self.stats,
@@ -511,6 +511,7 @@ class AsyncOCRPipeline:
         tasks: list[ImageTask],
         ld_parquet_uri: str,
         output_parquet_uri: str,
+        output_jsonl_uri: str,
         timeout_s: float | None = None,
     ) -> dict:
         """
@@ -521,7 +522,8 @@ class AsyncOCRPipeline:
         Args:
             tasks: List of ImageTask objects identifying pages to process
             ld_parquet_uri: S3 URI of the line detection parquet file
-            output_parquet_uri: S3 URI for output
+            output_parquet_uri: S3 URI for output parquet file
+            output_jsonl_uri: S3 URI for output JSONL file
             timeout_s: Optional timeout in seconds. If None, uses cfg.volume_timeout_s
         
         Raises:
@@ -531,7 +533,7 @@ class AsyncOCRPipeline:
         
         try:
             return await asyncio.wait_for(
-                self._run_sequential_pipeline(tasks, ld_parquet_uri, output_parquet_uri),
+                self._run_sequential_pipeline(tasks, ld_parquet_uri, output_parquet_uri, output_jsonl_uri),
                 timeout=timeout
             )
         except asyncio.TimeoutError:
@@ -548,6 +550,7 @@ class AsyncOCRPipeline:
         tasks: list[ImageTask],
         ld_parquet_uri: str,
         output_parquet_uri: str,
+        output_jsonl_uri: str,
     ) -> dict:
         """Internal sequential pipeline execution (called by run_sequential with timeout)."""
         start_time = time.perf_counter()
@@ -639,13 +642,18 @@ class AsyncOCRPipeline:
                 pruned_vocab = [vocab[i] for i in keep_indices] if keep_indices is not None else vocab
 
                 # Use decode_logits_with_segments for structured output
-                original_width = inferred.processed_page.orig_width
+                # Get line width in original coordinates (not page width!)
+                processed_line = inferred.processed_page.lines[line_idx]
+                line_bbox_w = processed_line.bbox[2]  # Width in resized coords
+                inv_scale = 1.0 / inferred.processed_page.scale_factor if inferred.processed_page.scale_factor != 0 else 1.0
+                original_line_width = int(line_bbox_w * inv_scale)  # Scale to original coords
+                
                 future = loop.run_in_executor(
                     self._ctc_executor,
                     _decode_single_line_with_segments,
                     cropped,
                     pruned_vocab,
-                    original_width,
+                    original_line_width,  # Pass line width, not page width!
                     self.cfg.beam_width,
                     self.cfg.token_min_logp,
                     submit_time,
@@ -718,11 +726,10 @@ class AsyncOCRPipeline:
                 await self.q_results.put(EndOfStream(stream="results", producer="run_sequential"))
 
             # Create output writer stage for this run
-            volume_id = output_parquet_uri.split("/")[-2] if "/" in output_parquet_uri else "unknown"
             expected_filenames = [t.filename for t in tasks]
             output_writer = OutputWriterStage(
-                volume_id=volume_id,
-                output_prefix=output_parquet_uri.rsplit("/", 1)[0] if "/" in output_parquet_uri else output_parquet_uri,
+                parquet_uri=output_parquet_uri,
+                jsonl_uri=output_jsonl_uri,
                 q_in=self.q_results,
                 expected_filenames=expected_filenames,
                 stats=self.stats,

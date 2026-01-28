@@ -497,11 +497,16 @@ class CTCDecoderStage:
                             else vocab
                         )
 
-                        original_width = inferred.processed_page.orig_width
+                        # Get line width in original coordinates (not page width!)
+                        processed_line = inferred.processed_page.lines[line_idx]
+                        line_bbox_w = processed_line.bbox[2]  # Width in resized coords
+                        inv_scale = 1.0 / inferred.processed_page.scale_factor if inferred.processed_page.scale_factor != 0 else 1.0
+                        original_line_width = int(line_bbox_w * inv_scale)  # Scale to original coords
+                        
                         decode_result = decode_logits_with_segments(
                             cropped,
                             pruned_vocab,
-                            original_width,
+                            original_line_width,  # Pass line width, not page width!
                             beam_width=self.cfg.beam_width,
                             token_min_logp=self.cfg.token_min_logp,
                         )
@@ -609,14 +614,14 @@ class OutputWriterStage:
 
     def __init__(
         self,
-        volume_id: str,
-        output_prefix: str,
+        parquet_uri: str,
+        jsonl_uri: str,
         q_in: asyncio.Queue,
         expected_filenames: list[str],
         stats: dict[str, int],
     ) -> None:
-        self.volume_id = volume_id
-        self.output_prefix = output_prefix
+        self.parquet_uri = parquet_uri
+        self.jsonl_uri = jsonl_uri
         self.q_in = q_in
         self.expected_filenames = set(expected_filenames)
         self.total_pages = len(expected_filenames)
@@ -632,7 +637,7 @@ class OutputWriterStage:
 
         logger.info(f"[OutputWriter] Starting, expecting {self.total_pages} pages")
 
-        writer = OutputWriter(self.volume_id, self.output_prefix)
+        writer = OutputWriter(self.parquet_uri, self.jsonl_uri)
         pages_written = 0
         errors_received = 0
 

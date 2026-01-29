@@ -12,14 +12,13 @@ All stages connected by bounded asyncio.Queue for backpressure.
 """
 
 import asyncio
+import contextlib
 import logging
 import os
 import time
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
-from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-import numpy as np
 import numpy.typing as npt
 from botocore.client import BaseClient
 
@@ -27,13 +26,9 @@ from .data_structures import (
     EndOfStream,
     ImageTask,
     InferredPage,
-    LineLogits,
     LineResult,
-    PageInFlight,
     PageOCRResult,
     PageResult,
-    PendingTensor,
-    PipelineError,
 )
 from .line import BBox
 
@@ -47,9 +42,8 @@ from .ctc_decoder import (
     decode_logits_with_segments,
     init_worker_process,
 )
-from .line_decoder import FetchedBytes, LineDecoder, PrefetchedBytes, ProcessedPage
+from .line_decoder import LineDecoder, ProcessedPage
 from .model import OCRModel
-from .output_writer import OutputWriter
 from .stages import (
     CTCDecoderStage,
     GPUInferenceStage,
@@ -62,7 +56,6 @@ from .stages import (
 logger = logging.getLogger(__name__)
 
 # Import for parquet loading
-import pyarrow.parquet as pq
 
 # Default vocabulary size for fallback logits
 DEFAULT_VOCAB_SIZE = 84
@@ -104,7 +97,7 @@ def _build_page_ocr_result(
         # Skip empty lines (or lines with only whitespace)
         if not decode_result.text or not decode_result.text.strip():
             continue
-        
+
         x, y, w, h = processed_line.bbox
 
         # Scale bbox back to original image coordinates
@@ -290,7 +283,7 @@ class AsyncOCRPipeline:
 
         # Create stage instances
         self._parquet_loader = ParquetLoaderStage(s3_client=s3_client)
-        
+
         self._prefetcher = PrefetcherStage(
             cfg=cfg,
             s3_client=s3_client,
@@ -299,7 +292,7 @@ class AsyncOCRPipeline:
             q_out=self.q_fetched,
             stats=self.stats,
         )
-        
+
         self._image_processor = ImageProcessorStage(
             cfg=cfg,
             line_decoder=self.line_decoder,
@@ -309,7 +302,7 @@ class AsyncOCRPipeline:
             executor=self._image_executor,
             stats=self.stats,
         )
-        
+
         self._gpu_inference = GPUInferenceStage(
             cfg=cfg,
             ocr_model=ocr_model,
@@ -317,7 +310,7 @@ class AsyncOCRPipeline:
             q_out=self.q_inferred,
             stats=self.stats,
         )
-        
+
         self._ctc_decoder_stage = CTCDecoderStage(
             cfg=cfg,
             ctc_decoder=ctc_decoder,
@@ -336,35 +329,29 @@ class AsyncOCRPipeline:
         tasks: list[ImageTask],
         ld_parquet_uri: str,
         output_parquet_uri: str,
-        output_jsonl_uri: str | None,
         timeout_s: float | None = None,
     ) -> dict:
         """Run the full pipeline with optional timeout protection.
-        
+
         Args:
             tasks: List of ImageTask objects identifying pages to process
             ld_parquet_uri: S3 URI of the line detection parquet file
             output_parquet_uri: S3 URI for output parquet file
-            output_jsonl_uri: S3 URI for output JSONL file (None to disable)
             timeout_s: Optional timeout in seconds. If None, uses cfg.volume_timeout_s
-        
+
         Raises:
             asyncio.TimeoutError: If pipeline exceeds timeout (after graceful cleanup)
         """
-        timeout = timeout_s or getattr(self.cfg, 'volume_timeout_s', 600.0)
-        
+        timeout = timeout_s or getattr(self.cfg, "volume_timeout_s", 600.0)
+
         try:
             return await asyncio.wait_for(
-                self._run_pipeline(tasks, ld_parquet_uri, output_parquet_uri, output_jsonl_uri),
-                timeout=timeout
+                self._run_pipeline(tasks, ld_parquet_uri, output_parquet_uri), timeout=timeout
             )
         except asyncio.TimeoutError:
             # Log diagnostic state before cleanup
             diagnostic_state = self.get_diagnostic_state()
-            logger.error(
-                f"[AsyncOCRPipeline] Timeout after {timeout}s. "
-                f"Diagnostic: {diagnostic_state}"
-            )
+            logger.exception(f"[AsyncOCRPipeline] Timeout after {timeout}s. Diagnostic: {diagnostic_state}")
             # Try graceful cleanup
             await self._graceful_shutdown()
             raise
@@ -374,7 +361,6 @@ class AsyncOCRPipeline:
         tasks: list[ImageTask],
         ld_parquet_uri: str,
         output_parquet_uri: str,
-        output_jsonl_uri: str | None,
     ) -> dict:
         """Internal pipeline execution (called by run with timeout)."""
         start_time = time.perf_counter()
@@ -398,7 +384,6 @@ class AsyncOCRPipeline:
         expected_filenames = [t.filename for t in tasks]
         output_writer = OutputWriterStage(
             parquet_uri=output_parquet_uri,
-            jsonl_uri=output_jsonl_uri,
             q_in=self.q_results,
             expected_filenames=expected_filenames,
             stats=self.stats,
@@ -409,11 +394,11 @@ class AsyncOCRPipeline:
             # This avoids competing with the prefetcher's 64 concurrent image fetches
             parquet_task = asyncio.create_task(self._parquet_loader.run(ld_parquet_uri), name="parquet_loader")
             await parquet_task
-            
+
             if self._parquet_loader.parquet_error:
                 logger.error(f"[AsyncOCRPipeline] Parquet loading failed: {self._parquet_loader.parquet_error}")
                 # Still need to run stages to emit proper errors
-            
+
             # Phase 2: Start all other stages (parquet already loaded)
             self._stage_tasks = [
                 asyncio.create_task(self._prefetcher.run(tasks), name="prefetcher"),
@@ -449,7 +434,7 @@ class AsyncOCRPipeline:
 
     async def _graceful_shutdown(self) -> None:
         """Gracefully shutdown the pipeline on timeout.
-        
+
         Tries to let the writer flush before cancelling all tasks.
         """
         if not self._stage_tasks:
@@ -467,20 +452,14 @@ class AsyncOCRPipeline:
 
         # Wait briefly for non-writer tasks to cancel
         non_writer_tasks = [t for t in self._stage_tasks if t.get_name() != "writer"]
-        try:
-            await asyncio.wait_for(
-                asyncio.gather(*non_writer_tasks, return_exceptions=True),
-                timeout=2.0
-            )
-        except asyncio.TimeoutError:
-            pass
+        with contextlib.suppress(asyncio.TimeoutError):
+            await asyncio.wait_for(asyncio.gather(*non_writer_tasks, return_exceptions=True), timeout=2.0)
 
         # Try to send EOS to writer to let it flush
         if writer_task and not writer_task.done():
             try:
                 await asyncio.wait_for(
-                    self.q_results.put(EndOfStream(stream="results", producer="timeout_shutdown")),
-                    timeout=1.0
+                    self.q_results.put(EndOfStream(stream="results", producer="timeout_shutdown")), timeout=1.0
                 )
                 # Wait briefly for writer to flush
                 await asyncio.wait_for(writer_task, timeout=5.0)
@@ -488,10 +467,8 @@ class AsyncOCRPipeline:
             except asyncio.TimeoutError:
                 logger.warning("[AsyncOCRPipeline] Writer did not flush in time, cancelling")
                 writer_task.cancel()
-                try:
+                with contextlib.suppress(asyncio.TimeoutError, asyncio.CancelledError):
                     await asyncio.wait_for(writer_task, timeout=1.0)
-                except (asyncio.TimeoutError, asyncio.CancelledError):
-                    pass
 
         self._stage_tasks = []
         self._is_running = False
@@ -499,7 +476,7 @@ class AsyncOCRPipeline:
 
     def get_diagnostic_state(self) -> dict:
         """Return diagnostic state for debugging stuck pipelines.
-        
+
         Called when timeout occurs to help identify where the pipeline is stuck.
         """
         return {
@@ -511,11 +488,9 @@ class AsyncOCRPipeline:
                 "q_results": f"{self.q_results.qsize()}/64",
             },
             "stats": dict(self.stats),
-            "parquet_ready": self._parquet_loader._load_complete.is_set(),
+            "parquet_ready": self._parquet_loader.is_load_complete,
             "parquet_error": self._parquet_loader.parquet_error,
-            "active_tasks": [
-                t.get_name() for t in self._stage_tasks if not t.done()
-            ] if self._stage_tasks else [],
+            "active_tasks": [t.get_name() for t in self._stage_tasks if not t.done()] if self._stage_tasks else [],
         }
 
     async def run_sequential(
@@ -523,37 +498,32 @@ class AsyncOCRPipeline:
         tasks: list[ImageTask],
         ld_parquet_uri: str,
         output_parquet_uri: str,
-        output_jsonl_uri: str | None,
         timeout_s: float | None = None,
     ) -> dict:
         """
         Run pipeline in two phases to eliminate CPU contention:
         Phase 1: Prefetch + Image Processing + GPU Inference (collect all logits in memory)
         Phase 2: CTC Decode all collected logits + Write to Parquet
-        
+
         Args:
             tasks: List of ImageTask objects identifying pages to process
             ld_parquet_uri: S3 URI of the line detection parquet file
             output_parquet_uri: S3 URI for output parquet file
-            output_jsonl_uri: S3 URI for output JSONL file (None to disable)
             timeout_s: Optional timeout in seconds. If None, uses cfg.volume_timeout_s
-        
+
         Raises:
             asyncio.TimeoutError: If pipeline exceeds timeout (after graceful cleanup)
         """
-        timeout = timeout_s or getattr(self.cfg, 'volume_timeout_s', 600.0)
-        
+        timeout = timeout_s or getattr(self.cfg, "volume_timeout_s", 600.0)
+
         try:
             return await asyncio.wait_for(
-                self._run_sequential_pipeline(tasks, ld_parquet_uri, output_parquet_uri, output_jsonl_uri),
-                timeout=timeout
+                self._run_sequential_pipeline(tasks, ld_parquet_uri, output_parquet_uri),
+                timeout=timeout,
             )
         except asyncio.TimeoutError:
             diagnostic_state = self.get_diagnostic_state()
-            logger.error(
-                f"[AsyncOCRPipeline] Sequential timeout after {timeout}s. "
-                f"Diagnostic: {diagnostic_state}"
-            )
+            logger.exception(f"[AsyncOCRPipeline] Sequential timeout after {timeout}s. Diagnostic: {diagnostic_state}")
             await self._graceful_shutdown()
             raise
 
@@ -562,7 +532,6 @@ class AsyncOCRPipeline:
         tasks: list[ImageTask],
         ld_parquet_uri: str,
         output_parquet_uri: str,
-        output_jsonl_uri: str | None,
     ) -> dict:
         """Internal sequential pipeline execution (called by run_sequential with timeout)."""
         start_time = time.perf_counter()
@@ -598,10 +567,10 @@ class AsyncOCRPipeline:
             logger.info("[Phase 0] Downloading parquet...")
             parquet_task = asyncio.create_task(self._parquet_loader.run(ld_parquet_uri), name="parquet_loader")
             await parquet_task
-            
+
             if self._parquet_loader.parquet_error:
                 logger.error(f"[AsyncOCRPipeline] Parquet loading failed: {self._parquet_loader.parquet_error}")
-            
+
             # Phase 1: Run prefetch + image processing + GPU inference
             logger.info("[Phase 1] Starting GPU inference phase...")
             self._stage_tasks = [
@@ -663,9 +632,11 @@ class AsyncOCRPipeline:
                 # Get line width in original coordinates (not page width!)
                 processed_line = inferred.processed_page.lines[line_idx]
                 line_bbox_w = processed_line.bbox[2]  # Width in resized coords
-                inv_scale = 1.0 / inferred.processed_page.scale_factor if inferred.processed_page.scale_factor != 0 else 1.0
+                inv_scale = (
+                    1.0 / inferred.processed_page.scale_factor if inferred.processed_page.scale_factor != 0 else 1.0
+                )
                 original_line_width = int(line_bbox_w * inv_scale)  # Scale to original coords
-                
+
                 future = loop.run_in_executor(
                     self._ctc_executor,
                     _decode_single_line_with_segments,
@@ -747,7 +718,6 @@ class AsyncOCRPipeline:
             expected_filenames = [t.filename for t in tasks]
             output_writer = OutputWriterStage(
                 parquet_uri=output_parquet_uri,
-                jsonl_uri=output_jsonl_uri,
                 q_in=self.q_results,
                 expected_filenames=expected_filenames,
                 stats=self.stats,

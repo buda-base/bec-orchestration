@@ -9,16 +9,17 @@ This module defines:
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Literal, Optional, Union
+from typing import TYPE_CHECKING, Literal
 
-import numpy.typing as npt
-
-from .line import BBox
+from .line_decoder import PrefetchedBytes, ProcessedPage
 
 if TYPE_CHECKING:
-    from .ctc_decoder import SyllableSegment
-    from .line_decoder import FetchedBytes, PrefetchedBytes, ProcessedPage
+    import numpy.typing as npt
 
+    from .ctc_decoder import SyllableSegment
+    from .gpu_inference import InferredPage
+    from .line import BBox
+    from .output_writer import PageOCRResult
 
 # =============================================================================
 # Task Identity
@@ -29,7 +30,7 @@ if TYPE_CHECKING:
 class ImageTask:
     """
     Identity of a single image/page to process.
-    
+
     Frozen dataclass that uniquely identifies a page in the pipeline.
     Replaces tuple-based (page_idx, filename) passing.
     """
@@ -53,7 +54,7 @@ class EndOfStream:
     """
 
     stream: Literal["fetched", "processed", "inferred", "results"]
-    producer: Optional[str] = None
+    producer: str | None = None
 
 
 @dataclass(frozen=True)
@@ -77,7 +78,7 @@ class PipelineError:
         "Pipeline",
     ]
     task: ImageTask
-    source_etag: Optional[str]
+    source_etag: str | None
     error_type: str
     message: str
 
@@ -138,7 +139,7 @@ class PageInFlight:
     including the processed page data and collected line results.
     """
 
-    processed_page: "ProcessedPage"  # The processed page with line tensors
+    processed_page: ProcessedPage  # The processed page with line tensors
     expected_lines: int  # Number of lines expected for this page
     line_logits: dict[int, LineLogits]  # Collected LineLogits objects by line index
 
@@ -155,8 +156,8 @@ class InferredPage:
     task: ImageTask
     source_etag: str
     logits_list: list[LineLogits]
-    processed_page: "ProcessedPage"
-    error: Optional[str] = None
+    processed_page: ProcessedPage
+    error: str | None = None
 
     # Convenience properties
     @property
@@ -166,28 +167,6 @@ class InferredPage:
     @property
     def filename(self) -> str:
         return self.task.filename
-
-
-# =============================================================================
-# Queue Message Type Unions
-# =============================================================================
-
-# Each queue can receive one of these message types:
-# - The normal data payload
-# - A PipelineError (if processing failed for this page)
-# - EndOfStream (when the producer is done)
-
-# q_fetched: Prefetcher -> ImageProcessor (PrefetchedBytes, no LD metadata yet)
-PrefetchedBytesMsg = Union["PrefetchedBytes", PipelineError, EndOfStream]
-
-# q_processed: ImageProcessor -> GPUInference
-ProcessedPageMsg = Union["ProcessedPage", PipelineError, EndOfStream]
-
-# q_inferred: GPUInference -> CTCDecoder
-InferredPageMsg = Union[InferredPage, PipelineError, EndOfStream]
-
-# q_results: CTCDecoder -> OutputWriter
-PageOCRResultMsg = Union["PageOCRResult", PipelineError, EndOfStream]
 
 
 # =============================================================================
@@ -203,7 +182,7 @@ class LineResult:
     bbox: BBox
     text: str
     confidence: float
-    syllables: list["SyllableSegment"]  # from CTC decoder
+    syllables: list[SyllableSegment]  # from CTC decoder
 
 
 @dataclass
@@ -251,3 +230,25 @@ class PageResult:
     @property
     def filename(self) -> str:
         return self.task.filename
+
+
+# =============================================================================
+# Queue Message Type Unions
+# =============================================================================
+
+# Each queue can receive one of these message types:
+# - The normal data payload
+# - A PipelineError (if processing failed for this page)
+# - EndOfStream (when the producer is done)
+
+# q_fetched: Prefetcher -> ImageProcessor (PrefetchedBytes, no LD metadata yet)
+PrefetchedBytesMsg = PrefetchedBytes | PipelineError | EndOfStream
+
+# q_processed: ImageProcessor -> GPUInference
+ProcessedPageMsg = ProcessedPage | PipelineError | EndOfStream
+
+# q_inferred: GPUInference -> CTCDecoder
+InferredPageMsg = InferredPage | PipelineError | EndOfStream
+
+# q_results: CTCDecoder -> OutputWriter
+PageOCRResultMsg = PageOCRResult | PipelineError | EndOfStream

@@ -11,27 +11,36 @@ This follows the LDv1 pipeline pattern for modular, testable stages.
 from __future__ import annotations
 
 import asyncio
+import io
 import logging
 import time
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
-import numpy.typing as npt
 import pyarrow.parquet as pq
-from botocore.client import BaseClient
+from pyarrow import fs
 
+from .ctc_decoder import decode_logits_with_segments
 from .data_structures import (
     EndOfStream,
     ImageTask,
     InferredPage,
     LineLogits,
+    LineResult,
     PageInFlight,
+    PageOCRResult,
+    PendingTensor,
     PipelineError,
 )
+from .line import BBox
 from .line_decoder import FetchedBytes, LineDecoder, PrefetchedBytes, ProcessedPage
+from .output_writer import OutputWriter
 
 if TYPE_CHECKING:
+    from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+
+    from botocore.client import BaseClient
+
     from .config import OCRV1Config
     from .ctc_decoder import CTCDecoder
     from .model import OCRModel
@@ -44,7 +53,7 @@ DEFAULT_VOCAB_SIZE = 84
 
 class ParquetLoaderStage:
     """Loads LD parquet file asynchronously with progressive row availability.
-    
+
     Downloads parquet via boto3 (faster than PyArrow's S3 filesystem),
     then reads from memory. Makes rows available progressively so
     ImageProcessor can start before all rows are parsed.
@@ -59,7 +68,7 @@ class ParquetLoaderStage:
 
     async def get_row(self, filename: str) -> dict | None:
         """Get row by filename, waiting if not yet loaded.
-        
+
         Returns immediately if the row is already in memory.
         Otherwise waits until the row's row group is loaded.
         Returns None if the row doesn't exist in the parquet file.
@@ -67,39 +76,39 @@ class ParquetLoaderStage:
         # Fast path: already in memory
         if filename in self.parquet_data:
             return self.parquet_data[filename]
-        
+
         # Load finished, row doesn't exist
         if self._load_complete.is_set():
             return None
-        
+
         # Register interest in this filename
         if filename not in self._row_events:
             self._row_events[filename] = asyncio.Event()
-        
+
         # Wait for either this row to be loaded or load completion
         row_event = self._row_events[filename]
         load_complete_task = asyncio.create_task(self._load_complete.wait())
         row_event_task = asyncio.create_task(row_event.wait())
-        
+
         try:
-            done, pending = await asyncio.wait(
-                [row_event_task, load_complete_task],
-                return_when=asyncio.FIRST_COMPLETED
+            _, pending = await asyncio.wait(
+                {load_complete_task, row_event_task},
+                return_when=asyncio.FIRST_COMPLETED,
             )
-            # Cancel pending tasks to avoid warnings
             for task in pending:
                 task.cancel()
-                try:
-                    await task
-                except asyncio.CancelledError:
-                    pass
+
+            if filename in self.parquet_data:
+                return self.parquet_data[filename]
         except Exception:
-            # Ensure cleanup on any error
-            row_event_task.cancel()
-            load_complete_task.cancel()
-            raise
-        
-        return self.parquet_data.get(filename)
+            return None
+        else:
+            return None
+
+    @property
+    def is_load_complete(self) -> bool:
+        """Check if parquet loading has completed."""
+        return self._load_complete.is_set()
 
     def _parse_s3_uri(self, uri: str) -> tuple[str, str]:
         """Parse s3://bucket/key into (bucket, key)."""
@@ -111,7 +120,7 @@ class ParquetLoaderStage:
 
     async def run(self, ld_parquet_uri: str) -> None:
         """Load parquet file and make rows available progressively.
-        
+
         Downloads via boto3 (much faster than PyArrow's S3 filesystem),
         then reads from memory. Processes rows in batches with yields
         to the event loop so images can start processing as soon as
@@ -123,36 +132,35 @@ class ParquetLoaderStage:
 
         try:
             # Download via boto3 (faster than PyArrow's S3 filesystem)
-            if self.s3_client and ld_parquet_uri.startswith("s3://"):
+            if self.s3_client is not None and ld_parquet_uri.startswith("s3://"):
                 bucket, key = self._parse_s3_uri(ld_parquet_uri)
-                
-                def _download_and_parse():
-                    import io
-                    response = self.s3_client.get_object(Bucket=bucket, Key=key)
+
+                # Define the function with the client as a parameter
+                def _download_and_parse(client: BaseClient) -> tuple[Any, int]:
+                    response = client.get_object(Bucket=bucket, Key=key)
                     file_bytes = response["Body"].read()
                     file_size_bytes = len(file_bytes)
-                    
+
                     # Read parquet from memory buffer
                     buffer = io.BytesIO(file_bytes)
                     table = pq.read_table(buffer)
                     return table.to_pylist(), file_size_bytes
-                
-                all_rows, file_size_bytes = await loop.run_in_executor(None, _download_and_parse)
+
+                all_rows, file_size_bytes = await loop.run_in_executor(None, _download_and_parse, self.s3_client)
             else:
                 # Fallback to PyArrow's S3 filesystem for non-S3 URIs or if no client
-                def _load_parquet():
-                    from pyarrow import fs
+                def _load_parquet() -> tuple[Any, int]:
                     filesystem, path = fs.FileSystem.from_uri(ld_parquet_uri)
                     file_info = filesystem.get_file_info(path)
                     file_size_bytes = file_info.size
-                    
+
                     table = pq.read_table(ld_parquet_uri)
                     return table.to_pylist(), file_size_bytes
-                
+
                 all_rows, file_size_bytes = await loop.run_in_executor(None, _load_parquet)
-            
+
             download_time = time.perf_counter() - start_time
-            
+
             # Format file size for logging
             if file_size_bytes >= 1024 * 1024:
                 size_str = f"{file_size_bytes / (1024 * 1024):.2f} MB"
@@ -160,31 +168,33 @@ class ParquetLoaderStage:
                 size_str = f"{file_size_bytes / 1024:.1f} KB"
             else:
                 size_str = f"{file_size_bytes} bytes"
-            
+
             speed_mbps = (file_size_bytes / (1024 * 1024)) / download_time if download_time > 0 else 0
-            logger.info(f"[ParquetLoader] Downloaded {len(all_rows)} rows ({size_str}) in {download_time:.2f}s ({speed_mbps:.1f} MB/s), processing...")
+            logger.info(
+                f"[ParquetLoader] Downloaded {len(all_rows)} rows ({size_str}) in {download_time:.2f}s ({speed_mbps:.1f} MB/s), processing..."
+            )
 
             # Process rows in batches, yielding to event loop between batches
             # This allows images to start processing as soon as their row is available
             batch_size = 100
             for i in range(0, len(all_rows), batch_size):
-                batch = all_rows[i:i + batch_size]
+                batch = all_rows[i : i + batch_size]
                 for row in batch:
                     filename = row["img_file_name"]
                     self.parquet_data[filename] = row
                     if filename in self._row_events:
                         self._row_events[filename].set()
-                
+
                 # Yield to event loop so waiting tasks can proceed
                 await asyncio.sleep(0)
 
             elapsed = time.perf_counter() - start_time
             logger.info(f"[ParquetLoader] Loaded {len(self.parquet_data)} rows in {elapsed:.2f}s")
-            
+
         except Exception as e:
             elapsed = time.perf_counter() - start_time
             self.parquet_error = f"{type(e).__name__}: {e}"
-            logger.error(f"[ParquetLoader] Failed in {elapsed:.2f}s: {self.parquet_error}")
+            logger.exception(f"[ParquetLoader] Failed in {elapsed:.2f}s: {self.parquet_error}")
         finally:
             self._load_complete.set()
             # Signal all remaining waiters (in case they're waiting for rows that don't exist)
@@ -194,13 +204,13 @@ class ParquetLoaderStage:
 
 class PrefetcherStage:
     """Fetches images from S3 with high concurrency.
-    
+
     Outputs PrefetchedBytes (raw bytes without LD metadata).
     """
 
     def __init__(
         self,
-        cfg: "OCRV1Config",
+        cfg: OCRV1Config,
         s3_client: BaseClient,
         source_image_bucket: str,
         volume_prefix: str,
@@ -226,9 +236,7 @@ class PrefetcherStage:
                     loop = asyncio.get_event_loop()
 
                     def _fetch() -> tuple[str, bytes]:
-                        response = self.s3_client.get_object(
-                            Bucket=self.source_image_bucket, Key=key
-                        )
+                        response = self.s3_client.get_object(Bucket=self.source_image_bucket, Key=key)
                         return response.get("ETag", "").strip('"'), response["Body"].read()
 
                     source_etag, file_bytes = await loop.run_in_executor(None, _fetch)
@@ -267,14 +275,14 @@ class PrefetcherStage:
 
 class ImageProcessorStage:
     """Processes images using LineDecoder.
-    
+
     Waits for parquet to be loaded, combines PrefetchedBytes with LD row data,
     and runs LineDecoder to extract lines.
     """
 
     def __init__(
         self,
-        cfg: "OCRV1Config",
+        cfg: OCRV1Config,
         line_decoder: LineDecoder,
         parquet_loader: ParquetLoaderStage,
         q_in: asyncio.Queue,
@@ -292,7 +300,7 @@ class ImageProcessorStage:
 
     async def run(self) -> None:
         """Process images concurrently.
-        
+
         Uses streaming parquet loading - each image waits only for its
         specific row to be loaded, not the entire parquet file.
         """
@@ -307,7 +315,7 @@ class ImageProcessorStage:
                 try:
                     # Wait for this specific row (may return immediately if already loaded)
                     ld_row = await self.parquet_loader.get_row(prefetched.filename)
-                    
+
                     # Check for parquet error
                     if self.parquet_loader.parquet_error:
                         await self.q_out.put(
@@ -321,7 +329,7 @@ class ImageProcessorStage:
                         )
                         self.stats["errors"] += 1
                         return
-                    
+
                     if ld_row is None:
                         await self.q_out.put(
                             PipelineError(
@@ -384,17 +392,16 @@ class ImageProcessorStage:
         logger.info(f"[ImageProcessor] Done, processed {self.stats['processed']} pages")
 
 
-
 class GPUInferenceStage:
     """Runs GPU inference with batching.
-    
+
     Collects line tensors into batches, runs inference, and distributes results.
     """
 
     def __init__(
         self,
-        cfg: "OCRV1Config",
-        ocr_model: "OCRModel",
+        cfg: OCRV1Config,
+        ocr_model: OCRModel,
         q_in: asyncio.Queue,
         q_out: asyncio.Queue,
         stats: dict[str, int],
@@ -407,8 +414,7 @@ class GPUInferenceStage:
 
     async def run(self) -> None:
         """Run GPU inference with batching."""
-        from .data_structures import PendingTensor
-        
+
         logger.info(f"[GPUInference] Starting with batch_size={self.cfg.gpu_batch_size}")
 
         pending_tensors: list[PendingTensor] = []
@@ -451,20 +457,20 @@ class GPUInferenceStage:
 
         async def try_emit_completed_pages() -> None:
             nonlocal pages_emitted
-            completed = [
-                pid for pid, pf in pages_in_flight.items()
-                if len(pf.line_logits) >= pf.expected_lines
-            ]
+            completed = [pid for pid, pf in pages_in_flight.items() if len(pf.line_logits) >= pf.expected_lines]
 
             for pid in completed:
                 page_flight = pages_in_flight.pop(pid)
                 logits_list = [
-                    page_flight.line_logits.get(i, LineLogits(
-                        logits=np.zeros((1, DEFAULT_VOCAB_SIZE), dtype=np.float32),
-                        content_width=1,
-                        left_pad_width=0,
-                        keep_indices=None,
-                    ))
+                    page_flight.line_logits.get(
+                        i,
+                        LineLogits(
+                            logits=np.zeros((1, DEFAULT_VOCAB_SIZE), dtype=np.float32),
+                            content_width=1,
+                            left_pad_width=0,
+                            keep_indices=None,
+                        ),
+                    )
                     for i in range(page_flight.expected_lines)
                 ]
                 await self.q_out.put(self._create_inferred_page(page_flight.processed_page, logits_list))
@@ -480,12 +486,15 @@ class GPUInferenceStage:
 
                 for page_flight in pages_in_flight.values():
                     logits_list = [
-                        page_flight.line_logits.get(i, LineLogits(
-                            logits=np.zeros((1, DEFAULT_VOCAB_SIZE), dtype=np.float32),
-                            content_width=1,
-                            left_pad_width=0,
-                            keep_indices=None,
-                        ))
+                        page_flight.line_logits.get(
+                            i,
+                            LineLogits(
+                                logits=np.zeros((1, DEFAULT_VOCAB_SIZE), dtype=np.float32),
+                                content_width=1,
+                                left_pad_width=0,
+                                keep_indices=None,
+                            ),
+                        )
                         for i in range(page_flight.expected_lines)
                     ]
                     await self.q_out.put(self._create_inferred_page(page_flight.processed_page, logits_list))
@@ -520,14 +529,15 @@ class GPUInferenceStage:
             )
 
             for line_idx, line in enumerate(processed.lines):
-                from .data_structures import PendingTensor
-                pending_tensors.append(PendingTensor(
-                    page_idx=processed.page_idx,
-                    line_idx=line_idx,
-                    tensor=line.tensor,
-                    content_width=line.content_width,
-                    left_pad_width=line.left_pad_width,
-                ))
+                pending_tensors.append(
+                    PendingTensor(
+                        page_idx=processed.page_idx,
+                        line_idx=line_idx,
+                        tensor=line.tensor,
+                        content_width=line.content_width,
+                        left_pad_width=line.left_pad_width,
+                    )
+                )
 
                 if len(pending_tensors) >= self.cfg.gpu_batch_size:
                     await flush_batch()
@@ -547,14 +557,14 @@ class GPUInferenceStage:
 
 class CTCDecoderStage:
     """Decodes logits to text using CTC beam search.
-    
+
     Runs decoding in a process pool for parallelism.
     """
 
     def __init__(
         self,
-        cfg: "OCRV1Config",
-        ctc_decoder: "CTCDecoder",
+        cfg: OCRV1Config,
+        ctc_decoder: CTCDecoder,
         q_in: asyncio.Queue,
         q_out: asyncio.Queue,
         executor: ProcessPoolExecutor,
@@ -569,9 +579,6 @@ class CTCDecoderStage:
 
     async def run(self) -> None:
         """Decode pages from GPU inference."""
-        from .ctc_decoder import decode_logits_with_segments
-        from .line import BBox
-        from .data_structures import LineResult, PageOCRResult
 
         logger.info("[CTCDecoder] Starting")
 
@@ -583,7 +590,6 @@ class CTCDecoderStage:
             async with sem:
                 try:
                     vocab = self.ctc_decoder.ctc_vocab
-                    loop = asyncio.get_event_loop()
                     line_decode_results = []
 
                     num_lines = len(inferred.logits_list)
@@ -603,9 +609,13 @@ class CTCDecoderStage:
                         # Get line width in original coordinates (not page width!)
                         processed_line = inferred.processed_page.lines[line_idx]
                         line_bbox_w = processed_line.bbox[2]  # Width in resized coords
-                        inv_scale = 1.0 / inferred.processed_page.scale_factor if inferred.processed_page.scale_factor != 0 else 1.0
+                        inv_scale = (
+                            1.0 / inferred.processed_page.scale_factor
+                            if inferred.processed_page.scale_factor != 0
+                            else 1.0
+                        )
                         original_line_width = int(line_bbox_w * inv_scale)  # Scale to original coords
-                        
+
                         decode_result = decode_logits_with_segments(
                             cropped,
                             pruned_vocab,
@@ -662,10 +672,8 @@ class CTCDecoderStage:
 
         logger.info(f"[CTCDecoder] Done, decoded {self.stats['decoded']} pages")
 
-    def _build_page_ocr_result(self, processed_page: ProcessedPage, line_decode_results: list) -> "PageOCRResult":
+    def _build_page_ocr_result(self, processed_page: ProcessedPage, line_decode_results: list) -> PageOCRResult:
         """Build PageOCRResult from processed page and line decode results."""
-        from .line import BBox
-        from .data_structures import LineResult, PageOCRResult
 
         if processed_page.error:
             return PageOCRResult(
@@ -687,7 +695,7 @@ class CTCDecoderStage:
             # Skip empty lines (or lines with only whitespace)
             if not decode_result.text or not decode_result.text.strip():
                 continue
-            
+
             x, y, w, h = processed_line.bbox
             orig_x = int(x * inv_scale)
             orig_y = int(y * inv_scale)
@@ -713,8 +721,8 @@ class CTCDecoderStage:
 
 
 class OutputWriterStage:
-    """Writes results to Parquet and JSONL output files.
-    
+    """Writes results to Parquet output file.
+
     Tracks expected vs received pages and creates error records for any
     missing pages at EndOfStream (like ldv1's ParquetWriter).
     """
@@ -722,29 +730,25 @@ class OutputWriterStage:
     def __init__(
         self,
         parquet_uri: str,
-        jsonl_uri: str | None,
         q_in: asyncio.Queue,
         expected_filenames: list[str],
         stats: dict[str, int],
     ) -> None:
         self.parquet_uri = parquet_uri
-        self.jsonl_uri = jsonl_uri
         self.q_in = q_in
         self.expected_filenames = set(expected_filenames)
         self.total_pages = len(expected_filenames)
         self.stats = stats
-        
+
         # Track received filenames for missing page detection
         self._received_filenames: set[str] = set()
 
     async def run(self) -> None:
-        """Write results to output files."""
-        from .output_writer import OutputWriter
-        from .data_structures import PageOCRResult
+        """Write results to Parquet output file."""
 
         logger.info(f"[OutputWriter] Starting, expecting {self.total_pages} pages")
 
-        writer = OutputWriter(self.parquet_uri, self.jsonl_uri)
+        writer = OutputWriter(self.parquet_uri)
         pages_written = 0
         errors_received = 0
 
@@ -772,7 +776,7 @@ class OutputWriterStage:
 
                 if pages_written % 100 == 0:
                     logger.info(f"[OutputWriter] Progress: {pages_written}/{self.total_pages}")
-            
+
             # Fill missing pages with errors before closing
             dropped_count = self._fill_missing_pages(writer)
             if dropped_count > 0:
@@ -782,33 +786,27 @@ class OutputWriterStage:
         finally:
             writer.close()
 
-        error_stats = writer.get_error_stats()
-        logger.info(
-            f"[OutputWriter] Done, wrote {pages_written} pages, {errors_received} errors. "
-            f"Stats: {error_stats}"
-        )
+        logger.info(f"[OutputWriter] Done, wrote {pages_written} pages, {errors_received} errors")
 
-    def _fill_missing_pages(self, writer: "OutputWriter") -> int:
+    def _fill_missing_pages(self, writer: OutputWriter) -> int:
         """Create error records for any expected pages that were never received.
-        
+
         Returns:
             Number of missing pages that were filled.
         """
-        from .data_structures import ImageTask
-        
+
         missing = self.expected_filenames - self._received_filenames
         if not missing:
             return 0
-        
+
         # Log summary with sample of missing files
         missing_sorted = sorted(missing)
         sample = missing_sorted[:5]
         suffix = f" ... (+{len(missing_sorted) - 5} more)" if len(missing_sorted) > 5 else ""
         logger.warning(
-            f"[OutputWriter] {len(missing)} pages never received. "
-            f"Creating error records for: {sample}{suffix}"
+            f"[OutputWriter] {len(missing)} pages never received. Creating error records for: {sample}{suffix}"
         )
-        
+
         for filename in missing_sorted:
             # Create synthetic error for missing page
             synthetic_error = PipelineError(
@@ -816,8 +814,8 @@ class OutputWriterStage:
                 task=ImageTask(page_idx=-1, filename=filename),
                 source_etag=None,
                 error_type="DroppedByPipeline",
-                message=f"Page never received by output writer (lost in pipeline)",
+                message="Page never received by output writer (lost in pipeline)",
             )
             writer.write_error(synthetic_error)
-        
+
         return len(missing)

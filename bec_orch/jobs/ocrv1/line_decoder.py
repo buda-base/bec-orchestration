@@ -25,8 +25,7 @@ from .line import get_line_image
 
 if TYPE_CHECKING:
     from .config import OCRV1Config
-
-from .data_structures import ImageTask
+    from .data_structures import ImageTask
 
 logger = logging.getLogger(__name__)
 
@@ -39,7 +38,7 @@ logger = logging.getLogger(__name__)
 @dataclass
 class PrefetchedBytes:
     """Raw image bytes from S3 before LD metadata is attached.
-    
+
     This is produced by the prefetcher before the parquet file is loaded.
     """
 

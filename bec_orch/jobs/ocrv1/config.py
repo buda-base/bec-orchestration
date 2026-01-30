@@ -40,11 +40,35 @@ class OCRV1Config:
     """
 
     # -------------------------------------------------------------------------
-    # Model configuration (required, set from model_config.json)
+    # Required fields (no defaults - must come first)
     # -------------------------------------------------------------------------
-    input_width: int  # Model input width (e.g., 2048)
-    input_height: int  # Model input height (e.g., 64)
+    model: str  # Model name/subdirectory: "Woodblock", "Ume_Druma", etc. (REQUIRED)
+
+    # -------------------------------------------------------------------------
+    # Model configuration (set from model_config.json)
+    # -------------------------------------------------------------------------
     apply_log_softmax: bool = False  # Set to false for the new version of the model
+
+    # -------------------------------------------------------------------------
+    # Model Type Configuration (for different models like ume)
+    # -------------------------------------------------------------------------
+    model_variant: str | None = None  # Model variant for fine-tuning
+    confidence_threshold: float = 0.5  # Confidence threshold for filtering results
+    max_line_length: int = 1000  # Maximum line length to process
+
+    # -------------------------------------------------------------------------
+    # Advanced Processing Options
+    # -------------------------------------------------------------------------
+    enable_line_merge: bool = True  # Enable line segment merging
+    line_merge_threshold: float | None = None  # Threshold for line merging (None = auto)
+    enable_rotation_correction: bool = True  # Enable rotation correction
+    rotation_confidence_threshold: float = 0.7  # Confidence threshold for rotation
+
+    # -------------------------------------------------------------------------
+    # Performance Tuning
+    # -------------------------------------------------------------------------
+    enable_model_caching: bool = True  # Cache model in memory
+    cache_size_mb: int = 1024  # Model cache size in MB
 
     # -------------------------------------------------------------------------
     # Image processing
@@ -53,7 +77,6 @@ class OCRV1Config:
     max_image_height: int = 3000  # Maximum image height before scaling
     use_line_prepadding: bool = True  # Add h*h padding on left/right before resize
     merge_line_segments: bool = True  # Merge contours that belong to same line
-    line_merge_threshold: float | None = None  # Threshold for merging (None = auto)
 
     # -------------------------------------------------------------------------
     # Pipeline parallelism

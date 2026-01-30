@@ -439,7 +439,8 @@ class GPUInferenceStage:
             # Model crops time dimension BEFORE softmax/pruning to save computation
             loop = asyncio.get_event_loop()
             line_logits_list = await loop.run_in_executor(
-                None, lambda: self.ocr_model.predict(tensors, content_widths, left_pad_widths, self.cfg.input_width)
+                None,
+                lambda: self.ocr_model.predict(tensors, content_widths, left_pad_widths, self.ocr_model.input_width),
             )
 
             # Distribute results back to pages

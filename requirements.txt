@@ -47,3 +47,8 @@ pyctcdecode @ git+https://github.com/buda-base/pyctcdecode/@main
 pandas
 scipy  # needed for log_softmax in ctc_decoder
 pyewts
+click
+tabulate
+python-dotenv
+ec2-metadata
+rich

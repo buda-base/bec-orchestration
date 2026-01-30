@@ -248,7 +248,7 @@ class AsyncOCRPipeline:
         self.volume_prefix = volume_prefix
 
         # Create LineDecoder for image processing
-        self.line_decoder = LineDecoder(cfg)
+        self.line_decoder = LineDecoder(cfg, ocr_model)
 
         # Bounded queues for backpressure
         self.q_fetched: asyncio.Queue = asyncio.Queue(maxsize=64)

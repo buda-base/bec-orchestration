@@ -26,6 +26,7 @@ from .line import get_line_image
 if TYPE_CHECKING:
     from .config import OCRV1Config
     from .data_structures import ImageTask
+    from .model import OCRModel
 
 logger = logging.getLogger(__name__)
 
@@ -267,14 +268,16 @@ class LineDecoder:
     Thread-safe: all processing is stateless per call.
     """
 
-    def __init__(self, cfg: OCRV1Config) -> None:
+    def __init__(self, cfg: OCRV1Config, ocr_model: OCRModel) -> None:
         """
         Initialize LineDecoder.
 
         Args:
             cfg: OCRV1Config with all configuration options
+            ocr_model: OCRModel with model dimensions
         """
         self.cfg = cfg
+        self.ocr_model = ocr_model
 
     def process(self, fetched: FetchedBytes) -> ProcessedPage:
         """
@@ -404,7 +407,7 @@ class LineDecoder:
 
             if line_img is None:
                 # Create empty line entry
-                empty_tensor = np.zeros((1, self.cfg.input_height, self.cfg.input_width), dtype=np.float32)
+                empty_tensor = np.zeros((1, self.ocr_model.input_height, self.ocr_model.input_width), dtype=np.float32)
                 lines.append(
                     ProcessedLine(
                         tensor=empty_tensor,
@@ -501,8 +504,8 @@ class LineDecoder:
             image = image.squeeze(axis=-1)
 
         h, w = image.shape[:2]
-        target_h = self.cfg.input_height
-        target_w = self.cfg.input_width
+        target_h = self.ocr_model.input_height
+        target_w = self.ocr_model.input_width
 
         if self.cfg.use_line_prepadding:
             # Add square padding (h x h) on left and right before resizing

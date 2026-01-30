@@ -17,7 +17,6 @@ if TYPE_CHECKING:
     import numpy.typing as npt
 
     from .ctc_decoder import SyllableSegment
-    from .gpu_inference import InferredPage
     from .line import BBox
     from .output_writer import PageOCRResult
 

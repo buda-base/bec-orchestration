@@ -36,6 +36,8 @@ class OCRModel:
         input_layer: str,
         output_layer: str,
         *,
+        input_width: int,
+        input_height: int,
         squeeze_channel: bool,
         swap_hw: bool,
         apply_log_softmax: bool = True,
@@ -48,6 +50,8 @@ class OCRModel:
             model_file: Path to ONNX model file
             input_layer: Name of the input layer in the ONNX model
             output_layer: Name of the output layer in the ONNX model
+            input_width: Model input width
+            input_height: Model input height
             squeeze_channel: Whether to squeeze channel dimension
             swap_hw: Whether to swap height and width dimensions
             apply_log_softmax: If True, applies log_softmax after forward pass (on GPU or CPU).
@@ -57,6 +61,8 @@ class OCRModel:
             vocab_prune_threshold: Threshold for vocabulary pruning. Tokens with max log_prob
                                    below this threshold are pruned. None disables pruning.
         """
+        self._input_width = input_width
+        self._input_height = input_height
         self._input_layer = input_layer
         self._output_layer = output_layer
         self._squeeze_channel_dim = squeeze_channel
@@ -382,3 +388,13 @@ class OCRModel:
             pruned_list.append(pruned)
 
         return pruned_list, keep_indices_list
+
+    @property
+    def input_width(self) -> int:
+        """Get the model input width."""
+        return self._input_width
+
+    @property
+    def input_height(self) -> int:
+        """Get the model input height."""
+        return self._input_height

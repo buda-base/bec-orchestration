@@ -136,8 +136,10 @@ class OCRV1JobWorker:
 
         logger.info("OCR model loaded successfully")
 
-        # Create async worker with the loaded model and config
-        self.async_worker = OCRV1JobWorkerAsync(cfg)
+        # Create async worker with the loaded model and config (model stays loaded between volumes, same as ldv1)
+        self.async_worker = OCRV1JobWorkerAsync(
+            cfg, ocr_model=self.ocr_model, ctc_decoder=self.ctc_decoder
+        )
 
     def run(self, ctx: "JobContext") -> "TaskResult":
         """

@@ -11,7 +11,7 @@ import logging
 import os
 import time
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 import boto3
 import s3fs
@@ -39,83 +39,110 @@ class OCRV1JobWorkerAsync:
 
     Uses asyncio for S3 prefetching with backpressure, thread pools for
     CPU-bound image processing and CTC decoding.
+
+    When running from the base worker, ocr_model and ctc_decoder can be passed
+    in so the model is loaded once in the top-level worker and reused across
+    all volumes (same pattern as ldv1).
     """
 
-    def __init__(self, cfg: OCRV1Config) -> None:
+    def __init__(
+        self,
+        cfg: OCRV1Config,
+        *,
+        ocr_model: Optional[OCRModel] = None,
+        ctc_decoder: Optional[CTCDecoder] = None,
+    ) -> None:
         """Initialize the OCR worker.
 
         Args:
             cfg: OCRV1Config with all configuration options.
+            ocr_model: Optional pre-loaded OCR model (from top-level worker).
+                       If provided with ctc_decoder, model loading is skipped.
+            ctc_decoder: Optional pre-loaded CTC decoder. Must be passed with
+                         ocr_model when reusing a model across volumes.
         """
-        # Get base model directory from environment
-        base_model_dir = os.environ.get("BEC_OCR_MODEL_DIR")
-        if not base_model_dir:
-            raise ValueError("BEC_OCR_MODEL_DIR environment variable not set.")
-
-        base_model_dir = base_model_dir.strip("\"'")
-        base_model_dir_path = Path(base_model_dir)
-        if not base_model_dir_path.exists():
-            raise FileNotFoundError(f"OCR model directory not found: {base_model_dir}")
-
-        # Get model subdirectory from config
-        if cfg and hasattr(cfg, "model") and cfg.model:
-            model_subdir = cfg.model
-            model_dir = base_model_dir_path / model_subdir
-        else:
-            # Fallback to base directory (old behavior)
-            model_dir = base_model_dir_path
-
-        if not model_dir.exists():
-            raise FileNotFoundError(f"OCR model directory not found: {model_dir}")
-
-        config_path = model_dir / "model_config.json"
-        if not config_path.exists():
-            raise FileNotFoundError(f"model_config.json not found in {model_dir}")
-
-        logger.info(f"Loading OCR model config from: {config_path}")
-
-        with config_path.open(encoding="utf-8") as f:
-            model_config = json.load(f)
-
-        onnx_model_file = model_dir / model_config["onnx-model"]
-        if not onnx_model_file.exists():
-            raise FileNotFoundError(f"ONNX model file not found: {onnx_model_file}")
-
-        input_width = model_config["input_width"]
-        input_height = model_config["input_height"]
-        charset = model_config["charset"]
-        squeeze_channel = model_config["squeeze_channel_dim"] == "yes"
-        swap_hw = model_config["swap_hw"] == "yes"
-        add_blank = model_config["add_blank"] == "yes"
-
         self.cfg = cfg
 
-        logger.info(f"Loading OCR model: {onnx_model_file}")
-        logger.info(
-            f"  Architecture: {model_config.get('architecture', 'unknown')}, "
-            f"Version: {model_config.get('version', 'unknown')}"
-        )
-        logger.info(f"  Input: {input_width}x{input_height}, Charset length: {len(charset)}")
+        if ocr_model is not None and ctc_decoder is not None:
+            # Reuse model loaded by top-level worker (same pattern as ldv1)
+            self.ocr_model = ocr_model
+            self.ctc_decoder = ctc_decoder
+            logger.info("Using pre-loaded OCR model (reused across volumes)")
+        else:
+            # Load model here (e.g. when async worker is used standalone)
+            if ocr_model is not None or ctc_decoder is not None:
+                raise ValueError("Pass both ocr_model and ctc_decoder to reuse, or neither to load here")
 
-        self.ocr_model = OCRModel(
-            model_file=str(onnx_model_file),
-            input_layer=model_config["input_layer"],
-            output_layer=model_config["output_layer"],
-            input_width=input_width,
-            input_height=input_height,
-            squeeze_channel=squeeze_channel,
-            swap_hw=swap_hw,
-            apply_log_softmax=cfg.apply_log_softmax,
-            use_gpu_operations=True,
-            vocab_prune_threshold=cfg.vocab_prune_threshold,
-        )
+            # Get base model directory from environment
+            base_model_dir = os.environ.get("BEC_OCR_MODEL_DIR")
+            if not base_model_dir:
+                raise ValueError("BEC_OCR_MODEL_DIR environment variable not set.")
 
-        logger.info(
-            f"  Word delimiters: {len(cfg.word_delimiters)} chars "
-            f"({'Tibetan syllable' if cfg.word_delimiters == TIBETAN_WORD_DELIMITERS else 'space-only'})"
-        )
+            base_model_dir = base_model_dir.strip("\"'")
+            base_model_dir_path = Path(base_model_dir)
+            if not base_model_dir_path.exists():
+                raise FileNotFoundError(f"OCR model directory not found: {base_model_dir}")
 
-        self.ctc_decoder = CTCDecoder(charset=charset, add_blank=add_blank, word_delimiters=cfg.word_delimiters)
+            # Get model subdirectory from config
+            if cfg and hasattr(cfg, "model") and cfg.model:
+                model_subdir = cfg.model
+                model_dir = base_model_dir_path / model_subdir
+            else:
+                # Fallback to base directory (old behavior)
+                model_dir = base_model_dir_path
+
+            if not model_dir.exists():
+                raise FileNotFoundError(f"OCR model directory not found: {model_dir}")
+
+            config_path = model_dir / "model_config.json"
+            if not config_path.exists():
+                raise FileNotFoundError(f"model_config.json not found in {model_dir}")
+
+            logger.info(f"Loading OCR model config from: {config_path}")
+
+            with config_path.open(encoding="utf-8") as f:
+                model_config = json.load(f)
+
+            onnx_model_file = model_dir / model_config["onnx-model"]
+            if not onnx_model_file.exists():
+                raise FileNotFoundError(f"ONNX model file not found: {onnx_model_file}")
+
+            input_width = model_config["input_width"]
+            input_height = model_config["input_height"]
+            charset = model_config["charset"]
+            squeeze_channel = model_config["squeeze_channel_dim"] == "yes"
+            swap_hw = model_config["swap_hw"] == "yes"
+            add_blank = model_config["add_blank"] == "yes"
+
+            logger.info(f"Loading OCR model: {onnx_model_file}")
+            logger.info(
+                f"  Architecture: {model_config.get('architecture', 'unknown')}, "
+                f"Version: {model_config.get('version', 'unknown')}"
+            )
+            logger.info(f"  Input: {input_width}x{input_height}, Charset length: {len(charset)}")
+
+            self.ocr_model = OCRModel(
+                model_file=str(onnx_model_file),
+                input_layer=model_config["input_layer"],
+                output_layer=model_config["output_layer"],
+                input_width=input_width,
+                input_height=input_height,
+                squeeze_channel=squeeze_channel,
+                swap_hw=swap_hw,
+                apply_log_softmax=cfg.apply_log_softmax,
+                use_gpu_operations=True,
+                vocab_prune_threshold=cfg.vocab_prune_threshold,
+            )
+
+            self.ctc_decoder = CTCDecoder(
+                charset=charset, add_blank=add_blank, word_delimiters=cfg.word_delimiters
+            )
+
+            logger.info(
+                f"  Word delimiters: {len(cfg.word_delimiters)} chars "
+                f"({'Tibetan syllable' if cfg.word_delimiters == TIBETAN_WORD_DELIMITERS else 'space-only'})"
+            )
+            logger.info("OCR model loaded successfully")
 
         self.ld_bucket = os.environ.get("BEC_LD_BUCKET", "bec.bdrc.io")
         self.source_image_bucket = os.environ.get("BEC_SOURCE_IMAGE_BUCKET", "archive.tbrc.org")
@@ -126,8 +153,6 @@ class OCRV1JobWorkerAsync:
             retries={"max_attempts": 3, "mode": "adaptive"},
         )
         self._s3_client = boto3.client("s3", config=boto_config)
-
-        logger.info("OCR model loaded successfully")
 
     def run(self, ctx: "JobContext") -> "TaskResult":
         """Run OCR on a volume using async pipeline."""

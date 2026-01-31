@@ -1,44 +1,25 @@
 """
-Dual output writer for OCR results - Parquet for bulk queries + JSONL.gz for detailed data.
+Parquet output writer for OCR results.
 
-Writes OCR results in two formats:
-1. Parquet: Compact page-level data for bulk text queries (streaming)
-2. JSONL.gz: Full structured data with lines/segments/syllables (written once at end)
+Writes OCR results in Parquet format for bulk text queries with streaming writes.
 """
 
-import gzip
-import json
 import logging
 from collections import defaultdict
-from typing import Any, Union
+from typing import Union
 
-import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 import s3fs
 
 from .data_structures import PageOCRResult, PageResult, PipelineError
 
-
-def _convert_numpy_types(obj: Any) -> Any:
-    """Convert numpy types to native Python types for JSON serialization."""
-    if isinstance(obj, (np.integer, np.floating)):
-        return obj.item()
-    if isinstance(obj, np.ndarray):
-        return obj.tolist()
-    if isinstance(obj, dict):
-        return {k: _convert_numpy_types(v) for k, v in obj.items()}
-    if isinstance(obj, list):
-        return [_convert_numpy_types(item) for item in obj]
-    return obj
-
-
 logger = logging.getLogger(__name__)
 
 
 def ocr_build_schema() -> pa.Schema:
     """Build the schema for OCR output parquet files.
-    
+
     Schema design follows ldv1 conventions:
     - tps_points: list<list<float32>> for TPS transformation points
     - line_bboxes: list<struct<x:int16, y:int16, w:int16, h:int16>> for bounding boxes
@@ -48,19 +29,21 @@ def ocr_build_schema() -> pa.Schema:
     """
     # TPS points: list of [input_points, output_points] where each is list of [x, y] pairs
     tps_points_type = pa.list_(pa.list_(pa.float32()))
-    
+
     # Bounding box struct (x, y, w, h) - use int16 like ldv1 for efficiency
-    bbox_struct = pa.struct([
-        ("x", pa.int16()),
-        ("y", pa.int16()),
-        ("w", pa.int16()),
-        ("h", pa.int16()),
-    ])
+    bbox_struct = pa.struct(
+        [
+            ("x", pa.int16()),
+            ("y", pa.int16()),
+            ("w", pa.int16()),
+            ("h", pa.int16()),
+        ]
+    )
     line_bboxes_type = pa.list_(bbox_struct)
-    
+
     # Line texts as list of strings (native parquet array, more efficient than JSON in binary)
     line_texts_type = pa.list_(pa.string())
-    
+
     return pa.schema(
         [
             pa.field("img_file_name", pa.string()),
@@ -73,8 +56,8 @@ def ocr_build_schema() -> pa.Schema:
             pa.field("nb_lines", pa.int32()),
             # Error fields (like ldv1)
             pa.field("ok", pa.bool_()),
-            pa.field("error_stage", pa.string()),    # null when ok=True
-            pa.field("error_type", pa.string()),     # null when ok=True
+            pa.field("error_stage", pa.string()),  # null when ok=True
+            pa.field("error_type", pa.string()),  # null when ok=True
             pa.field("error_message", pa.string()),  # null when ok=True
         ]
     )
@@ -102,7 +85,7 @@ class ParquetWriter:
 
     def write_page(self, result: PageOCRResult) -> None:
         """Write a single OCR result page to parquet.
-        
+
         Writes line-level data in native parquet types following ldv1 conventions.
         """
         if result.error:
@@ -110,19 +93,19 @@ class ParquetWriter:
             error_stage = ""
             error_type = ""
             error_message = result.error
-            
+
             # Try to parse structured error format: "[Stage] Type: Message"
             if result.error.startswith("[") and "]" in result.error:
                 bracket_end = result.error.index("]")
                 error_stage = result.error[1:bracket_end]
-                remainder = result.error[bracket_end + 1:].strip()
+                remainder = result.error[bracket_end + 1 :].strip()
                 if ":" in remainder:
                     error_type, error_message = remainder.split(":", 1)
                     error_type = error_type.strip()
                     error_message = error_message.strip()
                 else:
                     error_message = remainder
-            
+
             record = {
                 "img_file_name": result.img_file_name,
                 "source_etag": result.source_etag,
@@ -147,7 +130,7 @@ class ParquetWriter:
                 # Convert to list of lists of floats
                 tps_points_list = [input_pts, output_pts]
                 tps_alpha = float(alpha) if alpha is not None else None
-            
+
             # Build line bboxes as list of dicts matching the struct schema
             line_bboxes = [
                 {
@@ -158,10 +141,10 @@ class ParquetWriter:
                 }
                 for line in result.lines
             ]
-            
+
             # Build line texts as simple list of strings
             line_texts = [line.text for line in result.lines]
-            
+
             record = {
                 "img_file_name": result.img_file_name,
                 "source_etag": result.source_etag,
@@ -236,22 +219,15 @@ class ParquetWriter:
 
 class OutputWriter:
     """
-    Coordinates writing to both output formats (Parquet + JSONL.gz).
+    Coordinates writing to Parquet output format.
 
     Parquet is written in streaming batches.
-    JSONL.gz is collected in memory and written once at close().
     PipelineErrors are tracked and reported.
     """
 
-    def __init__(self, parquet_uri: str, jsonl_uri: str | None = None) -> None:
+    def __init__(self, parquet_uri: str) -> None:
         self.parquet_uri = parquet_uri
-        self.jsonl_uri = jsonl_uri
-
         self.parquet_writer = ParquetWriter(self.parquet_uri)
-        self._s3 = s3fs.S3FileSystem() if jsonl_uri else None
-
-        # Collect JSONL records in memory, write at end (only if enabled)
-        self._jsonl_records: list[dict] = [] if jsonl_uri else []
 
         # Error tracking
         self._errors: list[PipelineError] = []
@@ -259,28 +235,22 @@ class OutputWriter:
         self._success_count = 0
 
     def write_page(self, result: Union[PageOCRResult, "PageResult"]) -> None:
-        """Write page to both output formats."""
+        """Write page to Parquet format."""
         # Convert legacy PageResult to PageOCRResult if needed
-        if not hasattr(result, "img_file_name"):
-            if isinstance(result, PageResult):
-                result = PageOCRResult(
-                    img_file_name=result.filename,
-                    source_etag=result.source_etag,
-                    rotation_angle=0.0,
-                    tps_points=None,
-                    lines=[],
-                    error=result.error,
-                )
-            else:
-                raise TypeError(f"Expected PageResult or PageOCRResult, got {type(result)}")
+        if isinstance(result, PageResult):
+            ocr_result = PageOCRResult(
+                img_file_name=result.filename,
+                source_etag=result.source_etag,
+                rotation_angle=0.0,
+                tps_points=None,
+                lines=[],
+                error=result.error,
+            )
+        else:
+            ocr_result = result
 
         # Write to Parquet (streaming)
-        self.parquet_writer.write_page(result)
-
-        # Collect JSONL record (write at end) - only if jsonl_uri is set
-        if self.jsonl_uri:
-            self._jsonl_records.append(self._build_jsonl_record(result))
-
+        self.parquet_writer.write_page(ocr_result)
         self._success_count += 1
 
     def write_error(self, error: PipelineError) -> None:
@@ -291,94 +261,15 @@ class OutputWriter:
         # Write error to Parquet (streaming)
         self.parquet_writer.write_error(error)
 
-        # Collect error record for JSONL (only if enabled)
-        if self.jsonl_uri:
-            self._jsonl_records.append({
-                "img_file_name": error.filename,
-                "source_etag": error.source_etag,
-                "error": f"[{error.stage}] {error.error_type}: {error.message}",
-                "lines": [],
-            })
-
-    def _build_jsonl_record(self, result: PageOCRResult) -> dict:
-        """Build a JSONL record from PageOCRResult."""
-        if result.error:
-            return {
-                "img_file_name": result.img_file_name,
-                "source_etag": result.source_etag,
-                "rotation_angle": result.rotation_angle,
-                "tps_points": result.tps_points,
-                "error": result.error,
-                "lines": [],
-            }
-
-        return {
-            "img_file_name": result.img_file_name,
-            "source_etag": result.source_etag,
-            "rotation_angle": result.rotation_angle,
-            "tps_points": result.tps_points,
-            "lines": [
-                {
-                    "line_idx": line.line_idx,
-                    "bbox": line.bbox.as_list(),
-                    "text": line.text,
-                    "confidence": line.confidence,
-                    "syllables": [
-                        {
-                            "px": [s.start_pixel, s.end_pixel],
-                            "t": s.text,
-                            "c": s.confidence,
-                        }
-                        for s in line.syllables
-                    ],
-                }
-                for line in result.lines
-            ],
-        }
-
-    def _write_jsonl(self) -> None:
-        """Write all collected JSONL records to S3."""
-        if not self.jsonl_uri:
-            return  # JSONL output is disabled
-        
-        if not self._jsonl_records:
-            logger.info(f"No records to write to {self.jsonl_uri}")
-            return
-
-        s3_path = self.jsonl_uri.replace("s3://", "")
-        if self._s3 is None:
-            logger.warning("S3 filesystem not initialized for JSONL writing")
-            return
-            
-        with self._s3.open(s3_path, "wb") as f:
-            with gzip.GzipFile(fileobj=f, mode="wb") as gz:
-                for record in self._jsonl_records:
-                    json_line = json.dumps(_convert_numpy_types(record), ensure_ascii=False) + "\n"
-                    gz.write(json_line.encode("utf-8"))
-
-        logger.info(f"Wrote {len(self._jsonl_records)} records to {self.jsonl_uri}")
-
-    def get_error_stats(self) -> dict:
-        """Get error statistics."""
-        return {
-            "success_count": self._success_count,
-            "error_count": len(self._errors),
-            "errors_by_stage": dict(self._error_count_by_stage),
-        }
-
     def close(self) -> None:
-        """Close Parquet writer and write JSONL."""
-        # Close Parquet (flushes remaining records)
+        """Close the Parquet writer and log summary."""
         self.parquet_writer.close()
-
-        # Write all JSONL records at once
-        self._write_jsonl()
 
         # Log summary
         if self._errors:
-            logger.warning(
-                f"Pipeline completed with {len(self._errors)} errors: {dict(self._error_count_by_stage)}"
-            )
+            logger.warning(f"Pipeline completed with {len(self._errors)} errors: {dict(self._error_count_by_stage)}")
+        else:
+            logger.info(f"Pipeline completed successfully with {self._success_count} pages processed")
 
 
 # Legacy compatibility - keep old class name

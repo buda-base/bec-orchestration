@@ -2,13 +2,15 @@
 Test script for async OCRV1JobWorker.
 
 Usage:
-    BEC_OCR_MODEL_DIR=ocr_models/Woodblock python test_ocrv1_async.py
+    BEC_OCR_MODEL_DIR=ocr_models python test_ocrv1_async.py --model Woodblock
 
 To generate a reference parquet with max accuracy settings:
-    BEC_OCR_MODEL_DIR=ocr_models/Woodblock python test_ocrv1_async.py --reference
+    BEC_OCR_MODEL_DIR=ocr_models python test_ocrv1_async.py --model Woodblock --reference
 
 To limit number of pages:
-    BEC_OCR_MODEL_DIR=ocr_models/Woodblock python test_ocrv1_async.py --max-pages 50
+    BEC_OCR_MODEL_DIR=ocr_models python test_ocrv1_async.py --model Woodblock --max-pages 50
+
+Available models: Woodblock, Ume_Druma, Ume_Petsuk, Modern
 """
 
 import argparse
@@ -25,11 +27,16 @@ from pathlib import Path
 import pandas as pd
 import s3fs
 
+# Load environment variables from .env file (like the CLI does)
+from dotenv import load_dotenv
+
 from bec_orch.core.models import ArtifactLocation, VolumeManifest, VolumeRef
 from bec_orch.jobs.base import JobContext
 from bec_orch.jobs.ocrv1.config import OCRV1Config
-from bec_orch.jobs.ocrv1.debug_visualizer import create_debug_visualizations
+from bec_orch.jobs.ocrv1.debug_visualizer import create_debug_visualizations, create_debug_visualizations_from_parquet
 from bec_orch.jobs.ocrv1.worker_async import OCRV1JobWorkerAsync
+
+load_dotenv()
 
 logging.basicConfig(
     level=logging.INFO,
@@ -69,7 +76,7 @@ def extract_lines_from_parquet(parquet_path: str) -> list[str]:
         elif hasattr(row, "texts"):
             # Legacy format (backwards compatibility)
             texts = row.texts if row.texts else []
-            
+
             # Convert to list if needed
             if isinstance(texts, list):
                 pass  # Already a list
@@ -274,6 +281,12 @@ def main() -> None:
         default=50,
         help="Maximum number of pages to process (default: 50)",
     )
+    parser.add_argument(
+        "--model",
+        type=str,
+        required=True,
+        help="Model to use (e.g., Woodblock, Ume_Druma, Ume_Petsuk, Modern)",
+    )
     args = parser.parse_args()
 
     # Reference mode settings (will be applied to worker after initialization)
@@ -335,15 +348,14 @@ def main() -> None:
 
     # Build config
     cfg = OCRV1Config(
-        input_width=0,  # Will be set from model
-        input_height=0,  # Will be set from model
+        model=args.model,  # Required model from command line
         # CTC decoder settings
         beam_width=reference_beam_width if reference_beam_width else 64,
         token_min_logp=reference_token_min_logp if reference_token_min_logp else -3.0,
         use_greedy_decode=False,
         use_hybrid_decode=not args.reference,  # Disable hybrid for reference mode
         greedy_confidence_threshold=-0.2,  # Higher = more selective
-        use_sequential_pipeline=False,  # Use parallel pipeline (default)
+        use_sequential_pipeline=True,  # Use parallel pipeline (default)
         kenlm_path=str(Path(os.environ.get("BEC_OCR_MODEL_DIR", "ocr_models")) / "tibetan_5gram.binary"),
     )
 
@@ -383,7 +395,7 @@ def main() -> None:
         else:
             # Compare with reference (exits if reference doesn't exist)
             compare_with_reference(temp_parquet)
-        
+
         # Create debug visualizations if requested
         if args.debug:
             logger.info("=== Creating debug visualizations ===")
@@ -391,7 +403,7 @@ def main() -> None:
             try:
                 # Check if JSONL output exists (may be disabled in config)
                 jsonl_exists = s3.exists(current_jsonl_s3)
-                
+
                 if jsonl_exists:
                     logger.info("Using JSONL for detailed syllable-level visualizations")
                     create_debug_visualizations(
@@ -405,7 +417,7 @@ def main() -> None:
                 else:
                     logger.info("JSONL output not found (may be disabled in config)")
                     logger.info("Using parquet for page-level visualizations only")
-                    from bec_orch.jobs.ocrv1.debug_visualizer import create_debug_visualizations_from_parquet
+
                     create_debug_visualizations_from_parquet(
                         parquet_uri=f"s3://{current_parquet_s3}",
                         jsonl_uri=None,
@@ -416,11 +428,11 @@ def main() -> None:
                         max_images=10,
                     )
                 logger.info(f"Debug visualizations saved to {debug_output_dir}/")
-            except Exception as e:
-                logger.error(f"Failed to create debug visualizations: {e}", exc_info=True)
-    
-    except Exception as e:
-        logger.warning(f"Could not process output parquet: {e}")
+            except Exception:
+                logger.exception("Failed to create debug visualizations")
+
+    except Exception:
+        logger.exception("Could not process output parquet")
     finally:
         if Path(temp_parquet).exists():
             Path(temp_parquet).unlink()

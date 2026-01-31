@@ -41,23 +41,34 @@ class OCRV1JobWorkerAsync:
     CPU-bound image processing and CTC decoding.
     """
 
-    def __init__(self, cfg: OCRV1Config | None = None) -> None:
+    def __init__(self, cfg: OCRV1Config) -> None:
         """Initialize the OCR worker.
 
         Args:
             cfg: OCRV1Config with all configuration options.
-                 If None, a default config is created from model dimensions.
         """
-        model_dir = os.environ.get("BEC_OCR_MODEL_DIR")
-        if not model_dir:
+        # Get base model directory from environment
+        base_model_dir = os.environ.get("BEC_OCR_MODEL_DIR")
+        if not base_model_dir:
             raise ValueError("BEC_OCR_MODEL_DIR environment variable not set.")
 
-        model_dir = model_dir.strip("\"'")
-        model_dir_path = Path(model_dir)
-        if not model_dir_path.exists():
+        base_model_dir = base_model_dir.strip("\"'")
+        base_model_dir_path = Path(base_model_dir)
+        if not base_model_dir_path.exists():
+            raise FileNotFoundError(f"OCR model directory not found: {base_model_dir}")
+
+        # Get model subdirectory from config
+        if cfg and hasattr(cfg, "model") and cfg.model:
+            model_subdir = cfg.model
+            model_dir = base_model_dir_path / model_subdir
+        else:
+            # Fallback to base directory (old behavior)
+            model_dir = base_model_dir_path
+
+        if not model_dir.exists():
             raise FileNotFoundError(f"OCR model directory not found: {model_dir}")
 
-        config_path = model_dir_path / "model_config.json"
+        config_path = model_dir / "model_config.json"
         if not config_path.exists():
             raise FileNotFoundError(f"model_config.json not found in {model_dir}")
 
@@ -66,7 +77,7 @@ class OCRV1JobWorkerAsync:
         with config_path.open(encoding="utf-8") as f:
             model_config = json.load(f)
 
-        onnx_model_file = model_dir_path / model_config["onnx-model"]
+        onnx_model_file = model_dir / model_config["onnx-model"]
         if not onnx_model_file.exists():
             raise FileNotFoundError(f"ONNX model file not found: {onnx_model_file}")
 
@@ -76,14 +87,6 @@ class OCRV1JobWorkerAsync:
         squeeze_channel = model_config["squeeze_channel_dim"] == "yes"
         swap_hw = model_config["swap_hw"] == "yes"
         add_blank = model_config["add_blank"] == "yes"
-
-        # Create config if not provided
-        if cfg is None:
-            cfg = OCRV1Config(input_width=input_width, input_height=input_height)
-        else:
-            # Update config with model dimensions
-            cfg.input_width = input_width
-            cfg.input_height = input_height
 
         self.cfg = cfg
 
@@ -98,9 +101,12 @@ class OCRV1JobWorkerAsync:
             model_file=str(onnx_model_file),
             input_layer=model_config["input_layer"],
             output_layer=model_config["output_layer"],
+            input_width=input_width,
+            input_height=input_height,
             squeeze_channel=squeeze_channel,
             swap_hw=swap_hw,
             apply_log_softmax=cfg.apply_log_softmax,
+            use_gpu_operations=True,
             vocab_prune_threshold=cfg.vocab_prune_threshold,
         )
 
@@ -145,7 +151,6 @@ class OCRV1JobWorkerAsync:
         # Get URIs (parquet will be loaded async by pipeline)
         ld_parquet_uri = self._get_ld_parquet_uri(ctx)
         output_parquet_uri = self._get_output_parquet_uri(ctx)
-        output_jsonl_uri = self._get_output_jsonl_uri(ctx) if self.cfg.enable_jsonl_output else None
 
         # Get manifest filenames
         manifest_filenames: set[str] = {
@@ -156,10 +161,7 @@ class OCRV1JobWorkerAsync:
         sorted_filenames = sorted(manifest_filenames)
 
         # Build ImageTask list (parquet loaded async by pipeline)
-        tasks = [
-            ImageTask(page_idx=page_idx, filename=filename)
-            for page_idx, filename in enumerate(sorted_filenames)
-        ]
+        tasks = [ImageTask(page_idx=page_idx, filename=filename) for page_idx, filename in enumerate(sorted_filenames)]
 
         logger.info(f"Starting pipeline for {total_images} images, parquet: {ld_parquet_uri}")
 
@@ -179,10 +181,10 @@ class OCRV1JobWorkerAsync:
         try:
             if self.cfg.use_sequential_pipeline:
                 logger.info(f"Using SEQUENTIAL pipeline mode for {total_images} images")
-                stats = await pipeline.run_sequential(tasks, ld_parquet_uri, output_parquet_uri, output_jsonl_uri)
+                stats = await pipeline.run_sequential(tasks, ld_parquet_uri, output_parquet_uri)
             else:
                 logger.info(f"Using PARALLEL pipeline mode for {total_images} images")
-                stats = await pipeline.run(tasks, ld_parquet_uri, output_parquet_uri, output_jsonl_uri)
+                stats = await pipeline.run(tasks, ld_parquet_uri, output_parquet_uri)
         finally:
             await pipeline.close()
 
@@ -216,9 +218,6 @@ class OCRV1JobWorkerAsync:
 
     def _get_output_parquet_uri(self, ctx: "JobContext") -> str:
         return f"s3://{ctx.artifacts_location.bucket}/{ctx.artifacts_location.prefix}/{ctx.artifacts_location.basename}_ocrv1.parquet"
-    
-    def _get_output_jsonl_uri(self, ctx: "JobContext") -> str:
-        return f"s3://{ctx.artifacts_location.bucket}/{ctx.artifacts_location.prefix}/{ctx.artifacts_location.basename}_ocrv1.jsonl.gz"
 
     def _get_volume_prefix(self, ctx: "JobContext") -> str:
         w_prefix = hashlib.md5(ctx.volume.w_id.encode()).hexdigest()[:2]  # noqa: S324

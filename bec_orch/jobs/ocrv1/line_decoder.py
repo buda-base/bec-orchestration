@@ -467,7 +467,14 @@ class LineDecoder:
         if not contour_points:
             return None, k_factor, (0, 0, 0, 0)
 
-        pts = np.array([[p["x"], p["y"]] for p in contour_points], dtype=np.int32)
+        try:
+            pts = np.array([[int(p["x"]), int(p["y"])] for p in contour_points], dtype=np.int32)
+        except (KeyError, TypeError, ValueError):
+            logger.exception("[LineDecoder] Expected contour point dict with 'x','y'")
+            return None, k_factor, (0, 0, 0, 0)
+
+        if len(pts) == 0:
+            return None, k_factor, (0, 0, 0, 0)
         x, y, w, h = cv2.boundingRect(pts)
         if h <= 0:
             return None, k_factor, (0, 0, 0, 0)

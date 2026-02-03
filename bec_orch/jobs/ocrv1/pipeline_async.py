@@ -29,6 +29,7 @@ from .data_structures import (
     LineResult,
     PageOCRResult,
     PageResult,
+    PipelineError,
 )
 from .line import BBox
 
@@ -541,7 +542,7 @@ class AsyncOCRPipeline:
         logger.info(f"[AsyncOCRPipeline] Starting SEQUENTIAL pipeline for {total_pages} pages")
 
         # Phase 1: Collect all inferred pages in memory
-        all_inferred: list[InferredPage] = []
+        all_inferred: list[InferredPage | PipelineError] = []
 
         async def collect_inferred() -> None:
             """Collect all inferred pages instead of passing to CTC decoder."""
@@ -596,9 +597,18 @@ class AsyncOCRPipeline:
             # Each entry: (page_idx, line_idx, cropped_logits, inferred, keep_indices)
             all_decode_tasks: list[tuple[int, int, npt.NDArray, InferredPage, npt.NDArray | None]] = []
 
-            for inferred in all_inferred:
+            for item in all_inferred:
+                # Handle PipelineError objects - just pass them through
+                if isinstance(item, PipelineError):
+                    await self.q_results.put(item)
+                    self.stats["errors"] += 1
+                    continue
+
+                # Handle InferredPage objects
+                inferred = item
                 if inferred.error or not inferred.logits_list:
-                    await self.q_results.put(self._create_error_page(inferred, None))
+                    await self.q_results.put(self._create_error_page_ocr(inferred, None))
+                    self.stats["errors"] += 1
                     continue
 
                 for line_idx, line_logits in enumerate(inferred.logits_list):

@@ -232,7 +232,7 @@ class PrefetcherStage:
         async def fetch_one(task: ImageTask) -> None:
             async with self._s3_sem:
                 try:
-                    key = f"{self.volume_prefix}/{task.filename}"
+                    key = f"{self.volume_prefix.rstrip('/')}/{task.filename}"
                     loop = asyncio.get_event_loop()
 
                     def _fetch() -> tuple[str, bytes]:
@@ -254,14 +254,15 @@ class PrefetcherStage:
                         logger.debug(f"[Prefetcher] Fetched {self.stats['fetched']} pages")
 
                 except Exception as e:
-                    logger.warning(f"[Prefetcher] Failed to fetch {task.filename}: {e}")
+                    key = f"{self.volume_prefix.rstrip('/')}/{task.filename}"
+                    logger.warning(f"[Prefetcher] Failed to fetch {task.filename} (s3://{self.source_image_bucket}/{key}): {e}")
                     await self.q_out.put(
                         PipelineError(
                             stage="Prefetcher",
                             task=task,
                             source_etag=None,
                             error_type=type(e).__name__,
-                            message=str(e),
+                            message=f"Failed to fetch s3://{self.source_image_bucket}/{key}: {e}",
                         )
                     )
                     self.stats["errors"] += 1

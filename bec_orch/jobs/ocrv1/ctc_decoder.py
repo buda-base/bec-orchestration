@@ -302,7 +302,7 @@ def _decode_logits_beam_search_internal(
     result = decoder.decode(log_probs, beam_width=beam_width, token_min_logp=token_min_logp, logits_are_log_probs=True)
     t2 = time.perf_counter()
 
-    logger.info(
+    logger.debug(
         f"[CTC timing] shape={orig_shape}, vocab={len(vocab)}, "
         f"build_decoder={1000 * (t1 - t0):.1f}ms, decode={1000 * (t2 - t1):.1f}ms"
     )
@@ -342,7 +342,7 @@ def decode_logits_beam_search(
 
     if not logits_are_log_probs:
         t_softmax = time.perf_counter()
-        logger.info(f"[CTC timing] softmax={1000 * (t_softmax - t0):.1f}ms for shape {logits.shape}")
+        logger.debug(f"[CTC timing] softmax={1000 * (t_softmax - t0):.1f}ms for shape {logits.shape}")
 
     return _decode_logits_beam_search_internal(log_probs, vocab, beam_width, token_min_logp)
 

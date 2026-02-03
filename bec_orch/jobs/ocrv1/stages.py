@@ -170,7 +170,7 @@ class ParquetLoaderStage:
                 size_str = f"{file_size_bytes} bytes"
 
             speed_mbps = (file_size_bytes / (1024 * 1024)) / download_time if download_time > 0 else 0
-            logger.info(
+            logger.debug(
                 f"[ParquetLoader] Downloaded {len(all_rows)} rows ({size_str}) in {download_time:.2f}s ({speed_mbps:.1f} MB/s), processing..."
             )
 
@@ -189,7 +189,7 @@ class ParquetLoaderStage:
                 await asyncio.sleep(0)
 
             elapsed = time.perf_counter() - start_time
-            logger.info(f"[ParquetLoader] Loaded {len(self.parquet_data)} rows in {elapsed:.2f}s")
+            logger.debug(f"[ParquetLoader] Loaded {len(self.parquet_data)} rows in {elapsed:.2f}s")
 
         except Exception as e:
             elapsed = time.perf_counter() - start_time
@@ -251,7 +251,7 @@ class PrefetcherStage:
                     self.stats["fetched"] += 1
 
                     if self.stats["fetched"] % 20 == 0:
-                        logger.info(f"[Prefetcher] Fetched {self.stats['fetched']} pages")
+                        logger.debug(f"[Prefetcher] Fetched {self.stats['fetched']} pages")
 
                 except Exception as e:
                     logger.warning(f"[Prefetcher] Failed to fetch {task.filename}: {e}")
@@ -451,7 +451,7 @@ class GPUInferenceStage:
             pending_tensors.clear()
 
             batch_ms = (time.perf_counter() - start_time) * 1000
-            logger.info(
+            logger.debug(
                 f"[GPUInference] Batch {batch_size} lines in {batch_ms:.0f}ms "
                 f"({batch_ms / batch_size:.0f}ms/line). {pages_emitted} pages emitted"
             )
@@ -481,7 +481,7 @@ class GPUInferenceStage:
         while True:
             msg = await self.q_in.get()
             if isinstance(msg, EndOfStream):
-                logger.info(f"[GPUInference] Received EOS, flushing {len(pending_tensors)} pending tensors")
+                logger.debug(f"[GPUInference] Received EOS, flushing {len(pending_tensors)} pending tensors")
                 await flush_batch()
                 await try_emit_completed_pages()
 
@@ -512,7 +512,7 @@ class GPUInferenceStage:
             pages_received += 1
 
             if pages_received % 20 == 0:
-                logger.info(
+                logger.debug(
                     f"[GPUInference] Received {pages_received} pages, "
                     f"{len(pending_tensors)} tensors pending, {len(pages_in_flight)} in flight"
                 )
@@ -665,7 +665,7 @@ class CTCDecoderStage:
             pages_received += 1
 
             if pages_received % 20 == 0:
-                logger.info(f"[CTCDecoder] Received {pages_received} pages")
+                logger.debug(f"[CTCDecoder] Received {pages_received} pages")
 
             task = asyncio.create_task(decode_one(inferred))
             pending_tasks.add(task)
@@ -776,7 +776,7 @@ class OutputWriterStage:
                 pages_written += 1
 
                 if pages_written % 100 == 0:
-                    logger.info(f"[OutputWriter] Progress: {pages_written}/{self.total_pages}")
+                    logger.debug(f"[OutputWriter] Progress: {pages_written}/{self.total_pages}")
 
             # Fill missing pages with errors before closing
             dropped_count = self._fill_missing_pages(writer)

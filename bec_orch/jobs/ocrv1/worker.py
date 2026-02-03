@@ -97,12 +97,12 @@ class OCRV1JobWorker:
         swap_hw = model_config["swap_hw"] == "yes"
         add_blank = model_config["add_blank"] == "yes"
 
-        logger.info(f"Loading OCR model: {onnx_model_file}")
-        logger.info(
+        logger.debug(f"Loading OCR model: {onnx_model_file}")
+        logger.debug(
             f"  Architecture: {model_config.get('architecture', 'unknown')}, "
             f"Version: {model_config.get('version', 'unknown')}"
         )
-        logger.info(f"  Input: {input_width}x{input_height}, Charset length: {len(charset)}")
+        logger.debug(f"  Input: {input_width}x{input_height}, Charset length: {len(charset)}")
 
         # Load OCR model
         self.ocr_model = OCRModel(
@@ -118,7 +118,7 @@ class OCRV1JobWorker:
             vocab_prune_threshold=cfg.vocab_prune_threshold,
         )
 
-        logger.info(
+        logger.debug(
             f"  Word delimiters: {len(cfg.word_delimiters)} chars "
             f"({'Tibetan syllable' if cfg.word_delimiters == TIBETAN_WORD_DELIMITERS else 'space-only'})"
         )
@@ -134,12 +134,10 @@ class OCRV1JobWorker:
         )
         self._s3_client = boto3.client("s3", config=boto_config)
 
-        logger.info("OCR model loaded successfully")
+        logger.debug("OCR model loaded successfully")
 
         # Create async worker with the loaded model and config (model stays loaded between volumes, same as ldv1)
-        self.async_worker = OCRV1JobWorkerAsync(
-            cfg, ocr_model=self.ocr_model, ctc_decoder=self.ctc_decoder
-        )
+        self.async_worker = OCRV1JobWorkerAsync(cfg, ocr_model=self.ocr_model, ctc_decoder=self.ctc_decoder)
 
     def run(self, ctx: "JobContext") -> "TaskResult":
         """

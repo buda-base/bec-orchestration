@@ -11,7 +11,7 @@ import logging
 import os
 import time
 from pathlib import Path
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING
 
 import boto3
 import s3fs
@@ -49,8 +49,8 @@ class OCRV1JobWorkerAsync:
         self,
         cfg: OCRV1Config,
         *,
-        ocr_model: Optional[OCRModel] = None,
-        ctc_decoder: Optional[CTCDecoder] = None,
+        ocr_model: OCRModel | None = None,
+        ctc_decoder: CTCDecoder | None = None,
     ) -> None:
         """Initialize the OCR worker.
 
@@ -67,7 +67,7 @@ class OCRV1JobWorkerAsync:
             # Reuse model loaded by top-level worker (same pattern as ldv1)
             self.ocr_model = ocr_model
             self.ctc_decoder = ctc_decoder
-            logger.info("Using pre-loaded OCR model (reused across volumes)")
+            logger.debug("Using pre-loaded OCR model (reused across volumes)")
         else:
             # Load model here (e.g. when async worker is used standalone)
             if ocr_model is not None or ctc_decoder is not None:
@@ -98,7 +98,7 @@ class OCRV1JobWorkerAsync:
             if not config_path.exists():
                 raise FileNotFoundError(f"model_config.json not found in {model_dir}")
 
-            logger.info(f"Loading OCR model config from: {config_path}")
+            logger.debug(f"Loading OCR model config from: {config_path}")
 
             with config_path.open(encoding="utf-8") as f:
                 model_config = json.load(f)
@@ -114,12 +114,12 @@ class OCRV1JobWorkerAsync:
             swap_hw = model_config["swap_hw"] == "yes"
             add_blank = model_config["add_blank"] == "yes"
 
-            logger.info(f"Loading OCR model: {onnx_model_file}")
-            logger.info(
+            logger.debug(f"Loading OCR model: {onnx_model_file}")
+            logger.debug(
                 f"  Architecture: {model_config.get('architecture', 'unknown')}, "
                 f"Version: {model_config.get('version', 'unknown')}"
             )
-            logger.info(f"  Input: {input_width}x{input_height}, Charset length: {len(charset)}")
+            logger.debug(f"  Input: {input_width}x{input_height}, Charset length: {len(charset)}")
 
             self.ocr_model = OCRModel(
                 model_file=str(onnx_model_file),
@@ -134,11 +134,9 @@ class OCRV1JobWorkerAsync:
                 vocab_prune_threshold=cfg.vocab_prune_threshold,
             )
 
-            self.ctc_decoder = CTCDecoder(
-                charset=charset, add_blank=add_blank, word_delimiters=cfg.word_delimiters
-            )
+            self.ctc_decoder = CTCDecoder(charset=charset, add_blank=add_blank, word_delimiters=cfg.word_delimiters)
 
-            logger.info(
+            logger.debug(
                 f"  Word delimiters: {len(cfg.word_delimiters)} chars "
                 f"({'Tibetan syllable' if cfg.word_delimiters == TIBETAN_WORD_DELIMITERS else 'space-only'})"
             )
@@ -171,7 +169,7 @@ class OCRV1JobWorkerAsync:
                 f"Line detection not completed for volume {ctx.volume.w_id}/{ctx.volume.i_id}. "
                 f"Expected success marker at: {ld_success_uri}"
             )
-        logger.info(f"LD success marker found: {ld_success_uri}")
+        logger.debug(f"LD success marker found: {ld_success_uri}")
 
         # Get URIs (parquet will be loaded async by pipeline)
         ld_parquet_uri = self._get_ld_parquet_uri(ctx)
@@ -188,7 +186,7 @@ class OCRV1JobWorkerAsync:
         # Build ImageTask list (parquet loaded async by pipeline)
         tasks = [ImageTask(page_idx=page_idx, filename=filename) for page_idx, filename in enumerate(sorted_filenames)]
 
-        logger.info(f"Starting pipeline for {total_images} images, parquet: {ld_parquet_uri}")
+        logger.debug(f"Starting pipeline for {total_images} images, parquet: {ld_parquet_uri}")
 
         # Get volume prefix for S3
         volume_prefix = self._get_volume_prefix(ctx)
@@ -205,10 +203,10 @@ class OCRV1JobWorkerAsync:
 
         try:
             if self.cfg.use_sequential_pipeline:
-                logger.info(f"Using SEQUENTIAL pipeline mode for {total_images} images")
+                logger.debug(f"Using SEQUENTIAL pipeline mode for {total_images} images")
                 stats = await pipeline.run_sequential(tasks, ld_parquet_uri, output_parquet_uri)
             else:
-                logger.info(f"Using PARALLEL pipeline mode for {total_images} images")
+                logger.debug(f"Using PARALLEL pipeline mode for {total_images} images")
                 stats = await pipeline.run(tasks, ld_parquet_uri, output_parquet_uri)
         finally:
             await pipeline.close()

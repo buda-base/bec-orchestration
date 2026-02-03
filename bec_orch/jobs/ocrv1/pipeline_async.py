@@ -266,7 +266,7 @@ class AsyncOCRPipeline:
             initargs=(ctc_decoder.ctc_vocab,),
         )
 
-        logger.info(
+        logger.debug(
             f"Pipeline config: prefetch={cfg.prefetch_concurrency}, "
             f"img_workers={cfg.image_processor_workers}, "
             f"ctc_workers={cfg.ctc_workers}, gpu_batch={cfg.gpu_batch_size}"
@@ -373,7 +373,7 @@ class AsyncOCRPipeline:
         async def monitor_queues() -> None:
             while True:
                 await asyncio.sleep(5)
-                logger.info(
+                logger.debug(
                     f"[QueueDepth] fetched={self.q_fetched.qsize()}, processed={self.q_processed.qsize()}, "
                     f"inferred={self.q_inferred.qsize()}, results={self.q_results.qsize()}"
                 )
@@ -463,7 +463,7 @@ class AsyncOCRPipeline:
                 )
                 # Wait briefly for writer to flush
                 await asyncio.wait_for(writer_task, timeout=5.0)
-                logger.info("[AsyncOCRPipeline] Writer flushed successfully")
+                logger.debug("[AsyncOCRPipeline] Writer flushed successfully")
             except asyncio.TimeoutError:
                 logger.warning("[AsyncOCRPipeline] Writer did not flush in time, cancelling")
                 writer_task.cancel()
@@ -555,7 +555,7 @@ class AsyncOCRPipeline:
         async def monitor_queues() -> None:
             while True:
                 await asyncio.sleep(5)
-                logger.info(
+                logger.debug(
                     f"[QueueDepth] fetched={self.q_fetched.qsize()}, processed={self.q_processed.qsize()}, "
                     f"inferred={self.q_inferred.qsize()}, collected={len(all_inferred)}"
                 )
@@ -583,7 +583,7 @@ class AsyncOCRPipeline:
             await asyncio.gather(*self._stage_tasks, return_exceptions=True)
             monitor_task.cancel()  # Stop monitor after Phase 1
             phase1_time = time.perf_counter() - start_time
-            logger.info(f"[Phase 1] GPU inference complete in {phase1_time:.2f}s - collected {len(all_inferred)} pages")
+            logger.debug(f"[Phase 1] GPU inference complete in {phase1_time:.2f}s - collected {len(all_inferred)} pages")
 
             # Phase 2: CTC decode all collected logits at once (max parallelism)
             logger.info("[Phase 2] Starting CTC decode phase...")
@@ -613,12 +613,12 @@ class AsyncOCRPipeline:
             gpu_pruned_count = sum(1 for _, _, _, _, ki in all_decode_tasks if ki is not None)
             if gpu_pruned_count > 0:
                 sample_ki = next((ki for _, _, _, _, ki in all_decode_tasks if ki is not None), None)
-                logger.info(
+                logger.debug(
                     f"[Phase 2] Submitting {len(all_decode_tasks)} lines to {self.cfg.ctc_workers} workers... "
                     f"({gpu_pruned_count} GPU-pruned, sample_keep_indices={len(sample_ki) if sample_ki is not None else 'N/A'})"
                 )
             else:
-                logger.info(
+                logger.debug(
                     f"[Phase 2] Submitting {len(all_decode_tasks)} lines to {self.cfg.ctc_workers} workers... (0 GPU-pruned)"
                 )
 
@@ -675,7 +675,7 @@ class AsyncOCRPipeline:
                     idx = next(i for i, f in enumerate(futures) if f[2] is future)
                     results[idx] = line_decode_result
                     completed += 1
-                    logger.info(
+                    logger.debug(
                         f"[CTC] line {completed}/{total_lines} page={page_idx} line={line_idx} worker={worker_pid} "
                         f"decode={decode_ms:.1f}ms ipc_in={ipc_in_ms:.1f}ms roundtrip={total_roundtrip_ms:.1f}ms"
                     )
@@ -686,7 +686,7 @@ class AsyncOCRPipeline:
             avg_ipc_in = total_ipc_in / num_results if num_results > 0 else 0
             avg_ipc_out = total_ipc_out / num_results if num_results > 0 else 0
             ms_per_line = decode_time * 1000 / num_results if num_results > 0 else 0
-            logger.info(
+            logger.debug(
                 f"[Phase 2] All {num_results} lines decoded in {decode_time:.2f}s "
                 f"({ms_per_line:.1f}ms/line, avg_ipc_in={avg_ipc_in:.1f}ms, avg_ipc_out={avg_ipc_out:.1f}ms)"
             )

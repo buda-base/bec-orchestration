@@ -80,9 +80,9 @@ class OCRModel:
         )
 
         if self._use_gpu:
-            logger.info(f"[OCRModel] PyTorch GPU: softmax={softmax_status}, vocab_pruning={pruning_status} (per-line)")
+            logger.debug(f"[OCRModel] PyTorch GPU: softmax={softmax_status}, vocab_pruning={pruning_status} (per-line)")
         else:
-            logger.info(
+            logger.debug(
                 f"[OCRModel] scipy/numpy CPU: softmax={softmax_status}, vocab_pruning={pruning_status} (per-line)"
             )
 

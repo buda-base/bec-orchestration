@@ -23,8 +23,6 @@ from bec_orch.jobs.shared.memory_monitor import log_memory_snapshot
 if TYPE_CHECKING:
     from bec_orch.jobs.base import JobContext
 
-from bec_orch.core.worker_runtime import get_s3_folder_prefix
-
 from .config import TIBETAN_WORD_DELIMITERS, OCRV1Config
 from .ctc_decoder import CTCDecoder
 from .data_structures import ImageTask
@@ -190,6 +188,8 @@ class OCRV1JobWorkerAsync:
         logger.debug(f"Starting pipeline for {total_images} images, parquet: {ld_parquet_uri}")
 
         # Get volume prefix for S3
+        from bec_orch.core.worker_runtime import get_s3_folder_prefix  # noqa: PLC0415
+
         volume_prefix = get_s3_folder_prefix(ctx.volume.w_id, ctx.volume.i_id)
 
         # Create and run pipeline

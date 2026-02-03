@@ -174,6 +174,9 @@ class OCRV1JobWorker:
                 f"avg {result.avg_duration_per_page_ms:.2f}ms/page"
             )
 
+        except (TerminalTaskError, RetryableTaskError):
+            raise
+
         except Exception as e:
             # Log memory state at failure (helps diagnose OOM)
             log_memory_snapshot(f"[OCRV1] FAILED volume {ctx.volume.w_id}/{ctx.volume.i_id}", level=logging.ERROR)
@@ -200,4 +203,8 @@ class OCRV1JobWorker:
             raise RetryableTaskError(f"Pipeline error ({error_type}): {e}") from e
 
         else:
+            if result.nb_errors > 0:
+                raise TerminalTaskError(
+                    f"Volume had {result.nb_errors} processing errors out of {result.total_images} images"
+                )
             return result

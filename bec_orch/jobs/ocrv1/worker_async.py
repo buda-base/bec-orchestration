@@ -5,7 +5,6 @@ Uses asyncio for high-concurrency S3 prefetching with backpressure.
 """
 
 import asyncio
-import hashlib
 import json
 import logging
 import os
@@ -23,6 +22,8 @@ from bec_orch.jobs.shared.memory_monitor import log_memory_snapshot
 
 if TYPE_CHECKING:
     from bec_orch.jobs.base import JobContext
+
+from bec_orch.core.worker_runtime import get_s3_folder_prefix
 
 from .config import TIBETAN_WORD_DELIMITERS, OCRV1Config
 from .ctc_decoder import CTCDecoder
@@ -189,7 +190,7 @@ class OCRV1JobWorkerAsync:
         logger.debug(f"Starting pipeline for {total_images} images, parquet: {ld_parquet_uri}")
 
         # Get volume prefix for S3
-        volume_prefix = self._get_volume_prefix(ctx)
+        volume_prefix = get_s3_folder_prefix(ctx.volume.w_id, ctx.volume.i_id)
 
         # Create and run pipeline
         pipeline = AsyncOCRPipeline(
@@ -241,10 +242,6 @@ class OCRV1JobWorkerAsync:
 
     def _get_output_parquet_uri(self, ctx: "JobContext") -> str:
         return f"s3://{ctx.artifacts_location.bucket}/{ctx.artifacts_location.prefix}/{ctx.artifacts_location.basename}_ocrv1.parquet"
-
-    def _get_volume_prefix(self, ctx: "JobContext") -> str:
-        w_prefix = hashlib.md5(ctx.volume.w_id.encode()).hexdigest()[:2]  # noqa: S324
-        return f"Works/{w_prefix}/{ctx.volume.w_id}/images/{ctx.volume.w_id}-{ctx.volume.i_id}"
 
     def _check_s3_exists(self, uri: str) -> bool:
         fs = s3fs.S3FileSystem()

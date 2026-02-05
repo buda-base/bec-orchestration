@@ -338,24 +338,41 @@ class LineDecoder:
 
         # Convert Parquet TPS format [iy, ix, oy, ox] to (input_pts, output_pts) format
         tps_input_pts = tps_output_pts = None
+        tps_info = None
         if tps_points:
             try:
-                # Convert from [y,x] to [x,y] format for both input and output points
-                tps_input_pts = [[p[1], p[0]] for p in tps_points]  # [ix, iy]
-                tps_output_pts = [[p[3], p[2]] for p in tps_points]  # [ox, oy]
+                # Validate format: each point should be [iy, ix, oy, ox] (4 values)
+                if not isinstance(tps_points, (list, tuple)) or len(tps_points) == 0:
+                    logger.warning(f"[LineDecoder] {fetched.filename}: Invalid tps_points format (not a list or empty)")
+                elif not all(isinstance(p, (list, tuple)) and len(p) == 4 for p in tps_points):
+                    # Log what we got for debugging
+                    sample = tps_points[0] if len(tps_points) > 0 else None
+                    logger.warning(
+                        f"[LineDecoder] {fetched.filename}: Invalid tps_points format. "
+                        f"Expected [[iy,ix,oy,ox],...], got {len(tps_points)} points, "
+                        f"sample point has {len(sample) if sample else 0} values: {sample}"
+                    )
+                else:
+                    # Convert from [y,x] to [x,y] format for both input and output points
+                    tps_input_pts = [[float(p[1]), float(p[0])] for p in tps_points]  # [ix, iy]
+                    tps_output_pts = [[float(p[3]), float(p[2])] for p in tps_points]  # [ox, oy]
 
-                # Scale if image was resized
-                if scale_factor != 1.0:
-                    tps_input_pts = [[p[0] * scale_factor, p[1] * scale_factor] for p in tps_input_pts]
-                    tps_output_pts = [[p[0] * scale_factor, p[1] * scale_factor] for p in tps_output_pts]
+                    # Scale if image was resized
+                    if scale_factor != 1.0:
+                        tps_input_pts = [[p[0] * scale_factor, p[1] * scale_factor] for p in tps_input_pts]
+                        tps_output_pts = [[p[0] * scale_factor, p[1] * scale_factor] for p in tps_output_pts]
 
-                # Store original unscaled points for output
-                tps_info = (([[p[1], p[0]] for p in tps_points], [[p[3], p[2]] for p in tps_points]), tps_alpha)
-            except (IndexError, TypeError):
-                logger.exception("[LineDecoder] Failed to parse TPS points")
+                    # Store original unscaled points for output (in [x, y] format)
+                    tps_info = (
+                        [[float(p[1]), float(p[0])] for p in tps_points],  # input_pts [ix, iy]
+                        [[float(p[3]), float(p[2])] for p in tps_points],  # output_pts [ox, oy]
+                    ), tps_alpha
+            except (IndexError, TypeError, ValueError) as e:
+                logger.warning(
+                    f"[LineDecoder] {fetched.filename}: Failed to parse TPS points: {e}. "
+                    f"tps_points type={type(tps_points).__name__}, len={len(tps_points) if hasattr(tps_points, '__len__') else 'N/A'}"
+                )
                 tps_input_pts = tps_output_pts = tps_info = None
-        else:
-            tps_info = None
 
         # Apply transforms (rotation + TPS) using scaled points
         image = apply_transform_1(image, rotation_angle, tps_input_pts, tps_output_pts, tps_alpha)

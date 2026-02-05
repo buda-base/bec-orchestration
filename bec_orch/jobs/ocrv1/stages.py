@@ -292,8 +292,8 @@ class PrefetcherStage:
                     self.stats["errors"] += 1
 
                 except Exception as e:
-                    key = f"{self.volume_prefix.rstrip('/')}/{task.filename}"
-                    logger.warning(f"[Prefetcher] Failed to fetch {task.filename} (s3://{self.source_image_bucket}/{key}): {e}")
+                    s3_uri = f"s3://{self.source_image_bucket}/{self.volume_prefix.rstrip('/')}/{task.filename}"
+                    logger.warning(f"[Prefetcher] Failed to fetch {s3_uri}: {e}")
                     try:
                         await asyncio.wait_for(
                             self.q_out.put(
@@ -302,13 +302,13 @@ class PrefetcherStage:
                                     task=task,
                                     source_etag=None,
                                     error_type=type(e).__name__,
-                                    message=f"Failed to fetch s3://{self.source_image_bucket}/{key}: {e}",
+                                    message=f"Failed to fetch {s3_uri}: {e}",
                                 )
                             ),
                             timeout=QUEUE_PUT_TIMEOUT,
                         )
                     except (asyncio.TimeoutError, asyncio.CancelledError):
-                        logger.error(f"[Prefetcher] Failed to send error for {task.filename}")
+                        logger.error(f"[Prefetcher] Failed to send error for {s3_uri}")
                     self.stats["errors"] += 1
 
         fetch_tasks = [asyncio.create_task(fetch_one(task)) for task in tasks]

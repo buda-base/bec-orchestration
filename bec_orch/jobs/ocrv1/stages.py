@@ -962,6 +962,9 @@ class OutputWriterStage:
 
     Tracks expected vs received pages and creates error records for any
     missing pages at EndOfStream (like ldv1's ParquetWriter).
+
+    All records are accumulated in memory during processing. The single
+    Parquet write to S3 happens in close() via run_in_executor.
     """
 
     def __init__(
@@ -981,13 +984,18 @@ class OutputWriterStage:
         self._received_filenames: set[str] = set()
 
     async def run(self) -> None:
-        """Write results to Parquet output file."""
+        """Collect results and write single Parquet file at end.
+
+        Records are accumulated in memory (fast, no I/O). The single S3 write
+        happens in close() via run_in_executor to not block the event loop.
+        """
 
         logger.info(f"[OutputWriter] Starting, expecting {self.total_pages} pages")
 
         writer = OutputWriter(self.parquet_uri)
         pages_written = 0
         errors_received = 0
+        loop = asyncio.get_event_loop()
 
         try:
             while True:
@@ -1007,6 +1015,7 @@ class OutputWriterStage:
                     # Track received filename
                     if msg.filename:
                         self._received_filenames.add(msg.filename)
+                    # Accumulate error (no I/O)
                     writer.write_error(msg)
                     errors_received += 1
                     continue
@@ -1016,20 +1025,23 @@ class OutputWriterStage:
                 filename = getattr(result, "img_file_name", None) or getattr(result, "filename", None)
                 if filename:
                     self._received_filenames.add(filename)
+                # Accumulate page (no I/O)
                 writer.write_page(result)
                 pages_written += 1
 
                 if pages_written % 100 == 0:
                     logger.debug(f"[OutputWriter] Progress: {pages_written}/{self.total_pages}")
 
-            # Fill missing pages with errors before closing
+            # Fill missing pages with errors (no I/O, just accumulates)
             dropped_count = self._fill_missing_pages(writer)
             if dropped_count > 0:
                 errors_received += dropped_count
                 self.stats["errors"] += dropped_count
 
         finally:
-            writer.close()
+            # Single S3 write in executor to not block event loop
+            logger.info(f"[OutputWriter] Writing {pages_written + errors_received} records to S3...")
+            await loop.run_in_executor(None, writer.close)
 
         logger.info(f"[OutputWriter] Done, wrote {pages_written} pages, {errors_received} errors")
 

@@ -64,27 +64,19 @@ def ocr_build_schema() -> pa.Schema:
 
 
 class ParquetWriter:
-    """Streaming Parquet writer for compact OCR page data."""
+    """Parquet writer for compact OCR page data.
 
-    def __init__(self, uri: str, batch_size: int = 100) -> None:
+    Accumulates all records in memory and writes once at close() to avoid
+    blocking the async event loop with S3 I/O during processing.
+    """
+
+    def __init__(self, uri: str) -> None:
         self.uri = uri
-        self.batch_size = batch_size
         self.schema = ocr_build_schema()
         self.records: list[dict] = []
-        self.total_written = 0
-
-        self._s3 = s3fs.S3FileSystem()
-        self._writer: pq.ParquetWriter | None = None
-        self._file = None
-
-    def _open_writer(self) -> None:
-        """Open the parquet writer lazily on first write."""
-        s3_path = self.uri.replace("s3://", "")
-        self._file = self._s3.open(s3_path, "wb")
-        self._writer = pq.ParquetWriter(self._file, self.schema)
 
     def write_page(self, result: PageOCRResult) -> None:
-        """Write a single OCR result page to parquet.
+        """Accumulate a single OCR result page (no I/O until close).
 
         Writes line-level data in native parquet types following ldv1 conventions.
         """
@@ -162,11 +154,8 @@ class ParquetWriter:
 
         self.records.append(record)
 
-        if len(self.records) >= self.batch_size:
-            self._flush_batch()
-
     def write_error(self, error: PipelineError) -> None:
-        """Write a pipeline error as a failed page record."""
+        """Accumulate a pipeline error as a failed page record (no I/O until close)."""
         record = {
             "img_file_name": error.filename,
             "source_etag": error.source_etag or "",
@@ -184,45 +173,32 @@ class ParquetWriter:
 
         self.records.append(record)
 
-        if len(self.records) >= self.batch_size:
-            self._flush_batch()
-
-    def _flush_batch(self) -> None:
-        """Flush accumulated records to parquet."""
+    def close(self) -> None:
+        """Write all accumulated records to S3 as a single Parquet file."""
         if not self.records:
+            logger.warning(f"No records to write to {self.uri}")
             return
 
-        if self._writer is None:
-            self._open_writer()
-
+        # Build table from all accumulated records
         table = pa.Table.from_pylist(self.records, schema=self.schema)
-        if self._writer is not None:
-            self._writer.write_table(table)
-        self.total_written += len(self.records)
-        logger.debug(f"Flushed {len(self.records)} records (total: {self.total_written})")
-        self.records = []
 
-    def close(self) -> None:
-        """Flush remaining records and close the writer."""
-        self._flush_batch()
+        # Write to S3 in one operation
+        s3 = s3fs.S3FileSystem()
+        s3_path = self.uri.replace("s3://", "")
 
-        if self._writer:
-            self._writer.close()
-            self._writer = None
+        with s3.open(s3_path, "wb") as f:
+            pq.write_table(table, f)
 
-        if self._file:
-            self._file.close()
-            self._file = None
-
-        logger.info(f"Wrote {self.total_written} records to {self.uri}")
+        logger.info(f"Wrote {len(self.records)} records to {self.uri}")
 
 
 class OutputWriter:
     """
     Coordinates writing to Parquet output format.
 
-    Parquet is written in streaming batches.
-    PipelineErrors are tracked and reported.
+    Accumulates all records in memory during processing, then writes
+    a single Parquet file to S3 when close() is called. This avoids
+    blocking the async event loop with S3 I/O during processing.
     """
 
     def __init__(self, parquet_uri: str) -> None:
@@ -235,7 +211,7 @@ class OutputWriter:
         self._success_count = 0
 
     def write_page(self, result: Union[PageOCRResult, "PageResult"]) -> None:
-        """Write page to Parquet format."""
+        """Accumulate page for Parquet output (no I/O until close)."""
         # Convert legacy PageResult to PageOCRResult if needed
         if isinstance(result, PageResult):
             ocr_result = PageOCRResult(
@@ -249,20 +225,20 @@ class OutputWriter:
         else:
             ocr_result = result
 
-        # Write to Parquet (streaming)
+        # Accumulate record (no I/O)
         self.parquet_writer.write_page(ocr_result)
         self._success_count += 1
 
     def write_error(self, error: PipelineError) -> None:
-        """Track and write a pipeline error."""
+        """Accumulate pipeline error (no I/O until close)."""
         self._errors.append(error)
         self._error_count_by_stage[error.stage] += 1
 
-        # Write error to Parquet (streaming)
+        # Accumulate error record (no I/O)
         self.parquet_writer.write_error(error)
 
     def close(self) -> None:
-        """Close the Parquet writer and log summary."""
+        """Write all accumulated records to S3 and log summary."""
         self.parquet_writer.close()
 
         # Log summary
@@ -270,7 +246,3 @@ class OutputWriter:
             logger.warning(f"Pipeline completed with {len(self._errors)} errors: {dict(self._error_count_by_stage)}")
         else:
             logger.info(f"Pipeline completed successfully with {self._success_count} pages processed")
-
-
-# Legacy compatibility - keep old class name
-StreamingParquetWriter = ParquetWriter

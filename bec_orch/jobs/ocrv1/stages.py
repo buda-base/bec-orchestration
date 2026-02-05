@@ -6,6 +6,12 @@ Each stage is a separate class with:
 - run(): Async method that processes items from input queue and puts results to output queue
 
 This follows the LDv1 pipeline pattern for modular, testable stages.
+
+IMPORTANT: Deadlock prevention measures:
+- All queue.get() calls have timeouts to prevent infinite waits
+- asyncio.CancelledError is caught explicitly (it's a BaseException, not Exception)
+- EndOfStream is ALWAYS sent in finally blocks to unblock downstream stages
+- Queue.put() timeouts prevent indefinite blocking on backpressure
 """
 
 from __future__ import annotations
@@ -19,6 +25,10 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 import pyarrow.parquet as pq
 from pyarrow import fs
+
+# Default timeout for queue operations (10 minutes - should be much less than job timeout)
+QUEUE_GET_TIMEOUT = 600.0  # 10 minutes
+QUEUE_PUT_TIMEOUT = 60.0   # 1 minute for backpressure
 
 from .ctc_decoder import decode_logits_with_segments
 from .data_structures import (
@@ -95,14 +105,28 @@ class ParquetLoaderStage:
                 {load_complete_task, row_event_task},
                 return_when=asyncio.FIRST_COMPLETED,
             )
+            # Cancel pending tasks and suppress CancelledError
             for task in pending:
                 task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
 
             if filename in self.parquet_data:
                 return self.parquet_data[filename]
-        except Exception:
             return None
-        else:
+
+        except asyncio.CancelledError:
+            # Clean up both tasks if we're cancelled
+            load_complete_task.cancel()
+            row_event_task.cancel()
+            raise
+
+        except Exception:
+            # Clean up tasks on unexpected error
+            load_complete_task.cancel()
+            row_event_task.cancel()
             return None
 
     @property
@@ -241,37 +265,65 @@ class PrefetcherStage:
 
                     source_etag, file_bytes = await loop.run_in_executor(None, _fetch)
 
-                    await self.q_out.put(
-                        PrefetchedBytes(
-                            task=task,
-                            source_etag=source_etag,
-                            file_bytes=file_bytes,
-                        )
+                    await asyncio.wait_for(
+                        self.q_out.put(
+                            PrefetchedBytes(
+                                task=task,
+                                source_etag=source_etag,
+                                file_bytes=file_bytes,
+                            )
+                        ),
+                        timeout=QUEUE_PUT_TIMEOUT,
                     )
                     self.stats["fetched"] += 1
 
                     if self.stats["fetched"] % 20 == 0:
                         logger.debug(f"[Prefetcher] Fetched {self.stats['fetched']} pages")
 
+                except asyncio.CancelledError:
+                    # Task was cancelled (e.g., pipeline shutdown) - don't send error, just exit
+                    logger.debug(f"[Prefetcher] Task cancelled for {task.filename}")
+                    raise  # Re-raise to properly cancel the task
+
+                except asyncio.TimeoutError:
+                    key = f"{self.volume_prefix.rstrip('/')}/{task.filename}"
+                    logger.error(f"[Prefetcher] Queue put timeout for {task.filename} - downstream may be stuck")
+                    # Don't try to put error (queue is stuck), just count it
+                    self.stats["errors"] += 1
+
                 except Exception as e:
                     key = f"{self.volume_prefix.rstrip('/')}/{task.filename}"
                     logger.warning(f"[Prefetcher] Failed to fetch {task.filename} (s3://{self.source_image_bucket}/{key}): {e}")
-                    await self.q_out.put(
-                        PipelineError(
-                            stage="Prefetcher",
-                            task=task,
-                            source_etag=None,
-                            error_type=type(e).__name__,
-                            message=f"Failed to fetch s3://{self.source_image_bucket}/{key}: {e}",
+                    try:
+                        await asyncio.wait_for(
+                            self.q_out.put(
+                                PipelineError(
+                                    stage="Prefetcher",
+                                    task=task,
+                                    source_etag=None,
+                                    error_type=type(e).__name__,
+                                    message=f"Failed to fetch s3://{self.source_image_bucket}/{key}: {e}",
+                                )
+                            ),
+                            timeout=QUEUE_PUT_TIMEOUT,
                         )
-                    )
+                    except (asyncio.TimeoutError, asyncio.CancelledError):
+                        logger.error(f"[Prefetcher] Failed to send error for {task.filename}")
                     self.stats["errors"] += 1
 
         fetch_tasks = [asyncio.create_task(fetch_one(task)) for task in tasks]
-        await asyncio.gather(*fetch_tasks)
-
-        await self.q_out.put(EndOfStream(stream="fetched", producer="Prefetcher"))
-        logger.info(f"[Prefetcher] Done, fetched {self.stats['fetched']} pages")
+        try:
+            await asyncio.gather(*fetch_tasks, return_exceptions=True)
+        finally:
+            # ALWAYS send EOS to unblock downstream, even on exception/cancellation
+            try:
+                await asyncio.wait_for(
+                    self.q_out.put(EndOfStream(stream="fetched", producer="Prefetcher")),
+                    timeout=QUEUE_PUT_TIMEOUT,
+                )
+            except (asyncio.TimeoutError, asyncio.CancelledError):
+                logger.error("[Prefetcher] Failed to send EOS - downstream may deadlock")
+            logger.info(f"[Prefetcher] Done, fetched {self.stats['fetched']} pages")
 
 
 class ImageProcessorStage:
@@ -315,31 +367,58 @@ class ImageProcessorStage:
             async with sem:
                 try:
                     # Wait for this specific row (may return immediately if already loaded)
-                    ld_row = await self.parquet_loader.get_row(prefetched.filename)
+                    # Add timeout to prevent infinite wait if parquet loading is stuck
+                    try:
+                        ld_row = await asyncio.wait_for(
+                            self.parquet_loader.get_row(prefetched.filename),
+                            timeout=QUEUE_GET_TIMEOUT,
+                        )
+                    except asyncio.TimeoutError:
+                        logger.error(f"[ImageProcessor] Timeout waiting for parquet row for {prefetched.filename}")
+                        await asyncio.wait_for(
+                            self.q_out.put(
+                                PipelineError(
+                                    stage="ImageProcessor",
+                                    task=prefetched.task,
+                                    source_etag=prefetched.source_etag,
+                                    error_type="ParquetTimeout",
+                                    message=f"Timeout waiting for LD parquet row for {prefetched.filename}",
+                                )
+                            ),
+                            timeout=QUEUE_PUT_TIMEOUT,
+                        )
+                        self.stats["errors"] += 1
+                        return
 
                     # Check for parquet error
                     if self.parquet_loader.parquet_error:
-                        await self.q_out.put(
-                            PipelineError(
-                                stage="ImageProcessor",
-                                task=prefetched.task,
-                                source_etag=prefetched.source_etag,
-                                error_type="ParquetLoadError",
-                                message=f"LD parquet loading failed: {self.parquet_loader.parquet_error}",
-                            )
+                        await asyncio.wait_for(
+                            self.q_out.put(
+                                PipelineError(
+                                    stage="ImageProcessor",
+                                    task=prefetched.task,
+                                    source_etag=prefetched.source_etag,
+                                    error_type="ParquetLoadError",
+                                    message=f"LD parquet loading failed: {self.parquet_loader.parquet_error}",
+                                )
+                            ),
+                            timeout=QUEUE_PUT_TIMEOUT,
                         )
                         self.stats["errors"] += 1
                         return
 
                     if ld_row is None:
-                        await self.q_out.put(
-                            PipelineError(
-                                stage="ImageProcessor",
-                                task=prefetched.task,
-                                source_etag=prefetched.source_etag,
-                                error_type="MissingLDData",
-                                message=f"No LD data found for {prefetched.filename} in parquet",
-                            )
+                        await asyncio.wait_for(
+                            self.q_out.put(
+                                PipelineError(
+                                    stage="ImageProcessor",
+                                    task=prefetched.task,
+                                    source_etag=prefetched.source_etag,
+                                    error_type="MissingLDData",
+                                    message=f"No LD data found for {prefetched.filename} in parquet",
+                                )
+                            ),
+                            timeout=QUEUE_PUT_TIMEOUT,
                         )
                         self.stats["errors"] += 1
                         return
@@ -356,39 +435,85 @@ class ImageProcessorStage:
                         self.line_decoder.process,
                         fetched,
                     )
-                    await self.q_out.put(processed)
+                    await asyncio.wait_for(
+                        self.q_out.put(processed),
+                        timeout=QUEUE_PUT_TIMEOUT,
+                    )
                     self.stats["processed"] += 1
                     if processed.error:
                         self.stats["errors"] += 1
-                except Exception as e:
-                    logger.warning(f"[ImageProcessor] Failed to process {prefetched.filename}: {e}")
-                    await self.q_out.put(
-                        PipelineError(
-                            stage="ImageProcessor",
-                            task=prefetched.task,
-                            source_etag=prefetched.source_etag,
-                            error_type=type(e).__name__,
-                            message=str(e),
-                        )
-                    )
+
+                except asyncio.CancelledError:
+                    # Task was cancelled - don't send error, just exit
+                    logger.debug(f"[ImageProcessor] Task cancelled for {prefetched.filename}")
+                    raise  # Re-raise to properly cancel
+
+                except asyncio.TimeoutError:
+                    logger.error(f"[ImageProcessor] Queue put timeout for {prefetched.filename}")
                     self.stats["errors"] += 1
 
-        while True:
-            msg = await self.q_in.get()
-            if isinstance(msg, EndOfStream):
-                if pending_tasks:
-                    await asyncio.gather(*pending_tasks, return_exceptions=True)
-                await self.q_out.put(EndOfStream(stream="processed", producer="ImageProcessor"))
-                break
+                except Exception as e:
+                    logger.warning(f"[ImageProcessor] Failed to process {prefetched.filename}: {e}")
+                    try:
+                        await asyncio.wait_for(
+                            self.q_out.put(
+                                PipelineError(
+                                    stage="ImageProcessor",
+                                    task=prefetched.task,
+                                    source_etag=prefetched.source_etag,
+                                    error_type=type(e).__name__,
+                                    message=str(e),
+                                )
+                            ),
+                            timeout=QUEUE_PUT_TIMEOUT,
+                        )
+                    except (asyncio.TimeoutError, asyncio.CancelledError):
+                        logger.error(f"[ImageProcessor] Failed to send error for {prefetched.filename}")
+                    self.stats["errors"] += 1
 
-            if isinstance(msg, PipelineError):
-                await self.q_out.put(msg)
-                continue
+        try:
+            while True:
+                try:
+                    msg = await asyncio.wait_for(self.q_in.get(), timeout=QUEUE_GET_TIMEOUT)
+                except asyncio.TimeoutError:
+                    logger.error("[ImageProcessor] Timeout waiting for input - upstream may be stuck")
+                    break
 
-            prefetched: PrefetchedBytes = msg
-            task = asyncio.create_task(process_one(prefetched))
-            pending_tasks.add(task)
-            task.add_done_callback(pending_tasks.discard)
+                if isinstance(msg, EndOfStream):
+                    if pending_tasks:
+                        # Wait for pending tasks with timeout
+                        try:
+                            await asyncio.wait_for(
+                                asyncio.gather(*pending_tasks, return_exceptions=True),
+                                timeout=QUEUE_GET_TIMEOUT,
+                            )
+                        except asyncio.TimeoutError:
+                            logger.error(f"[ImageProcessor] Timeout waiting for {len(pending_tasks)} pending tasks")
+                            for t in pending_tasks:
+                                t.cancel()
+                    break
+
+                if isinstance(msg, PipelineError):
+                    try:
+                        await asyncio.wait_for(self.q_out.put(msg), timeout=QUEUE_PUT_TIMEOUT)
+                    except (asyncio.TimeoutError, asyncio.CancelledError):
+                        logger.error("[ImageProcessor] Failed to forward PipelineError")
+                    continue
+
+                prefetched: PrefetchedBytes = msg
+                task = asyncio.create_task(process_one(prefetched))
+                pending_tasks.add(task)
+                task.add_done_callback(pending_tasks.discard)
+
+        finally:
+            # ALWAYS send EOS to unblock downstream
+            try:
+                await asyncio.wait_for(
+                    self.q_out.put(EndOfStream(stream="processed", producer="ImageProcessor")),
+                    timeout=QUEUE_PUT_TIMEOUT,
+                )
+            except (asyncio.TimeoutError, asyncio.CancelledError):
+                logger.error("[ImageProcessor] Failed to send EOS - downstream may deadlock")
 
         logger.info(f"[ImageProcessor] Done, processed {self.stats['processed']} pages")
 
@@ -439,10 +564,26 @@ class GPUInferenceStage:
             # Run inference in executor to not block event loop
             # Model crops time dimension BEFORE softmax/pruning to save computation
             loop = asyncio.get_event_loop()
-            line_logits_list = await loop.run_in_executor(
-                None,
-                lambda: self.ocr_model.predict(tensors, content_widths, left_pad_widths, self.ocr_model.input_width),
-            )
+            try:
+                line_logits_list = await asyncio.wait_for(
+                    loop.run_in_executor(
+                        None,
+                        lambda: self.ocr_model.predict(tensors, content_widths, left_pad_widths, self.ocr_model.input_width),
+                    ),
+                    timeout=QUEUE_GET_TIMEOUT,  # Use same timeout for GPU ops
+                )
+            except asyncio.TimeoutError:
+                logger.error(f"[GPUInference] Timeout during inference for batch of {batch_size} lines")
+                # Create dummy logits for this batch
+                line_logits_list = [
+                    LineLogits(
+                        logits=np.zeros((1, DEFAULT_VOCAB_SIZE), dtype=np.float32),
+                        content_width=1,
+                        left_pad_width=0,
+                        keep_indices=None,
+                    )
+                    for _ in pending_tensors
+                ]
 
             # Distribute results back to pages
             for pt, line_logits in zip(pending_tensors, line_logits_list, strict=True):
@@ -475,75 +616,119 @@ class GPUInferenceStage:
                     )
                     for i in range(page_flight.expected_lines)
                 ]
-                await self.q_out.put(self._create_inferred_page(page_flight.processed_page, logits_list))
-                pages_emitted += 1
-                self.stats["inferred"] += 1
-
-        while True:
-            msg = await self.q_in.get()
-            if isinstance(msg, EndOfStream):
-                logger.debug(f"[GPUInference] Received EOS, flushing {len(pending_tensors)} pending tensors")
-                await flush_batch()
-                await try_emit_completed_pages()
-
-                for page_flight in pages_in_flight.values():
-                    logits_list = [
-                        page_flight.line_logits.get(
-                            i,
-                            LineLogits(
-                                logits=np.zeros((1, DEFAULT_VOCAB_SIZE), dtype=np.float32),
-                                content_width=1,
-                                left_pad_width=0,
-                                keep_indices=None,
-                            ),
-                        )
-                        for i in range(page_flight.expected_lines)
-                    ]
-                    await self.q_out.put(self._create_inferred_page(page_flight.processed_page, logits_list))
-                    self.stats["inferred"] += 1
-
-                await self.q_out.put(EndOfStream(stream="inferred", producer="GPUInference"))
-                break
-
-            if isinstance(msg, PipelineError):
-                await self.q_out.put(msg)
-                continue
-
-            processed: ProcessedPage = msg
-            pages_received += 1
-
-            if pages_received % 20 == 0:
-                logger.debug(
-                    f"[GPUInference] Received {pages_received} pages, "
-                    f"{len(pending_tensors)} tensors pending, {len(pages_in_flight)} in flight"
-                )
-
-            if processed.error or not processed.lines:
-                await self.q_out.put(self._create_inferred_page(processed, []))
-                pages_emitted += 1
-                self.stats["inferred"] += 1
-                continue
-
-            pages_in_flight[processed.page_idx] = PageInFlight(
-                processed_page=processed,
-                expected_lines=len(processed.lines),
-                line_logits={},
-            )
-
-            for line_idx, line in enumerate(processed.lines):
-                pending_tensors.append(
-                    PendingTensor(
-                        page_idx=processed.page_idx,
-                        line_idx=line_idx,
-                        tensor=line.tensor,
-                        content_width=line.content_width,
-                        left_pad_width=line.left_pad_width,
+                try:
+                    await asyncio.wait_for(
+                        self.q_out.put(self._create_inferred_page(page_flight.processed_page, logits_list)),
+                        timeout=QUEUE_PUT_TIMEOUT,
                     )
-                )
+                    pages_emitted += 1
+                    self.stats["inferred"] += 1
+                except asyncio.TimeoutError:
+                    logger.error(f"[GPUInference] Queue put timeout for page {pid}")
+                    self.stats["errors"] += 1
 
-                if len(pending_tensors) >= self.cfg.gpu_batch_size:
+        try:
+            while True:
+                try:
+                    msg = await asyncio.wait_for(self.q_in.get(), timeout=QUEUE_GET_TIMEOUT)
+                except asyncio.TimeoutError:
+                    logger.error("[GPUInference] Timeout waiting for input - upstream may be stuck")
+                    break
+
+                if isinstance(msg, EndOfStream):
+                    logger.debug(f"[GPUInference] Received EOS, flushing {len(pending_tensors)} pending tensors")
                     await flush_batch()
                     await try_emit_completed_pages()
+
+                    for page_flight in pages_in_flight.values():
+                        logits_list = [
+                            page_flight.line_logits.get(
+                                i,
+                                LineLogits(
+                                    logits=np.zeros((1, DEFAULT_VOCAB_SIZE), dtype=np.float32),
+                                    content_width=1,
+                                    left_pad_width=0,
+                                    keep_indices=None,
+                                ),
+                            )
+                            for i in range(page_flight.expected_lines)
+                        ]
+                        try:
+                            await asyncio.wait_for(
+                                self.q_out.put(self._create_inferred_page(page_flight.processed_page, logits_list)),
+                                timeout=QUEUE_PUT_TIMEOUT,
+                            )
+                            self.stats["inferred"] += 1
+                        except asyncio.TimeoutError:
+                            logger.error(f"[GPUInference] Queue put timeout for remaining page")
+                            self.stats["errors"] += 1
+
+                    break
+
+                if isinstance(msg, PipelineError):
+                    try:
+                        await asyncio.wait_for(self.q_out.put(msg), timeout=QUEUE_PUT_TIMEOUT)
+                    except (asyncio.TimeoutError, asyncio.CancelledError):
+                        logger.error("[GPUInference] Failed to forward PipelineError")
+                    continue
+
+                processed: ProcessedPage = msg
+                pages_received += 1
+
+                if pages_received % 20 == 0:
+                    logger.debug(
+                        f"[GPUInference] Received {pages_received} pages, "
+                        f"{len(pending_tensors)} tensors pending, {len(pages_in_flight)} in flight"
+                    )
+
+                if processed.error or not processed.lines:
+                    try:
+                        await asyncio.wait_for(
+                            self.q_out.put(self._create_inferred_page(processed, [])),
+                            timeout=QUEUE_PUT_TIMEOUT,
+                        )
+                        pages_emitted += 1
+                        self.stats["inferred"] += 1
+                    except asyncio.TimeoutError:
+                        logger.error(f"[GPUInference] Queue put timeout for error page {processed.page_idx}")
+                        self.stats["errors"] += 1
+                    continue
+
+                pages_in_flight[processed.page_idx] = PageInFlight(
+                    processed_page=processed,
+                    expected_lines=len(processed.lines),
+                    line_logits={},
+                )
+
+                for line_idx, line in enumerate(processed.lines):
+                    pending_tensors.append(
+                        PendingTensor(
+                            page_idx=processed.page_idx,
+                            line_idx=line_idx,
+                            tensor=line.tensor,
+                            content_width=line.content_width,
+                            left_pad_width=line.left_pad_width,
+                        )
+                    )
+
+                    if len(pending_tensors) >= self.cfg.gpu_batch_size:
+                        await flush_batch()
+                        await try_emit_completed_pages()
+
+        except asyncio.CancelledError:
+            logger.warning("[GPUInference] Task cancelled, flushing remaining work")
+            await flush_batch()
+            raise
+
+        finally:
+            # ALWAYS send EOS to unblock downstream
+            try:
+                await asyncio.wait_for(
+                    self.q_out.put(EndOfStream(stream="inferred", producer="GPUInference")),
+                    timeout=QUEUE_PUT_TIMEOUT,
+                )
+            except (asyncio.TimeoutError, asyncio.CancelledError):
+                logger.error("[GPUInference] Failed to send EOS - downstream may deadlock")
 
         logger.info(f"[GPUInference] Done, inferred {self.stats['inferred']} pages")
 
@@ -634,43 +819,93 @@ class CTCDecoderStage:
                     )
 
                     page_result = self._build_page_ocr_result(inferred.processed_page, line_decode_results)
-                    await self.q_out.put(page_result)
+                    await asyncio.wait_for(
+                        self.q_out.put(page_result),
+                        timeout=QUEUE_PUT_TIMEOUT,
+                    )
                     self.stats["decoded"] += 1
+
+                except asyncio.CancelledError:
+                    logger.debug(f"[CTCDecoder] Task cancelled for {inferred.filename}")
+                    raise  # Re-raise to properly cancel
+
+                except asyncio.TimeoutError:
+                    logger.error(f"[CTCDecoder] Queue put timeout for {inferred.filename}")
+                    self.stats["errors"] += 1
 
                 except Exception as e:
                     logger.warning(f"[CTCDecoder] Failed to decode {inferred.filename}: {e}")
-                    await self.q_out.put(
-                        PipelineError(
-                            stage="CTCDecoder",
-                            task=inferred.task,
-                            source_etag=inferred.source_etag,
-                            error_type=type(e).__name__,
-                            message=str(e),
+                    try:
+                        await asyncio.wait_for(
+                            self.q_out.put(
+                                PipelineError(
+                                    stage="CTCDecoder",
+                                    task=inferred.task,
+                                    source_etag=inferred.source_etag,
+                                    error_type=type(e).__name__,
+                                    message=str(e),
+                                )
+                            ),
+                            timeout=QUEUE_PUT_TIMEOUT,
                         )
-                    )
+                    except (asyncio.TimeoutError, asyncio.CancelledError):
+                        logger.error(f"[CTCDecoder] Failed to send error for {inferred.filename}")
                     self.stats["errors"] += 1
 
-        while True:
-            msg = await self.q_in.get()
-            if isinstance(msg, EndOfStream):
-                if pending_tasks:
-                    await asyncio.gather(*pending_tasks, return_exceptions=True)
-                await self.q_out.put(EndOfStream(stream="results", producer="CTCDecoder"))
-                break
+        try:
+            while True:
+                try:
+                    msg = await asyncio.wait_for(self.q_in.get(), timeout=QUEUE_GET_TIMEOUT)
+                except asyncio.TimeoutError:
+                    logger.error("[CTCDecoder] Timeout waiting for input - upstream may be stuck")
+                    break
 
-            if isinstance(msg, PipelineError):
-                await self.q_out.put(msg)
-                continue
+                if isinstance(msg, EndOfStream):
+                    if pending_tasks:
+                        # Wait for pending tasks with timeout
+                        try:
+                            await asyncio.wait_for(
+                                asyncio.gather(*pending_tasks, return_exceptions=True),
+                                timeout=QUEUE_GET_TIMEOUT,
+                            )
+                        except asyncio.TimeoutError:
+                            logger.error(f"[CTCDecoder] Timeout waiting for {len(pending_tasks)} pending tasks")
+                            for t in pending_tasks:
+                                t.cancel()
+                    break
 
-            inferred: InferredPage = msg
-            pages_received += 1
+                if isinstance(msg, PipelineError):
+                    try:
+                        await asyncio.wait_for(self.q_out.put(msg), timeout=QUEUE_PUT_TIMEOUT)
+                    except (asyncio.TimeoutError, asyncio.CancelledError):
+                        logger.error("[CTCDecoder] Failed to forward PipelineError")
+                    continue
 
-            if pages_received % 20 == 0:
-                logger.debug(f"[CTCDecoder] Received {pages_received} pages")
+                inferred: InferredPage = msg
+                pages_received += 1
 
-            task = asyncio.create_task(decode_one(inferred))
-            pending_tasks.add(task)
-            task.add_done_callback(pending_tasks.discard)
+                if pages_received % 20 == 0:
+                    logger.debug(f"[CTCDecoder] Received {pages_received} pages")
+
+                task = asyncio.create_task(decode_one(inferred))
+                pending_tasks.add(task)
+                task.add_done_callback(pending_tasks.discard)
+
+        except asyncio.CancelledError:
+            logger.warning("[CTCDecoder] Task cancelled")
+            for t in pending_tasks:
+                t.cancel()
+            raise
+
+        finally:
+            # ALWAYS send EOS to unblock downstream
+            try:
+                await asyncio.wait_for(
+                    self.q_out.put(EndOfStream(stream="results", producer="CTCDecoder")),
+                    timeout=QUEUE_PUT_TIMEOUT,
+                )
+            except (asyncio.TimeoutError, asyncio.CancelledError):
+                logger.error("[CTCDecoder] Failed to send EOS - downstream may deadlock")
 
         logger.info(f"[CTCDecoder] Done, decoded {self.stats['decoded']} pages")
 
@@ -756,7 +991,15 @@ class OutputWriterStage:
 
         try:
             while True:
-                msg = await self.q_in.get()
+                try:
+                    msg = await asyncio.wait_for(self.q_in.get(), timeout=QUEUE_GET_TIMEOUT)
+                except asyncio.TimeoutError:
+                    logger.error("[OutputWriter] Timeout waiting for input - upstream may be stuck")
+                    break
+                except asyncio.CancelledError:
+                    logger.warning("[OutputWriter] Task cancelled")
+                    break
+
                 if isinstance(msg, EndOfStream):
                     break
 

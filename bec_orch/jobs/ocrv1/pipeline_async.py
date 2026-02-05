@@ -9,6 +9,12 @@ Pipeline stages:
 5. Parquet Writer (single async task) → S3
 
 All stages connected by bounded asyncio.Queue for backpressure.
+
+IMPORTANT: Deadlock prevention measures:
+- All queue.get() calls have timeouts to prevent infinite waits
+- ProcessPoolExecutor worker crashes are handled with try/except
+- asyncio.CancelledError is caught explicitly
+- EndOfStream is ALWAYS sent in finally blocks
 """
 
 import asyncio
@@ -16,11 +22,16 @@ import contextlib
 import logging
 import os
 import time
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+from concurrent.futures import BrokenExecutor, ProcessPoolExecutor, ThreadPoolExecutor
 from typing import TYPE_CHECKING
 
 import numpy.typing as npt
 from botocore.client import BaseClient
+
+# Timeout for queue/executor operations (10 minutes, less than job timeout)
+QUEUE_GET_TIMEOUT = 600.0
+# Timeout for individual CTC decode operation (5 minutes per line is very generous)
+CTC_DECODE_TIMEOUT = 300.0
 
 from .data_structures import (
     EndOfStream,
@@ -43,6 +54,9 @@ from .ctc_decoder import (
     decode_logits_with_segments,
     init_worker_process,
 )
+
+# Re-export for use in this module
+__all__ = ["AsyncOCRPipeline"]
 from .line_decoder import LineDecoder, ProcessedPage
 from .model import OCRModel
 from .stages import (
@@ -547,7 +561,15 @@ class AsyncOCRPipeline:
         async def collect_inferred() -> None:
             """Collect all inferred pages instead of passing to CTC decoder."""
             while True:
-                msg = await self.q_inferred.get()
+                try:
+                    msg = await asyncio.wait_for(self.q_inferred.get(), timeout=QUEUE_GET_TIMEOUT)
+                except asyncio.TimeoutError:
+                    logger.error("[collect_inferred] Timeout waiting for inferred page - upstream may be stuck")
+                    break
+                except asyncio.CancelledError:
+                    logger.warning("[collect_inferred] Task cancelled")
+                    break
+
                 if isinstance(msg, EndOfStream):
                     break
                 all_inferred.append(msg)
@@ -663,6 +685,7 @@ class AsyncOCRPipeline:
             decode_start = time.perf_counter()
             total_lines = len(futures)
             completed = 0
+            failed_lines = 0
 
             # Wait for all decodes and log each line as it completes
             pending = {
@@ -673,11 +696,70 @@ class AsyncOCRPipeline:
             total_ipc_out = 0.0
 
             while pending:
-                done, _ = await asyncio.wait(pending.keys(), return_when=asyncio.FIRST_COMPLETED)
+                try:
+                    # Add timeout to prevent infinite wait if workers crash
+                    done, still_pending = await asyncio.wait(
+                        pending.keys(),
+                        return_when=asyncio.FIRST_COMPLETED,
+                        timeout=CTC_DECODE_TIMEOUT,
+                    )
+                except asyncio.CancelledError:
+                    logger.warning("[CTC] Decode wait cancelled, cancelling remaining futures")
+                    for f in pending.keys():
+                        f.cancel()
+                    raise
+
+                # Handle timeout - no futures completed
+                if not done:
+                    logger.error(f"[CTC] Timeout waiting for {len(pending)} remaining decode tasks")
+                    # Create dummy results for remaining and break
+                    for future in list(pending.keys()):
+                        page_idx, line_idx, inferred, submit_time = pending.pop(future)
+                        idx = next(i for i, f in enumerate(futures) if f[2] is future)
+                        # Create empty decode result
+                        results[idx] = LineDecodeResult(
+                            text="",
+                            segments=[],
+                            line_confidence=float("-inf"),
+                            logit_score=0.0,
+                        )
+                        failed_lines += 1
+                        future.cancel()
+                    break
+
                 for future in done:
                     page_idx, line_idx, inferred, submit_time = pending.pop(future)
                     result_time = time.perf_counter()
-                    line_decode_result, decode_ms, ipc_in_ms, worker_pid = future.result()
+
+                    try:
+                        line_decode_result, decode_ms, ipc_in_ms, worker_pid = future.result()
+                    except BrokenExecutor as e:
+                        # Worker process crashed
+                        logger.error(f"[CTC] Worker process crashed for page={page_idx} line={line_idx}: {e}")
+                        line_decode_result = LineDecodeResult(
+                            text="",
+                            segments=[],
+                            line_confidence=float("-inf"),
+                            logit_score=0.0,
+                        )
+                        decode_ms = 0.0
+                        ipc_in_ms = 0.0
+                        worker_pid = -1
+                        failed_lines += 1
+                    except Exception as e:
+                        # Other error (e.g., decoding error)
+                        logger.warning(f"[CTC] Decode failed for page={page_idx} line={line_idx}: {e}")
+                        line_decode_result = LineDecodeResult(
+                            text="",
+                            segments=[],
+                            line_confidence=float("-inf"),
+                            logit_score=0.0,
+                        )
+                        decode_ms = 0.0
+                        ipc_in_ms = 0.0
+                        worker_pid = -1
+                        failed_lines += 1
+
                     ipc_out_ms = (time.perf_counter() - result_time) * 1000  # Time to deserialize result
                     total_roundtrip_ms = (result_time - submit_time) * 1000
                     total_ipc_in += ipc_in_ms
@@ -689,6 +771,9 @@ class AsyncOCRPipeline:
                         f"[CTC] line {completed}/{total_lines} page={page_idx} line={line_idx} worker={worker_pid} "
                         f"decode={decode_ms:.1f}ms ipc_in={ipc_in_ms:.1f}ms roundtrip={total_roundtrip_ms:.1f}ms"
                     )
+
+            if failed_lines > 0:
+                logger.warning(f"[CTC] {failed_lines} lines failed to decode")
 
             all_decode_results = results
             decode_time = time.perf_counter() - decode_start
@@ -721,8 +806,20 @@ class AsyncOCRPipeline:
             # Emit results and write to parquet concurrently
             async def emit_results() -> None:
                 for result in results_to_write:
-                    await self.q_results.put(result)
-                await self.q_results.put(EndOfStream(stream="results", producer="run_sequential"))
+                    try:
+                        await asyncio.wait_for(self.q_results.put(result), timeout=60.0)
+                    except asyncio.TimeoutError:
+                        logger.error(f"[emit_results] Timeout putting result for {result.img_file_name}")
+                    except asyncio.CancelledError:
+                        logger.warning("[emit_results] Task cancelled")
+                        raise
+                try:
+                    await asyncio.wait_for(
+                        self.q_results.put(EndOfStream(stream="results", producer="run_sequential")),
+                        timeout=60.0,
+                    )
+                except (asyncio.TimeoutError, asyncio.CancelledError):
+                    logger.error("[emit_results] Failed to send EOS")
 
             # Create output writer stage for this run
             expected_filenames = [t.filename for t in tasks]

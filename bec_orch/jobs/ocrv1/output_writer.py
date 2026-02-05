@@ -22,12 +22,14 @@ def ocr_build_schema() -> pa.Schema:
 
     Schema design follows ldv1 conventions:
     - tps_points: list<list<float32>> for TPS transformation points
+      Format matches ldv1: [[in_y, in_x, out_y, out_x], ...] - one 4-float list per point
     - line_bboxes: list<struct<x:int16, y:int16, w:int16, h:int16>> for bounding boxes
     - line_texts: list<string> for per-line OCR text (more efficient than page_text + line_texts)
     - nb_lines: int32 count of lines (like ldv1's nb_contours)
     - Error fields: ok, error_stage, error_type, error_message (like ldv1)
     """
-    # TPS points: list of [input_points, output_points] where each is list of [x, y] pairs
+    # TPS points: list of [in_y, in_x, out_y, out_x] per point (matches ldv1 format)
+    # = list<list<float32>> where inner list has 4 floats
     tps_points_type = pa.list_(pa.list_(pa.float32()))
 
     # Bounding box struct (x, y, w, h) - use int16 like ldv1 for efficiency
@@ -113,14 +115,22 @@ class ParquetWriter:
                 "error_message": error_message,
             }
         else:
-            # Success record - parse TPS points to match ldv1 format
+            # Success record - serialize TPS points to match ldv1 format
             tps_points_list = None
             tps_alpha = None
             if result.tps_points:
                 # result.tps_points is ((input_pts, output_pts), alpha)
+                # input_pts and output_pts are lists of [x, y] pairs
                 (input_pts, output_pts), alpha = result.tps_points
-                # Convert to list of lists of floats
-                tps_points_list = [input_pts, output_pts]
+                # Convert to ldv1 format: [[in_y, in_x, out_y, out_x], ...]
+                # Note: ldv1 stores as [y, x] order, not [x, y]
+                tps_points_list = []
+                n = min(len(input_pts), len(output_pts))
+                for i in range(n):
+                    # input_pts[i] is [x, y], we need [y, x, y, x] format
+                    ix, iy = float(input_pts[i][0]), float(input_pts[i][1])
+                    ox, oy = float(output_pts[i][0]), float(output_pts[i][1])
+                    tps_points_list.append([iy, ix, oy, ox])
                 tps_alpha = float(alpha) if alpha is not None else None
 
             # Build line bboxes as list of dicts matching the struct schema

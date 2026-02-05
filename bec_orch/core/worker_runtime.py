@@ -97,6 +97,10 @@ class BECWorkerRuntime:
         # Empty poll tracking
         self._empty_polls: int = 0
 
+        # DB reconnection settings
+        self._max_db_retries: int = 3
+        self._db_retry_delay: float = 1.0  # seconds
+
         # Graceful shutdown flag
         self._shutdown_requested: bool = False
         self._processing_message: bool = False
@@ -229,8 +233,10 @@ class BECWorkerRuntime:
         """Mark worker stopped and close DB connection."""
         logger.info("Shutting down BECWorkerRuntime")
 
-        if self.worker_id and self.conn:
+        if self.worker_id:
             try:
+                # Try to mark worker stopped with reconnection if needed
+                self._ensure_connection()
                 self.db.mark_worker_stopped(self.conn, self.worker_id)
             except Exception as e:
                 logger.error(f"Failed to mark worker stopped: {e}")
@@ -339,10 +345,11 @@ class BECWorkerRuntime:
         manifest = self._get_volume_manifest(volume)
         logger.info(f"Loaded manifest: {len(manifest.manifest)} files, etag={manifest.s3_etag}")
 
-        # Ensure volume exists in DB
+        # Ensure volume exists in DB (with retry on connection errors)
         etag_bytes = etag_to_bytes(manifest.s3_etag)
-        volume_id = self.db.ensure_volume(
-            self.conn,
+        volume_id = self._execute_with_retry(
+            "ensure_volume",
+            self.db.ensure_volume,
             volume.w_id,
             volume.i_id,
             etag_bytes,
@@ -370,9 +377,14 @@ class BECWorkerRuntime:
                     self.sqs.delete(self.queue_url, msg.receipt_handle)
                 return
 
-        # Try to claim task execution in DB
-        task_execution_id, existing_status, existing_started_at = self.db.claim_task_execution(
-            self.conn, self.job_record.id, volume_id, etag_bytes, self.worker_id
+        # Try to claim task execution in DB (with retry on connection errors)
+        task_execution_id, existing_status, existing_started_at = self._execute_with_retry(
+            "claim_task_execution",
+            self.db.claim_task_execution,
+            self.job_record.id,
+            volume_id,
+            etag_bytes,
+            self.worker_id,
         )
 
         if task_execution_id is None:
@@ -387,9 +399,14 @@ class BECWorkerRuntime:
                     f"Forcefully claiming task and reprocessing. "
                     f"job_id={self.job_record.id}, volume_id={volume_id}"
                 )
-                # Use force claim which always succeeds
-                task_execution_id = self.db.force_claim_task_execution(
-                    self.conn, self.job_record.id, volume_id, etag_bytes, self.worker_id
+                # Use force claim which always succeeds (with retry on connection errors)
+                task_execution_id = self._execute_with_retry(
+                    "force_claim_task_execution",
+                    self.db.force_claim_task_execution,
+                    self.job_record.id,
+                    volume_id,
+                    etag_bytes,
+                    self.worker_id,
                 )
                 if task_execution_id is None:
                     # Should never happen with force claim, but handle gracefully
@@ -422,9 +439,14 @@ class BECWorkerRuntime:
                         f"Assuming previous worker crashed. Claiming stale task and proceeding. "
                         f"job_id={self.job_record.id}, volume_id={volume_id}"
                     )
-                    # Try to claim the stale task
-                    task_execution_id = self.db.claim_stale_task_execution(
-                        self.conn, self.job_record.id, volume_id, etag_bytes, self.worker_id
+                    # Try to claim the stale task (with retry on connection errors)
+                    task_execution_id = self._execute_with_retry(
+                        "claim_stale_task_execution",
+                        self.db.claim_stale_task_execution,
+                        self.job_record.id,
+                        volume_id,
+                        etag_bytes,
+                        self.worker_id,
                     )
                     if task_execution_id is None:
                         # Race condition: another worker claimed it first, skip
@@ -488,29 +510,17 @@ class BECWorkerRuntime:
             self._write_success_marker(artifacts_location, success_payload)
             logger.info("Wrote success marker")
 
-            # Update DB with retry logic for connection timeouts
-            max_retries = 3
-            for attempt in range(max_retries):
-                try:
-                    self.db.mark_task_done(
-                        self.conn,
-                        task_execution_id,
-                        result.total_images,
-                        result.nb_errors,
-                        result.total_duration_ms,
-                        result.avg_duration_per_page_ms,
-                    )
-                    logger.info("Updated DB with task completion")
-                    break
-                except psycopg.OperationalError as e:
-                    if "connection is closed" in str(e).lower() or "timeout" in str(e).lower():
-                        if attempt < max_retries - 1:
-                            logger.warning(f"DB connection lost, retrying... (attempt {attempt + 1}/{max_retries})")
-                            # Reconnect
-                            self.conn = self.db.connect()
-                            time.sleep(1)
-                            continue
-                    raise  # Re-raise if not a connection issue or max retries exceeded
+            # Update DB with retry logic for connection errors
+            self._execute_with_retry(
+                "mark_task_done",
+                self.db.mark_task_done,
+                task_execution_id,
+                result.total_images,
+                result.nb_errors,
+                result.total_duration_ms,
+                result.avg_duration_per_page_ms,
+            )
+            logger.info("Updated DB with task completion")
 
             # Delete SQS message (if not direct)
             if not is_direct and msg.receipt_handle:
@@ -529,8 +539,17 @@ class BECWorkerRuntime:
             retryable, reason = self._classify_exception(exc)
             logger.error(f"Task failed (retryable={retryable}): {reason}", exc_info=True)
 
-            # Update DB
-            self.db.mark_task_failed(self.conn, task_execution_id, retryable)
+            # Update DB (with retry on connection errors)
+            try:
+                self._execute_with_retry(
+                    "mark_task_failed",
+                    self.db.mark_task_failed,
+                    task_execution_id,
+                    retryable,
+                )
+            except Exception as db_err:
+                # Log but don't fail - the original exception is more important
+                logger.error(f"Failed to mark task as failed in DB: {db_err}")
 
             # If terminal error, delete message to avoid reprocessing (if not direct)
             if not retryable and not is_direct and msg.receipt_handle:
@@ -652,13 +671,95 @@ class BECWorkerRuntime:
         # Default: treat as retryable
         return True, f"{exc_type}: {exc}"
 
+    def _ensure_connection(self) -> None:
+        """
+        Ensure the database connection is alive, reconnecting if necessary.
+
+        This method checks if the connection is closed and attempts to reconnect.
+        Should be called before critical DB operations.
+        """
+        if self.conn is None or self.conn.closed:
+            logger.warning("Database connection is closed, attempting to reconnect...")
+            try:
+                self.conn = self.db.connect()
+                logger.info("Successfully reconnected to database")
+            except Exception as e:
+                logger.error(f"Failed to reconnect to database: {e}")
+                raise
+
+    def _execute_with_retry(self, operation_name: str, operation_func, *args, **kwargs):
+        """
+        Execute a database operation with automatic retry on connection errors.
+
+        Args:
+            operation_name: Human-readable name for logging
+            operation_func: The function to call (should be a DBClient method)
+            *args: Positional arguments for the function
+            **kwargs: Keyword arguments for the function
+
+        Returns:
+            The result of the operation
+
+        Raises:
+            The last exception if all retries fail
+        """
+        last_exception = None
+
+        for attempt in range(self._max_db_retries):
+            try:
+                # Ensure connection is alive before attempting operation
+                self._ensure_connection()
+                return operation_func(self.conn, *args, **kwargs)
+            except psycopg.OperationalError as e:
+                last_exception = e
+                error_msg = str(e).lower()
+                is_connection_error = (
+                    "connection is closed" in error_msg
+                    or "timeout" in error_msg
+                    or "connection refused" in error_msg
+                    or "could not connect" in error_msg
+                    or "server closed the connection" in error_msg
+                )
+
+                if is_connection_error and attempt < self._max_db_retries - 1:
+                    logger.warning(
+                        f"DB connection error during {operation_name} (attempt {attempt + 1}/{self._max_db_retries}): {e}"
+                    )
+                    # Force reconnection on next attempt
+                    try:
+                        if self.conn and not self.conn.closed:
+                            self.conn.close()
+                    except Exception:
+                        pass
+                    self.conn = None
+                    time.sleep(self._db_retry_delay * (attempt + 1))  # Exponential backoff
+                    continue
+                raise
+            except Exception as e:
+                # Non-connection errors are not retried
+                raise
+
+        # All retries exhausted
+        raise last_exception
+
     def _maybe_heartbeat(self) -> None:
         """Update heartbeat if enough time has passed."""
         now = time.time()
         if now - self._last_heartbeat >= self._heartbeat_interval:
             try:
+                self._ensure_connection()
                 self.db.heartbeat(self.conn, self.worker_id)
                 self._last_heartbeat = now
+            except psycopg.OperationalError as e:
+                # Connection errors during heartbeat - try to reconnect
+                logger.warning(f"Failed to update heartbeat (connection error): {e}")
+                try:
+                    if self.conn and not self.conn.closed:
+                        self.conn.close()
+                except Exception:
+                    pass
+                self.conn = None
+                # Will reconnect on next operation
             except Exception as e:
                 logger.warning(f"Failed to update heartbeat: {e}")
 

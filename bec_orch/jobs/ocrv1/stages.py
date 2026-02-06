@@ -408,6 +408,7 @@ class ImageProcessorStage:
                         return
 
                     if ld_row is None:
+                        logger.warning(f"[ImageProcessor] No LD data for {prefetched.filename}")
                         await asyncio.wait_for(
                             self.q_out.put(
                                 PipelineError(
@@ -568,7 +569,9 @@ class GPUInferenceStage:
                 line_logits_list = await asyncio.wait_for(
                     loop.run_in_executor(
                         None,
-                        lambda: self.ocr_model.predict(tensors, content_widths, left_pad_widths, self.ocr_model.input_width),
+                        lambda: self.ocr_model.predict(
+                            tensors, content_widths, left_pad_widths, self.ocr_model.input_width
+                        ),
                     ),
                     timeout=QUEUE_GET_TIMEOUT,  # Use same timeout for GPU ops
                 )
@@ -660,7 +663,7 @@ class GPUInferenceStage:
                             )
                             self.stats["inferred"] += 1
                         except asyncio.TimeoutError:
-                            logger.error(f"[GPUInference] Queue put timeout for remaining page")
+                            logger.error("[GPUInference] Queue put timeout for remaining page")
                             self.stats["errors"] += 1
 
                     break

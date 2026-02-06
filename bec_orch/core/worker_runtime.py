@@ -567,6 +567,7 @@ class BECWorkerRuntime:
         """
         prefix = get_s3_folder_prefix(volume.w_id, volume.i_id)
         manifest_key = f"{prefix}dimensions.json"
+        logger.debug(f"Fetching manifest from s3://{self.s3_source_bucket}/{manifest_key}")
 
         try:
             # Get object with metadata

@@ -4,19 +4,20 @@ import os
 import sys
 import time
 import warnings
-from typing import Any, Dict
+from typing import Any
 
 # CloudWatch-ready logs (to stdout/stderr, appended by systemd to /var/log/bec/worker.log)
 # cloudwatch config is in cloudwatch.json
-# start cloudwatch with 
+# start cloudwatch with
 # sudo amazon-cloudwatch-agent-ctl -a fetch-config -m ec2 -c file:/.../cloudwatch.json -s
 # everything is usually WARNING, except logging.getLogger("bec") (and sub loggers) which is INFO for CW
 # Log Group: /bec/workers
 # Log Stream: something like {worker_name}/bec-worker
 
+
 class JsonFormatter(logging.Formatter):
     def format(self, record: logging.LogRecord) -> str:
-        payload: Dict[str, Any] = {
+        payload: dict[str, Any] = {
             "ts": time.time(),
             "level": record.levelname,
             "logger": record.name,
@@ -25,10 +26,25 @@ class JsonFormatter(logging.Formatter):
 
         for k, v in record.__dict__.items():
             if k in (
-                "args", "msg", "levelname", "name", "pathname", "filename",
-                "module", "exc_info", "exc_text", "stack_info", "lineno",
-                "funcName", "created", "msecs", "relativeCreated", "thread",
-                "threadName", "processName", "process"
+                "args",
+                "msg",
+                "levelname",
+                "name",
+                "pathname",
+                "filename",
+                "module",
+                "exc_info",
+                "exc_text",
+                "stack_info",
+                "lineno",
+                "funcName",
+                "created",
+                "msecs",
+                "relativeCreated",
+                "thread",
+                "threadName",
+                "processName",
+                "process",
             ):
                 continue
             if k.startswith("_"):
@@ -40,10 +56,11 @@ class JsonFormatter(logging.Formatter):
 
         return json.dumps(payload, ensure_ascii=False)
 
+
 def setup_logging(verbose: bool = False) -> None:
     """
     Setup logging with JSON formatting for CloudWatch.
-    
+
     Args:
         verbose: If True, sets bec logger to DEBUG and root logger to INFO.
                  If False, uses environment variables or defaults (WARNING for root, INFO for bec).
@@ -72,14 +89,19 @@ def setup_logging(verbose: bool = False) -> None:
     app_logger = logging.getLogger("bec")
     app_logger.setLevel(app_level)
     app_logger.propagate = True  # still go to root handler
-    
+
+    # Also set bec_orch namespace (used by __name__ loggers in bec_orch modules)
+    bec_orch_logger = logging.getLogger("bec_orch")
+    bec_orch_logger.setLevel(app_level)
+    bec_orch_logger.propagate = True
+
     # Timing/performance logger - ERROR by default (suppresses slow decode/wait warnings)
     # Can be set to WARNING/INFO via BEC_TIMINGS_LOG_LEVEL env var if needed
     timings_level = os.environ.get("BEC_TIMINGS_LOG_LEVEL", "ERROR").upper()
     timings_logger = logging.getLogger("bec_timings")
     timings_logger.setLevel(timings_level)
     timings_logger.propagate = True  # still go to root handler
-    
+
     # Memory monitor logger - ERROR by default (suppresses periodic memory snapshots)
     # Can be set to INFO via BEC_MEMORY_LOG_LEVEL env var or --verbose flag for OOM debugging
     memory_level = os.environ.get("BEC_MEMORY_LOG_LEVEL", "ERROR").upper()
@@ -88,7 +110,7 @@ def setup_logging(verbose: bool = False) -> None:
     memory_logger = logging.getLogger("bec_memory")
     memory_logger.setLevel(memory_level)
     memory_logger.propagate = True  # still go to root handler
-    
+
     # Suppress third-party deprecation warnings we can't control
     # PyTorch's pynvml deprecation warning
     warnings.filterwarnings(

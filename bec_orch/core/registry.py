@@ -73,6 +73,21 @@ def _auto_register() -> None:
             f"Worker class may not exist in module."
         )
 
+    # Try to import and register hffv1 worker (HFF-Remover + Surya)
+    try:
+        from bec_orch.jobs.hffv1.worker import HFFv1JobWorker
+        register_job_worker("hffv1", HFFv1JobWorker)
+    except ImportError as e:
+        logger.warning(
+            f"Failed to auto-register hffv1 worker: {e}. "
+            f"Install hff-remover and surya-ocr to enable this worker."
+        )
+    except AttributeError as e:
+        logger.warning(
+            f"Failed to auto-register hffv1 worker: {e}. "
+            f"Worker class may not exist in module."
+        )
+
 
 # Run auto-registration on module import
 _auto_register()

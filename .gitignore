@@ -212,3 +212,5 @@ ocr_models/
 
 # Test
 test/
+
+.cursor/skills/bdrc-image-manifest/SKILL.md

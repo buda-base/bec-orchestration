@@ -214,3 +214,4 @@ ocr_models/
 test/
 
 .cursor/skills/bdrc-image-manifest/SKILL.md
+output/

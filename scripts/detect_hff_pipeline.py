@@ -308,8 +308,10 @@ class DetectStage:
                 dets = self._detector.detect(
                     item.bgr,
                     filter_to_hff_only=self.cfg.filter_to_hff_only,
+                    normalize_bbox=False,
                 )
-                dets = self._processor.merge_nearby_detections(dets)
+                print("dets>>>>>>>>>>>>>>>>>", dets)
+                # dets = self._processor.merge_nearby_detections(dets)
                 duration_ms = (time.perf_counter() - t0) * 1000
                 results.append(DetectionResult(
                     task=item.task,

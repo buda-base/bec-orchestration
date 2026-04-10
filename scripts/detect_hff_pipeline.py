@@ -36,17 +36,13 @@ Usage
     python scripts/detect_hff_pipeline.py \\
         --w-id W22084 --i-id I0886 --output-dir ./output --dry-run
 
-Output parquet schema (one row per image)
------------------------------------------
+Output schema (one row per image)
+----------------------------------
     w_id, i_id, filename
-    header_boxes    : JSON  [{bbox:[x1,y1,x2,y2], confidence:float}, ...]
+    header_boxes    : JSON  [[[x1,y1],[x2,y1],[x2,y2],[x1,y2]], ...]
     footer_boxes    : JSON
     footnote_boxes  : JSON
-    body_boxes      : JSON  (text-area detections)
-    n_header, n_footer, n_footnote, n_body   : int
-    has_header, has_footer, has_body         : bool
-    duration_ms     : float
-    error           : str   (empty on success)
+    body_boxes      : JSON  (text-area / text detections)
 """
 from __future__ import annotations
 
@@ -310,8 +306,7 @@ class DetectStage:
                     filter_to_hff_only=self.cfg.filter_to_hff_only,
                     normalize_bbox=False,
                 )
-                print("dets>>>>>>>>>>>>>>>>>", dets)
-                # dets = self._processor.merge_nearby_detections(dets)
+                #dets = self._processor.merge_nearby_detections(dets)
                 duration_ms = (time.perf_counter() - t0) * 1000
                 results.append(DetectionResult(
                     task=item.task,
@@ -341,22 +336,45 @@ class DetectStage:
 
 # ── Stage 3: ParquetWriterStage ───────────────────────────────────────────────
 
+def _normalise_bbox(bbox: Any) -> Any:
+    """Normalise bbox to a list of [x, y] corner points (polygon format).
+
+    Handles both legacy flat [x1, y1, x2, y2] and the new polygon
+    [[x1,y1], [x2,y1], [x2,y2], [x1,y2]] formats returned by the detector.
+    Values are rounded to 3 decimal places.
+    """
+    if not bbox:
+        return bbox
+    # Polygon format: list of [x, y] pairs
+    if isinstance(bbox[0], (list, tuple)):
+        return [[round(float(c), 3) for c in pt] for pt in bbox]
+    # Legacy flat format: [x1, y1, x2, y2]
+    return [round(float(v), 3) for v in bbox]
+
+
+# Maps detector class_name values → internal bucket key
+_CLASS_NAME_MAP: Dict[str, str] = {
+    "header":    "header",
+    "footer":    "footer",
+    "footnote":  "footnote",
+    "text-area": "body",
+    "text":      "body",
+}
+
+
 def _build_parquet_row(
     w_id: str,
     i_id: str,
     result: DetectionResult,
 ) -> Dict[str, Any]:
-    """Convert a DetectionResult into one parquet row with per-class JSON columns."""
-    by_class: Dict[str, List[Dict[str, Any]]] = {
-        "header": [], "footer": [], "footnote": [], "text-area": [],
+    """Convert a DetectionResult into one row with per-class bbox-only JSON columns."""
+    by_class: Dict[str, List[Any]] = {
+        "header": [], "footer": [], "footnote": [], "body": [],
     }
     for d in result.detections:
-        cn = d.get("class_name", "")
-        if cn in by_class:
-            by_class[cn].append({
-                "bbox": [round(v, 1) for v in d["bbox"]],
-                "confidence": round(float(d.get("confidence", 1.0)), 4),
-            })
+        bucket = _CLASS_NAME_MAP.get(d.get("class_name", ""))
+        if bucket is not None:
+            by_class[bucket].append(_normalise_bbox(d["bbox"]))
 
     return {
         "w_id":           w_id,
@@ -365,16 +383,7 @@ def _build_parquet_row(
         "header_boxes":   json.dumps(by_class["header"]),
         "footer_boxes":   json.dumps(by_class["footer"]),
         "footnote_boxes": json.dumps(by_class["footnote"]),
-        "body_boxes":     json.dumps(by_class["text-area"]),
-        "n_header":       len(by_class["header"]),
-        "n_footer":       len(by_class["footer"]),
-        "n_footnote":     len(by_class["footnote"]),
-        "n_body":         len(by_class["text-area"]),
-        "has_header":     len(by_class["header"]) > 0,
-        "has_footer":     len(by_class["footer"]) > 0,
-        "has_body":       len(by_class["text-area"]) > 0,
-        "duration_ms":    result.duration_ms,
-        "error":          result.error,
+        "body_boxes":     json.dumps(by_class["body"]),
     }
 
 

@@ -1,12 +1,11 @@
-"""HFFv1 job worker — fetch images from S3, remove headers/footers/footnotes
-using the Surya layout model, and write masked images back to S3.
+"""HFFv1 job worker — fetch images from S3 and detect header/footer/footnote
+regions using the Surya layout model.
 
 Job name: ``hffv1``
 
 Environment variables
 ---------------------
 BEC_REGION          AWS region (default: us-east-1)
-BEC_DEST_S3_BUCKET  Destination bucket (overridden by ``ctx.artifacts_location``)
 """
 from __future__ import annotations
 
@@ -16,7 +15,6 @@ import os
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import urlparse
 
 import boto3
 import numpy as np
@@ -41,18 +39,6 @@ def _bytes_to_bgr(raw: bytes) -> np.ndarray:
     return np.array(pil)[:, :, ::-1]
 
 
-def _bgr_to_bytes(bgr: np.ndarray, fmt: str = "JPEG", quality: int = 95) -> bytes:
-    """Encode a BGR numpy array → image bytes."""
-    rgb = bgr[:, :, ::-1]
-    buf = io.BytesIO()
-    pil = Image.fromarray(rgb)
-    save_kwargs: Dict[str, Any] = {}
-    if fmt.upper() == "JPEG":
-        save_kwargs["quality"] = quality
-    pil.save(buf, format=fmt, **save_kwargs)
-    return buf.getvalue()
-
-
 def _s3_key_from_uri(uri: str) -> Tuple[str, str]:
     """Parse ``s3://bucket/key`` → ``(bucket, key)``."""
     parsed = urlparse(uri)
@@ -72,56 +58,20 @@ def _get_s3_folder_prefix(w_id: str, i_id: str) -> str:
         return f"Works/{w_id[:2]}/{w_id}/{i_id}/"
 
 
-def _mask_hff_regions(
-    bgr: np.ndarray,
-    detections: List[Dict[str, Any]],
-    margin: int = 0,
-) -> np.ndarray:
-    """White-out detected HFF regions in a BGR image.
-
-    Each bounding box ``[x1, y1, x2, y2]`` in *detections* is filled with
-    pure white (255) in a copy of the image.  An optional *margin* (pixels)
-    expands every box before masking.
-
-    Args:
-        bgr: Source image as a BGR numpy array.
-        detections: List of detection dicts from ``SuryaLayoutDetector.detect``
-            (each must contain a ``"bbox"`` key with ``[x1, y1, x2, y2]``).
-        margin: Extra pixels to add around each box before masking.
-
-    Returns:
-        A new BGR array with HFF regions filled white.
-    """
-    result = bgr.copy()
-    h, w = result.shape[:2]
-    for det in detections:
-        x1, y1, x2, y2 = map(int, det["bbox"])
-        x1 = max(0, x1 - margin)
-        y1 = max(0, y1 - margin)
-        x2 = min(w, x2 + margin)
-        y2 = min(h, y2 + margin)
-        result[y1:y2, x1:x2] = 255
-    return result
-
-
 # ──────────────────────────────────────────────────────────────────────────────
 # Core processing
 # ──────────────────────────────────────────────────────────────────────────────
 
 class _ImageProcessor:
-    """Holds shared, reusable objects (S3 client, Surya detector, HFF processor)."""
+    """Holds shared, reusable objects (S3 client and Surya detector)."""
 
     def __init__(self, cfg: HFFConfig) -> None:
         from hff_remover.detector import SuryaLayoutDetector
-        from hff_remover.processor import HFFProcessor
 
         logger.info("Loading Surya layout model …")
         self.detector = SuryaLayoutDetector(
             confidence_threshold=cfg.confidence_threshold,
         )
-        # HFFProcessor is used only for merge_nearby_detections; masking is
-        # handled by _mask_hff_regions which fills detected boxes with white.
-        self.merger = HFFProcessor(margin=cfg.margin)
         logger.info("Surya layout model loaded.")
 
         boto_cfg = BotoConfig(
@@ -139,10 +89,8 @@ class _ImageProcessor:
         self,
         source_bucket: str,
         source_key: str,
-        dest_bucket: str,
-        dest_key: str,
     ) -> Dict[str, Any]:
-        """Fetch one image, mask HFF regions, upload result.
+        """Fetch one image, run HFF detection, and return results.
 
         Returns a dict with ``filename``, ``detections``, ``duration_ms``,
         and ``error`` (None on success).
@@ -160,31 +108,6 @@ class _ImageProcessor:
             dets = self.detector.detect(
                 bgr,
                 filter_to_hff_only=self.cfg.filter_to_hff_only,
-            )
-            dets = self.merger.merge_nearby_detections(dets)
-
-            # ── mask (white-out HFF regions) ───────────────────────────────
-            if dets:
-                result_bgr = _mask_hff_regions(bgr, dets, margin=self.cfg.margin)
-            else:
-                result_bgr = bgr
-
-            # ── upload ─────────────────────────────────────────────────────
-            out_bytes = _bgr_to_bytes(
-                result_bgr,
-                fmt=self.cfg.output_format,
-                quality=self.cfg.output_quality,
-            )
-            content_type = (
-                "image/jpeg"
-                if self.cfg.output_format.upper() == "JPEG"
-                else "image/png"
-            )
-            self.s3.put_object(
-                Bucket=dest_bucket,
-                Key=dest_key,
-                Body=out_bytes,
-                ContentType=content_type,
             )
 
             duration_ms = (time.time() - t0) * 1000
@@ -220,7 +143,7 @@ class _ImageProcessor:
 # ──────────────────────────────────────────────────────────────────────────────
 
 class HFFv1JobWorker:
-    """BEC orchestration job worker for HFF removal using Surya.
+    """BEC orchestration job worker for HFF detection using Surya.
 
     The Surya model is loaded **once** in ``__init__`` and reused across every
     volume assigned to this worker process, matching the same pattern as
@@ -258,27 +181,23 @@ class HFFv1JobWorker:
         self,
         ctx: JobContext,
         cfg: HFFConfig,
-    ) -> List[Tuple[str, str, str, str]]:
-        """Build ``[(source_bucket, source_key, dest_bucket, dest_key), ...]``."""
+    ) -> List[Tuple[str, str]]:
+        """Build ``[(source_bucket, source_key), ...]``."""
         vol_prefix = _get_s3_folder_prefix(ctx.volume.w_id, ctx.volume.i_id)
-        dest_prefix = ctx.artifacts_location.prefix.rstrip("/")
 
-        items: List[Tuple[str, str, str, str]] = []
+        items: List[Tuple[str, str]] = []
         for item in ctx.volume_manifest.manifest:
             filename = item.get("filename")
             if not filename:
                 continue
             source_key = f"{vol_prefix}{filename}"
-            dest_key = f"{dest_prefix}/{filename}"
-            items.append(
-                (cfg.s3_source_bucket, source_key, ctx.artifacts_location.bucket, dest_key)
-            )
+            items.append((cfg.s3_source_bucket, source_key))
         return items
 
     # ── JobWorker protocol ────────────────────────────────────────────────────
 
     def run(self, ctx: JobContext) -> TaskResult:
-        """Process one volume: detect + mask HFF in every image, write to S3."""
+        """Process one volume: detect HFF regions in every image."""
         logger.info(
             "[HFFv1] Starting volume %s/%s (%d images)",
             ctx.volume.w_id,
@@ -308,10 +227,10 @@ class HFFv1JobWorker:
             max_workers=cfg.s3_concurrency, thread_name_prefix="hffv1"
         ) as pool:
             futures = {
-                pool.submit(proc.process_image, src_b, src_k, dst_b, dst_k): (
+                pool.submit(proc.process_image, src_b, src_k): (
                     src_k.split("/")[-1]
                 )
-                for src_b, src_k, dst_b, dst_k in image_list
+                for src_b, src_k in image_list
             }
             for future in as_completed(futures):
                 try:

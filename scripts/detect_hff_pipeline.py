@@ -70,7 +70,8 @@ from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
 import numpy as np
-from PIL import Image
+
+from bec_orch.jobs.shared.decoder import bytes_to_frame
 
 logger = logging.getLogger(__name__)
 
@@ -113,7 +114,7 @@ _END_OF_STREAM = _EOS()
 @dataclass
 class DecodedImage:
     task: Any           # ImageTask
-    bgr: np.ndarray     # H × W × 3, uint8 BGR
+    bgr: np.ndarray     # H × W, uint8 grayscale (pre-sized to ≤1024×1024 for Surya)
 
 
 @dataclass
@@ -168,7 +169,11 @@ def _load_manifest(s3_client, bucket: str, prefix: str) -> List[str]:
 # ── Stage 1: DecodeStage ──────────────────────────────────────────────────────
 
 class DecodeStage:
-    """Reads FetchedBytes from q_in, decodes bytes → BGR numpy, pushes to q_out.
+    """Reads FetchedBytes from q_in, decodes bytes → grayscale numpy, pushes to q_out.
+
+    Uses bytes_to_frame() from the shared decoder for robust VIPS → OpenCV → PIL
+    fallback handling of all BDRC image types (JPEG, TIFF Group4, bilevel, etc.).
+    Images are pre-sized to ≤1024×1024 px so Surya's internal scale_to_fit is a no-op.
 
     Prefetch errors (PipelineError) are forwarded as DetectionResult(error=…)
     so the ParquetWriterStage still records one row per image.
@@ -181,9 +186,17 @@ class DecodeStage:
         self._errors = 0
 
     @staticmethod
-    def _decode_bytes(file_bytes: bytes) -> np.ndarray:
-        pil = Image.open(io.BytesIO(file_bytes)).convert("RGB")
-        return np.array(pil)[:, :, ::-1]   # RGB → BGR (OpenCV / HFF convention)
+    def _decode_bytes(filename: str, file_bytes: bytes) -> np.ndarray:
+        frame, _, _, _ = bytes_to_frame(
+            filename,
+            file_bytes,
+            max_width=1024,
+            max_height=1024,
+            patch_size=1024,
+            max_patch_rows=1,
+            linearize=False,
+        )
+        return frame
 
     async def run(self) -> None:
         from bec_orch.jobs.ldv1.types_common import EndOfStream, FetchedBytes, PipelineError
@@ -207,7 +220,7 @@ class DecodeStage:
 
             assert isinstance(msg, FetchedBytes)
             try:
-                bgr = await asyncio.to_thread(self._decode_bytes, msg.file_bytes)
+                bgr = await asyncio.to_thread(self._decode_bytes, msg.task.img_filename, msg.file_bytes)
                 self._decoded += 1
                 await self.q_out.put(DecodedImage(task=msg.task, bgr=bgr))
             except Exception as exc:

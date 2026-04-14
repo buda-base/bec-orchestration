@@ -376,8 +376,6 @@ _CLASS_NAME_MAP: Dict[str, str] = {
 
 
 def _build_parquet_row(
-    w_id: str,
-    i_id: str,
     result: DetectionResult,
 ) -> Dict[str, Any]:
     """Convert a DetectionResult into one row with per-class bbox-only JSON columns."""
@@ -390,8 +388,6 @@ def _build_parquet_row(
             by_class[bucket].append(_normalise_bbox(d["bbox"]))
 
     return {
-        "w_id":           w_id,
-        "i_id":           i_id,
         "filename":       result.task.img_filename,
         "header_boxes":   json.dumps(by_class["header"]),
         "footer_boxes":   json.dumps(by_class["footer"]),
@@ -462,7 +458,7 @@ class ParquetWriterStage:
                     return self._count
 
                 assert isinstance(msg, DetectionResult)
-                row = _build_parquet_row(self.w_id, self.i_id, msg)
+                row = _build_parquet_row(msg)
                 self._count += 1
 
                 # Append to JSONL immediately so each image is durable on disk

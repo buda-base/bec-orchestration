@@ -39,11 +39,6 @@ def _bytes_to_bgr(raw: bytes) -> np.ndarray:
     return np.array(pil)[:, :, ::-1]
 
 
-def _s3_key_from_uri(uri: str) -> Tuple[str, str]:
-    """Parse ``s3://bucket/key`` → ``(bucket, key)``."""
-    parsed = urlparse(uri)
-    return parsed.netloc, parsed.path.lstrip("/")
-
 
 def _get_s3_folder_prefix(w_id: str, i_id: str) -> str:
     """Return the S3 key prefix for a BDRC volume's images.

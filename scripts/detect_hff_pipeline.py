@@ -8,14 +8,27 @@ are persisted — roughly 3 GB total across 18,000 volumes.
 
 Architecture
 ------------
-    S3Prefetcher  →  DecodeStage  →  DetectStage  →  ParquetWriterStage
-    (S3 bytes)       (bytes→BGR)     (Surya GPU)      (bbox rows → parquet)
+    S3Prefetcher  →  DecodeStage       →  DetectStage  →  ParquetWriterStage
+    (S3 bytes)       (bytes→grayscale)    (Surya GPU)      (rows in memory
+                      via bytes_to_frame,                    → parquet at EOS)
+                      pre-sized ≤1024×1024
+                      for Surya)
 
     Bounded queues between every stage enforce backpressure so a slow
     DetectStage never causes the prefetcher to consume unbounded RAM.
 
     The Surya model is loaded ONCE before the volume loop and reused
     across all volumes (avoids the ~30 s reload cost per volume).
+
+    DecodeStage uses bytes_to_frame() (VIPS → OpenCV → PIL fallback chain)
+    for robust handling of all BDRC image types (JPEG, TIFF Group4, bilevel).
+    Images are pre-sized to ≤1024×1024 px so Surya's internal scale_to_fit
+    is a no-op, avoiding a double-resize pass.
+
+    ParquetWriterStage accumulates rows in memory and writes a single
+    detections.parquet at the end of each volume (atomic tmp→rename).
+    No intermediate JSONL is written.  If the pipeline crashes mid-volume
+    no partial file is left behind; the volume must be rerun.
 
 Usage
 -----
@@ -38,11 +51,15 @@ Usage
 
 Output schema (one row per image)
 ----------------------------------
-    w_id, i_id, filename
+    filename
     header_boxes    : JSON  [[[x1,y1],[x2,y1],[x2,y2],[x1,y2]], ...]
     footer_boxes    : JSON
     footnote_boxes  : JSON
     body_boxes      : JSON  (text-area / text detections)
+
+    w_id and i_id are NOT stored in the parquet — they are encoded in the
+    output path: <output-dir>/<w_id>/<i_id>/detections.parquet
+    Bbox coordinates are in the pre-resized image space (≤1024×1024 px).
 """
 from __future__ import annotations
 
@@ -397,17 +414,12 @@ def _build_parquet_row(
 
 
 class ParquetWriterStage:
-    """Writes one JSONL row per detected image (durable after every image),
-    then converts to parquet when the volume finishes.
+    """Accumulates detection rows in memory and writes detections.parquet at EOS.
 
     Local output per volume:
-        detections.jsonl    — appended after every image (crash-safe, readable live)
-        detections.parquet  — written once at end of volume (complete, compact)
+        detections.parquet  — written once at end of volume (atomic rename)
 
     S3 output: parquet uploaded once at end of volume.
-
-    The JSONL file is kept alongside the parquet so partial results are
-    available immediately even if the volume crashes mid-way.
     """
 
     def __init__(
@@ -425,8 +437,7 @@ class ParquetWriterStage:
         self.output_s3_prefix = output_s3_prefix
         self.s3_client = s3_client
         self.q_in = q_in
-        self._count = 0
-        self._jsonl_fh: Optional[Any] = None   # file handle for incremental writes
+        self._rows: List[Dict[str, Any]] = []
 
     def _vol_dir(self) -> Path:
         """Return (and create) the per-volume output directory."""
@@ -435,82 +446,42 @@ class ParquetWriterStage:
         return d
 
     async def run(self) -> int:
-        """Drain q_in, append JSONL after every image, write parquet at EOS."""
+        """Drain q_in, accumulate rows in memory, write parquet at EOS."""
+        while True:
+            msg = await self.q_in.get()
 
-        # Open JSONL file if writing locally
-        if self.output_dir is not None:
-            vol_dir = await asyncio.to_thread(self._vol_dir)
-            jsonl_path = vol_dir / "detections.jsonl"
-            self._jsonl_fh = open(jsonl_path, "a", encoding="utf-8")  # noqa: SIM115
+            if isinstance(msg, _EOS):
+                await asyncio.to_thread(self._finalise)
+                count = len(self._rows)
+                logger.info(
+                    f"[Writer] Done — {count} rows for {self.w_id}/{self.i_id}"
+                )
+                return count
 
-        try:
-            while True:
-                msg = await self.q_in.get()
+            assert isinstance(msg, DetectionResult)
+            self._rows.append(_build_parquet_row(msg))
 
-                if isinstance(msg, _EOS):
-                    if self._jsonl_fh:
-                        self._jsonl_fh.close()
-                        self._jsonl_fh = None
-                    await asyncio.to_thread(self._finalise)
-                    logger.info(
-                        f"[Writer] Done — {self._count} rows for {self.w_id}/{self.i_id}"
-                    )
-                    return self._count
-
-                assert isinstance(msg, DetectionResult)
-                row = _build_parquet_row(msg)
-                self._count += 1
-
-                # Append to JSONL immediately so each image is durable on disk
-                if self._jsonl_fh is not None:
-                    await asyncio.to_thread(self._append_jsonl, row)
-
-                if self._count % 100 == 0:
-                    logger.info(f"[Writer] {self._count} images written")
-
-        except Exception:
-            if self._jsonl_fh:
-                self._jsonl_fh.close()
-                self._jsonl_fh = None
-            raise
-
-    def _append_jsonl(self, row: Dict[str, Any]) -> None:
-        """Append one JSON line and flush to the OS buffer immediately."""
-        self._jsonl_fh.write(json.dumps(row) + "\n")
-        self._jsonl_fh.flush()
+            if len(self._rows) % 100 == 0:
+                logger.info(f"[Writer] {len(self._rows)} images buffered")
 
     def _finalise(self) -> None:
-        """Read detections.jsonl → write detections.parquet → upload to S3."""
+        """Write rows → detections.parquet (local and/or S3)."""
         import pandas as pd
 
-        rows: List[Dict[str, Any]] = []
+        if not self._rows:
+            return
 
-        # Read rows back from JSONL (handles partial volumes on resume too)
+        df = pd.DataFrame(self._rows)
+
         if self.output_dir is not None:
             vol_dir = self._vol_dir()
-            jsonl_path = vol_dir / "detections.jsonl"
-
-            if jsonl_path.exists():
-                with open(jsonl_path, encoding="utf-8") as f:
-                    for line in f:
-                        line = line.strip()
-                        if line:
-                            rows.append(json.loads(line))
-
-            if rows:
-                df = pd.DataFrame(rows)
-                out_path = vol_dir / "detections.parquet"
-                tmp_path = out_path.with_suffix(".tmp.parquet")
-                df.to_parquet(tmp_path, index=False)
-                tmp_path.rename(out_path)
-                logger.info(f"[Writer] → {out_path} ({len(df)} rows)")
+            out_path = vol_dir / "detections.parquet"
+            tmp_path = out_path.with_suffix(".tmp.parquet")
+            df.to_parquet(tmp_path, index=False)
+            tmp_path.rename(out_path)
+            logger.info(f"[Writer] → {out_path} ({len(df)} rows)")
 
         if self.output_s3_prefix and self.s3_client:
-            # If we didn't already load rows from local JSONL, they came from memory
-            if not rows:
-                logger.warning(f"[Writer] No rows to upload to S3 for {self.w_id}/{self.i_id}")
-                return
-            df = pd.DataFrame(rows)
             buf = io.BytesIO()
             df.to_parquet(buf, index=False)
             parsed = urlparse(self.output_s3_prefix.rstrip("/"))

@@ -9,7 +9,7 @@ Streams BDRC volume images from S3, detects **header / footer / footnote / body*
 1. Reads a `dimensions.json` manifest from S3 to get the ordered list of images in a volume.
 2. Downloads images concurrently from S3 (no images are saved to disk).
 3. Runs the Surya layout detector on each image (GPU-accelerated, in batches).
-4. Writes one `detections.jsonl` row per image immediately (crash-safe), then a `detections.parquet` at the end of each volume.
+4. Accumulates detection rows in memory and writes a single `detections.parquet` at the end of each volume.
 
 The model is loaded **once** before the volume loop, even when processing thousands of volumes in batch.
 
@@ -19,8 +19,6 @@ The model is loaded **once** before the volume loop, even when processing thousa
 
 | field | type | description |
 |---|---|---|
-| `w_id` | string | Work ID |
-| `i_id` | string | Image group ID |
 | `filename` | string | Image filename |
 | `header_boxes` | JSON | List of polygon bboxes `[[[x,y], …], …]` |
 | `footer_boxes` | JSON | Same format |
@@ -28,8 +26,12 @@ The model is loaded **once** before the volume loop, even when processing thousa
 | `body_boxes` | JSON | Same format |
 
 Each bbox is four `[x, y]` corner points (top-left → top-right → bottom-right → bottom-left).
+An image with no detections in a class gets `[]` for that column.
 
-Files are written to `<output-dir>/<w_id>/<i_id>/detections.jsonl` and `detections.parquet`.
+`w_id` and `i_id` are not stored in the parquet — they are encoded in the output path.
+
+The file is written to `<output-dir>/<w_id>/<i_id>/detections.parquet` once all images in the volume have been processed.
+If the pipeline crashes mid-volume no partial file is left behind; the volume must be rerun.
 
 ---
 

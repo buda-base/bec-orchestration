@@ -9,7 +9,6 @@ BEC_REGION          AWS region (default: us-east-1)
 """
 from __future__ import annotations
 
-import io
 import logging
 import os
 import time
@@ -19,12 +18,12 @@ from typing import Any, Dict, List, Optional, Tuple
 import boto3
 import numpy as np
 from botocore.config import Config as BotoConfig
-from PIL import Image
 
 from bec_orch.core.models import TaskResult
 from bec_orch.errors import RetryableTaskError, TerminalTaskError
 from bec_orch.jobs.base import JobContext
 from bec_orch.jobs.hffv1.config import HFFConfig
+from bec_orch.jobs.shared.decoder import bytes_to_frame
 
 logger = logging.getLogger(__name__)
 
@@ -32,13 +31,6 @@ logger = logging.getLogger(__name__)
 # ──────────────────────────────────────────────────────────────────────────────
 # Helpers
 # ──────────────────────────────────────────────────────────────────────────────
-
-def _bytes_to_bgr(raw: bytes) -> np.ndarray:
-    """Decode raw image bytes → BGR numpy array (OpenCV / HFF convention)."""
-    pil = Image.open(io.BytesIO(raw)).convert("RGB")
-    return np.array(pil)[:, :, ::-1]
-
-
 
 def _get_s3_folder_prefix(w_id: str, i_id: str) -> str:
     """Return the S3 key prefix for a BDRC volume's images.
@@ -99,9 +91,17 @@ class _ImageProcessor:
             ].read()
 
             # ── detect ─────────────────────────────────────────────────────
-            bgr = _bytes_to_bgr(body)
+            frame, _, _, _ = bytes_to_frame(
+                filename,
+                body,
+                max_width=1024,
+                max_height=1024,
+                patch_size=1024,
+                max_patch_rows=1,
+                linearize=False,
+            )
             dets = self.detector.detect(
-                bgr,
+                frame,
                 filter_to_hff_only=self.cfg.filter_to_hff_only,
             )
 

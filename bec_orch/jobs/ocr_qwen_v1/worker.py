@@ -2,16 +2,25 @@
 
 Design (see ``scratch/findings.md``):
 
-    1. ThreadPool fetches all volume images from S3 and decodes them to RGB
-       (parallel, ~110 pages/s on a 32-thread pool, way faster than the GPU).
-    2. A single synchronous ``LLM.chat(list[...])`` runs all decoded pages in
-       one go — the engine packs the prefill optimally and beats the async
-       streaming pattern by ~15 %.
-    3. Results stream into a parquet writer.
+    1. The volume manifest is walked in fixed-size batches of
+       ``OCRQwenV1Config.ocr_batch_size`` pages. For each batch:
+         a. A ThreadPool fetches that batch from S3 and decodes to RGB
+            (parallel, ~110 pages/s on a 32-thread pool — way faster than
+            the GPU).
+         b. A single synchronous ``LLM.chat(batch)`` runs the decoded pages.
+            vLLM still batches internally per step, so throughput is the
+            same as one giant call would be, but the resident set is
+            bounded by ``ocr_batch_size`` decoded images at a time
+            (~10 MB each at 4 MP RGB) instead of an entire volume's worth.
+         c. Results stream into the parquet writer and the decoded image
+            buffers are dropped immediately.
+    2. The vLLM ``LLM`` is owned by the JobWorker instance and reused
+       across all volumes (model load: ~46 s warm). Caches are reset
+       between volumes per ``OCRQwenV1Config.reset_caches_between_volumes``.
 
-The vLLM ``LLM`` is owned by the JobWorker instance and reused across all
-volumes the worker processes (model load: ~46 s warm). Caches are reset
-between volumes per ``OCRQwenV1Config.reset_caches_between_volumes``.
+The previous implementation decoded the WHOLE volume up-front and called
+``LLM.chat`` once. That OOMs a 16 GB box on any pecha bigger than a few
+hundred pages (decoded RGB pile-up + vLLM RSS > 16 GB).
 """
 
 from __future__ import annotations
@@ -159,39 +168,15 @@ class OCRQwenV1JobWorker:
         cfg = self.cfg
         vol = ctx.volume
         n_expected = len(manifest)
+        batch_size = max(1, cfg.ocr_batch_size)
+        n_batches = (n_expected + batch_size - 1) // batch_size
 
-        # 1) Fetch + decode in parallel. Import lazily so the package can be
-        # introspected without the psycopg/DB stack.
+        # Import lazily so the package can be introspected without the
+        # psycopg/DB stack.
         from bec_orch.core.worker_runtime import get_s3_folder_prefix
 
         vol_prefix = get_s3_folder_prefix(vol.w_id, vol.i_id)
-        t_fetch = time.time()
-        fetched, failed = self._fetch_and_decode(vol_prefix, manifest)
-        fetch_dur = time.time() - t_fetch
-        logger.info(
-            f"[ocr_qwen_v1] {vol.w_id}/{vol.i_id}: fetch+decode "
-            f"{len(fetched)} ok / {len(failed)} failed in {fetch_dur:.1f}s "
-            f"({len(fetched) / max(fetch_dur, 1e-6):.1f} p/s)"
-        )
 
-        if not fetched:
-            # All pages failed before reaching the GPU — definitely terminal.
-            raise TerminalTaskError(
-                f"all {n_expected} pages failed before OCR for {vol.w_id}/{vol.i_id}"
-            )
-
-        # 2) Single big LLM.chat call. The engine handles concurrency and
-        # KV-cache scheduling internally. ``use_tqdm=False`` keeps logs clean.
-        t_ocr = time.time()
-        outputs = self._ocr_batch(fetched)
-        ocr_dur = time.time() - t_ocr
-        logger.info(
-            f"[ocr_qwen_v1] {vol.w_id}/{vol.i_id}: OCR done in {ocr_dur:.1f}s "
-            f"({len(fetched) / max(ocr_dur, 1e-6):.2f} p/s)"
-        )
-
-        # 3) Stream rows to parquet (success + failure rows go into the same
-        # parquet file; failure detail also lands in the optional jsonl).
         parquet_uri, errors_uri = self._artifact_uris(ctx)
         writer = StreamingOCRQwenV1Writer(
             parquet_uri=parquet_uri,
@@ -201,65 +186,116 @@ class OCRQwenV1JobWorker:
             compression=cfg.parquet_compression,
         )
 
+        n_ocr_done = 0
         ocr_failures = 0
         ocr_truncated = 0
-        per_page_durations_ms: list[float] = []
+        errors_by_stage: dict[str, int] = {}
+        t_fetch_total = 0.0
+        t_ocr_total = 0.0
 
         try:
-            for page, out in zip(fetched, outputs, strict=True):
-                if not out.outputs:
+            for batch_idx in range(n_batches):
+                start = batch_idx * batch_size
+                stop = min(start + batch_size, n_expected)
+                chunk_manifest = manifest[start:stop]
+
+                t_fetch = time.time()
+                fetched, failed = self._fetch_and_decode(vol_prefix, chunk_manifest)
+                t_fetch_total += time.time() - t_fetch
+
+                # Record fetch/decode failures up-front; they don't go to the
+                # GPU but they still count toward the failure rate.
+                for f in failed:
                     writer.write_error(
+                        filename=f.filename,
+                        source_etag=f.etag,
+                        stage=f.stage,
+                        error_message=f.error,
+                    )
+                    errors_by_stage[f.stage] = errors_by_stage.get(f.stage, 0) + 1
+
+                if not fetched:
+                    logger.warning(
+                        f"[ocr_qwen_v1] {vol.w_id}/{vol.i_id}: batch "
+                        f"{batch_idx + 1}/{n_batches} ({start}:{stop}) — "
+                        f"all {len(chunk_manifest)} pages failed before OCR"
+                    )
+                    continue
+
+                t_ocr = time.time()
+                outputs = self._ocr_batch(fetched)
+                t_ocr_total += time.time() - t_ocr
+
+                for page, out in zip(fetched, outputs, strict=True):
+                    if not out.outputs:
+                        writer.write_error(
+                            filename=page.filename,
+                            source_etag=page.etag,
+                            stage="ocr",
+                            error_message="empty vLLM output",
+                        )
+                        ocr_failures += 1
+                        errors_by_stage["ocr"] = errors_by_stage.get("ocr", 0) + 1
+                        continue
+                    gen = out.outputs[0]
+                    finish_reason = gen.finish_reason or ""
+                    truncated = finish_reason == "length"
+                    writer.write_success(
                         filename=page.filename,
                         source_etag=page.etag,
-                        stage="ocr",
-                        error_message="empty vLLM output",
+                        page_text=gen.text or "",
+                        output_tokens=len(gen.token_ids),
+                        finish_reason=finish_reason,
+                        truncated=truncated,
                     )
-                    ocr_failures += 1
-                    continue
-                gen = out.outputs[0]
-                finish_reason = gen.finish_reason or ""
-                truncated = finish_reason == "length"
-                writer.write_success(
-                    filename=page.filename,
-                    source_etag=page.etag,
-                    page_text=gen.text or "",
-                    output_tokens=len(gen.token_ids),
-                    finish_reason=finish_reason,
-                    truncated=truncated,
-                )
-                if truncated:
-                    ocr_truncated += 1
+                    if truncated:
+                        ocr_truncated += 1
 
-            for f in failed:
-                writer.write_error(
-                    filename=f.filename,
-                    source_etag=f.etag,
-                    stage=f.stage,
-                    error_message=f.error,
+                n_ocr_done += len(fetched)
+
+                # Eagerly drop the decoded image buffers — this is the whole
+                # point of batching. Without this we'd just be paying the
+                # batching overhead with no memory win.
+                for p in fetched:
+                    try:
+                        p.image.close()
+                    except Exception:  # noqa: BLE001 — PIL close is best-effort
+                        pass
+                del fetched, outputs
+                gc.collect()
+
+                logger.info(
+                    f"[ocr_qwen_v1] {vol.w_id}/{vol.i_id}: batch "
+                    f"{batch_idx + 1}/{n_batches} done "
+                    f"(ocr {n_ocr_done}/{n_expected}, "
+                    f"cum_fetch={t_fetch_total:.1f}s, cum_ocr={t_ocr_total:.1f}s)"
+                )
+
+            if n_ocr_done == 0:
+                # Every single page failed before reaching the GPU — terminal.
+                raise TerminalTaskError(
+                    f"all {n_expected} pages failed before OCR for {vol.w_id}/{vol.i_id}"
                 )
         finally:
             writer.close()
 
         elapsed_ms = (time.time() - t_start) * 1000
-        per_page_durations_ms = [elapsed_ms / n_expected] * n_expected  # best-effort
 
-        n_errors = ocr_failures + len(failed)
+        n_fetch_decode_errors = sum(
+            v for k, v in errors_by_stage.items() if k in ("fetch", "decode")
+        )
+        n_errors = n_fetch_decode_errors + ocr_failures
         if cfg.treat_truncation_as_failure:
             n_errors += ocr_truncated
-
-        errors_by_stage: dict[str, int] = {}
-        for f in failed:
-            errors_by_stage[f.stage] = errors_by_stage.get(f.stage, 0) + 1
-        if ocr_failures:
-            errors_by_stage["ocr"] = errors_by_stage.get("ocr", 0) + ocr_failures
-        if cfg.treat_truncation_as_failure and ocr_truncated:
-            errors_by_stage["truncation"] = ocr_truncated
+            if ocr_truncated:
+                errors_by_stage["truncation"] = ocr_truncated
 
         failure_rate = n_errors / n_expected if n_expected else 0.0
         logger.info(
             f"[ocr_qwen_v1] {vol.w_id}/{vol.i_id}: done in {elapsed_ms / 1000:.1f}s "
             f"({n_expected} pages, success={writer.success_count}, "
-            f"errors={n_errors}, truncated={ocr_truncated}, rate={failure_rate:.2%})"
+            f"errors={n_errors}, truncated={ocr_truncated}, rate={failure_rate:.2%}, "
+            f"fetch={t_fetch_total:.1f}s, ocr={t_ocr_total:.1f}s)"
         )
 
         # Classify retryable vs terminal at volume level.
@@ -356,8 +392,9 @@ class OCRQwenV1JobWorker:
     # ------------------------------------------------------------------
 
     def _ocr_batch(self, pages: list[_FetchedPage]):
-        """Run one synchronous ``LLM.chat`` call over the whole volume.
+        """Run one synchronous ``LLM.chat`` call over a batch of pages.
 
+        Called once per ``ocr_batch_size``-sized slice of the volume.
         Returns the raw vLLM ``RequestOutput`` list in the same order as
         ``pages``.
         """

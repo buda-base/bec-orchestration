@@ -118,6 +118,15 @@ class OCRQwenV1Config:
     # ------------------------------------------------------------------
     # I/O pipeline
     # ------------------------------------------------------------------
+    # Number of pages processed per fetch → OCR → write cycle. We DO NOT
+    # decode a whole volume into RAM up-front: at any moment only
+    # ``ocr_batch_size`` decoded RGB images are resident. 128 keeps the
+    # peak resident set near ~1.5 GB (128 × ~10 MB at 4 MP/page RGB) on
+    # top of vLLM's ~8 GB anon-rss — comfortably under 16 GB on g5.xlarge.
+    # vLLM still batches internally per step, so throughput is unchanged
+    # vs a single huge ``LLM.chat`` call. Tune up on larger boxes.
+    ocr_batch_size: int = 128
+
     # ThreadPoolExecutor size for parallel S3 GET + PIL decode. S3 fetch +
     # decode runs at ~110 pages/s with 32 threads on a c6i/A10G — way faster
     # than the GPU needs, so this rarely needs tuning.
@@ -189,5 +198,7 @@ class OCRQwenV1Config:
             raise ValueError(f"max_image_pixels too small: {self.max_image_pixels}")
         if self.s3_fetch_concurrency < 1:
             raise ValueError(f"s3_fetch_concurrency must be ≥ 1, got {self.s3_fetch_concurrency}")
+        if self.ocr_batch_size < 1:
+            raise ValueError(f"ocr_batch_size must be ≥ 1, got {self.ocr_batch_size}")
         if not 0.0 <= self.max_page_failure_rate <= 1.0:
             raise ValueError(f"max_page_failure_rate out of [0,1]: {self.max_page_failure_rate}")

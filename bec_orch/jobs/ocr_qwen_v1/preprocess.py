@@ -49,17 +49,62 @@ class ImageDecodeError(RuntimeError):
     """Raised when the bytes can't be turned into an RGB image."""
 
 
-def _decode_via_vips(data: bytes) -> Image.Image | None:
+def _compute_vips_scale(w: int, h: int, *, max_side: int, max_pixels: int) -> float:
+    """Compute a scale factor that satisfies both size caps; never upscales."""
+    if w <= 0 or h <= 0:
+        return 1.0
+    long_side = max(w, h)
+    side_scale = max_side / long_side if long_side > max_side else 1.0
+    pixel_scale = 1.0
+    if w * h > max_pixels:
+        pixel_scale = (max_pixels / (w * h)) ** 0.5
+    return min(side_scale, pixel_scale, 1.0)
+
+
+def _decode_via_vips(
+    data: bytes, *, max_side: int, max_pixels: int
+) -> Image.Image | None:
+    """Decode bytes → RGB PIL image, downscaling **during** the libvips read.
+
+    libvips reads the image header first; we use the header dimensions to
+    compute a scale factor and pass it to ``Image.resize`` BEFORE
+    ``write_to_memory`` materialises the pixel buffer. This is critical for
+    pathologically big images (e.g. 10000×10000 modern scans) — we never
+    allocate the full-resolution NumPy/PIL buffer.
+
+    Returns ``None`` if libvips can't decode (caller falls back to PIL).
+    """
     if not _VIPS_OK:
         return None
     try:
-        # ``access="sequential"`` lets libvips stream-decode big TIFFs without
-        # materialising the whole pixel buffer twice.
+        # ``access="sequential"`` is a big throughput win on large TIFFs.
         v = pyvips.Image.new_from_buffer(data, "", access="sequential")
+
+        # Header-only dimensions are available immediately (no full decode yet).
+        w, h = int(v.width), int(v.height)
+        scale = _compute_vips_scale(w, h, max_side=max_side, max_pixels=max_pixels)
+        if scale < 1.0:
+            # ``kernel="linear"`` (bilinear) is the libvips default and a good
+            # speed/quality tradeoff for continuous-tone content; the Qwen
+            # model handles slight smoothing just fine.
+            v = v.resize(scale, kernel="linear")
+            logger.debug(
+                f"[ocr_qwen_v1] vips downscaled {w}x{h} → {int(v.width)}x{int(v.height)} "
+                f"(scale={scale:.3f})"
+            )
+
+        # Force RGB (3 bands) so the PIL.frombytes call below is consistent.
         if v.bands == 1:
             v = v.colourspace("srgb")
         elif v.bands == 4:
             v = v.flatten()
+        elif v.bands != 3:
+            v = v.colourspace("srgb")
+
+        # libvips may return non-uchar formats (e.g. ushort TIFFs); cast.
+        if v.format != "uchar":
+            v = v.cast("uchar")
+
         mem = v.write_to_memory()
         return Image.frombytes("RGB", (int(v.width), int(v.height)), mem)
     except Exception as e:  # noqa: BLE001 — many vips loaders raise
@@ -122,15 +167,22 @@ def bytes_to_rgb(data: bytes, cfg: OCRQwenV1Config) -> Image.Image:
     if not data:
         raise ImageDecodeError("empty image bytes")
 
-    im = _decode_via_vips(data)
+    # Preferred lane: libvips decodes AND downscales in one streaming pass,
+    # so we never materialise the full-res pixel buffer for huge inputs.
+    im = _decode_via_vips(
+        data, max_side=cfg.max_image_side, max_pixels=cfg.max_image_pixels
+    )
     if im is None:
+        # PIL fallback: we have to decode at native resolution first, then
+        # shrink. Fine for typical-sized images; the libvips lane handles
+        # the pathological ones above.
         im = _decode_via_pil(data)
 
-    # ``_decode_via_vips`` already returns RGB; ``_decode_via_pil`` also.
-    # Belt-and-braces though, for any future decoder lanes.
     if im.mode != "RGB":
         im = im.convert("RGB")
 
+    # Safety net: re-enforce the budget for the PIL lane (no-op when vips
+    # already resized within tolerance).
     return _fit_to_budget(
         im,
         max_side=cfg.max_image_side,

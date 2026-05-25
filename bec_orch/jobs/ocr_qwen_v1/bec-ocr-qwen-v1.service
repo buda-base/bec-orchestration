@@ -1,0 +1,96 @@
+[Unit]
+Description=BEC Worker - ocr_qwen_v1 (Qwen3.5-VL Tibetan OCR)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+
+User=ubuntu
+Group=ubuntu
+
+# Load environment variables: BEC_SQL_*, BEC_REGION, BEC_DEST_S3_BUCKET,
+# AWS_* credentials, optional BEC_OCR_QWEN_MEM_UTIL.
+EnvironmentFile=/etc/bec/worker.env
+
+WorkingDirectory=/home/ubuntu/bec-orchestration
+
+# vLLM uses NCCL/CUDA; make sure the right libs are picked up and the HF
+# cache lives in a system-managed dir (the model is 1.7 GB; HF also caches
+# tokenizer + processor configs). The dir is declared in ReadWritePaths
+# below so ProtectHome=read-only does not lock it.
+Environment="PATH=/opt/pytorch/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+Environment="HF_HOME=/var/cache/bec-ocr-qwen-v1/hf"
+Environment="HF_HUB_DISABLE_PROGRESS_BARS=1"
+Environment="PYTHONUNBUFFERED=1"
+# vLLM / Torch / Triton / flashinfer / XDG caches — all redirected under the
+# systemd-managed CacheDirectory (writable; everything else under /home is
+# read-only thanks to ProtectHome).
+Environment="XDG_CACHE_HOME=/var/cache/bec-ocr-qwen-v1"
+Environment="VLLM_CACHE_ROOT=/var/cache/bec-ocr-qwen-v1/vllm"
+Environment="TORCHINDUCTOR_CACHE_DIR=/var/cache/bec-ocr-qwen-v1/torchinductor"
+Environment="TRITON_CACHE_DIR=/var/cache/bec-ocr-qwen-v1/triton"
+Environment="FLASHINFER_WORKSPACE_BASE=/var/cache/bec-ocr-qwen-v1/flashinfer"
+# Don't phone home (writes to ~/.config/vllm, fails under ProtectHome; also
+# pointless on a fleet of 100 workers).
+Environment="VLLM_NO_USAGE_STATS=1"
+Environment="DO_NOT_TRACK=1"
+# Quieter vLLM logs in journal; bump to INFO if you need to debug.
+Environment="VLLM_LOGGING_LEVEL=WARNING"
+Environment="TRANSFORMERS_VERBOSITY=warning"
+
+# Worker:
+#   --visibility-timeout 1800 matches OCRQwenV1Config.volume_timeout_s (30 min)
+#   --shutdown-after-empty 6  (default) -> graceful exit after ~2 min of empty polls
+ExecStart=/opt/pytorch/bin/bec worker \
+    --job-name ocr_qwen_v1 \
+    --visibility-timeout 1800
+
+# Graceful shutdown.
+#   - SIGTERM lets the worker finish the in-flight volume (worst case ~30 min)
+#     and write its parquet artifact before exiting.
+#   - TimeoutStopSec must therefore be > volume_timeout_s (1800s) + a margin.
+#   - AWS ASG scale-in only allows ~120s by default; for clean drains use a
+#     Lifecycle Hook (HeartbeatTimeout >= 2000s) or run on spot/on-demand
+#     with a longer grace period.
+KillMode=mixed
+KillSignal=SIGTERM
+TimeoutStopSec=2000
+
+# Restart on crash but back off so a wedged GPU / OOM doesn't hot-loop.
+Restart=on-failure
+RestartSec=30
+StartLimitInterval=600
+StartLimitBurst=5
+
+# Plenty of file descriptors for the boto3 connection pool + vLLM logging.
+LimitNOFILE=65536
+# vLLM can spawn many helper threads/subprocesses; default 4096 is enough,
+# but be explicit to avoid surprises on minimal AMIs.
+LimitNPROC=4096
+# Disable core dumps (vLLM/CUDA cores can be tens of GB).
+LimitCORE=0
+
+# Journal logging is fine; the BEC CLI logs to stdout/stderr already.
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=bec-ocr-qwen-v1
+
+# Security hardening, with the few writable paths vLLM/HuggingFace need:
+#   - /tmp                       : vLLM compile cache, NCCL scratch (PrivateTmp)
+#   - /var/cache/bec-ocr-qwen-v1 : HuggingFace Hub model cache (auto-created
+#                                  by CacheDirectory below and made writable)
+#   - /var/log/bec               : optional log dir for the BEC CLI
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/var/log/bec
+
+# systemd auto-creates /var/cache/bec-ocr-qwen-v1 (mode 0750, owned by User=)
+# and adds it to ReadWritePaths. This is where HF_HOME points.
+CacheDirectory=bec-ocr-qwen-v1
+CacheDirectoryMode=0750
+
+[Install]
+WantedBy=multi-user.target

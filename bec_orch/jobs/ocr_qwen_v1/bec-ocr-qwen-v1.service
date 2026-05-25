@@ -15,9 +15,6 @@ EnvironmentFile=/etc/bec/worker.env
 
 WorkingDirectory=/home/ubuntu/bec-orchestration
 
-MemoryMax=14G
-MemoryHigh=12G
-
 # vLLM uses NCCL/CUDA; make sure the right libs are picked up and the HF
 # cache lives in a system-managed dir (the model is 1.7 GB; HF also caches
 # tokenizer + processor configs). The dir is declared in ReadWritePaths
@@ -61,10 +58,27 @@ KillSignal=SIGTERM
 TimeoutStopSec=2000
 
 # Restart on crash but back off so a wedged GPU / OOM doesn't hot-loop.
+# (Tightened from 5 to 3 — once you've OOM'd three times in a row on the
+# same SQS message, more restarts won't help; let the message age out to
+# the DLQ via maxReceiveCount and stop the worker for human triage.)
 Restart=on-failure
 RestartSec=30
 StartLimitInterval=600
-StartLimitBurst=5
+StartLimitBurst=3
+
+# Cgroup memory limits. CRITICAL on g5.xlarge (16 GB RAM): without these,
+# a runaway worker pulls the kernel OOM-killer, which on this host kills
+# ``VLLM::EngineCor`` and leaves the parent process hung on a dead IPC
+# pipe — sshd then can't fork, the SSM agent loses connection, and the
+# only recovery is a force-stop (see incident 2026-05-25). With these:
+#   * MemoryHigh=12G ── soft cap; kernel starts reclaiming aggressively
+#   * MemoryMax=14G  ── hard cap; the worker (or one of its forks) gets
+#                       SIGKILL'd inside the cgroup, the rest of the
+#                       system stays responsive, and ``Restart=on-failure``
+#                       kicks in.
+# 14G leaves ~2 GB headroom for sshd/systemd/journald/SSM agent.
+MemoryHigh=12G
+MemoryMax=14G
 
 # Plenty of file descriptors for the boto3 connection pool + vLLM logging.
 LimitNOFILE=65536
@@ -83,12 +97,15 @@ SyslogIdentifier=bec-ocr-qwen-v1
 #   - /tmp                       : vLLM compile cache, NCCL scratch (PrivateTmp)
 #   - /var/cache/bec-ocr-qwen-v1 : HuggingFace Hub model cache (auto-created
 #                                  by CacheDirectory below and made writable)
-#   - /var/log/bec               : optional log dir for the BEC CLI
+#   - /var/log/bec               : optional log dir for the BEC CLI; prefixed
+#                                  with ``-`` so the unit still starts if the
+#                                  dir doesn't exist (logs go to journal
+#                                  anyway via StandardOutput=journal above).
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=read-only
-ReadWritePaths=/var/log/bec
+ReadWritePaths=-/var/log/bec
 
 # systemd auto-creates /var/cache/bec-ocr-qwen-v1 (mode 0750, owned by User=)
 # and adds it to ReadWritePaths. This is where HF_HOME points.

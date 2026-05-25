@@ -185,8 +185,8 @@ def sort_bbox_centers(
     for group in groups:
         group.sort(key=lambda c: c[0])
 
-    # Reverse to get bottom-to-top order (matching reading order)
-    groups.reverse()
+    # Groups are already in top-to-bottom order (ascending y),
+    # which matches Tibetan pecha reading order.
 
     return groups
 

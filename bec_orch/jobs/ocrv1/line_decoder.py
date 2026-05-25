@@ -194,8 +194,8 @@ def _group_line_segments(segments: list[LineSegment], line_threshold: float) -> 
     for group in groups:
         group.sort(key=lambda s: s.center[0])
 
-    # Reverse to get bottom-to-top order (matching original behavior)
-    groups.reverse()
+    # Groups are already in top-to-bottom order (ascending y),
+    # which matches Tibetan pecha reading order.
 
     return groups
 

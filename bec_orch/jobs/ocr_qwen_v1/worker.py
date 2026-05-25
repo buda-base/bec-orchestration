@@ -2,18 +2,23 @@
 
 Design (see ``scratch/findings.md``):
 
-    1. The volume manifest is walked in fixed-size batches of
+    1. The volume manifest is walked in fixed-size FETCH BATCHES of
        ``OCRQwenV1Config.ocr_batch_size`` pages. For each batch:
          a. A ThreadPool fetches that batch from S3 and decodes to RGB
             (parallel, ~110 pages/s on a 32-thread pool — way faster than
-            the GPU).
-         b. A single synchronous ``LLM.chat(batch)`` runs the decoded pages.
-            vLLM still batches internally per step, so throughput is the
-            same as one giant call would be, but the resident set is
-            bounded by ``ocr_batch_size`` decoded images at a time
-            (~10 MB each at 4 MP RGB) instead of an entire volume's worth.
-         c. Results stream into the parquet writer and the decoded image
-            buffers are dropped immediately.
+            the GPU). Only one batch worth of decoded images is resident
+            in the parent process at a time.
+         b. The batch is further sliced into OCR CHUNKS sized by total
+            decoded bytes (``OCRQwenV1Config.llm_chat_chunk_max_bytes``);
+            each chunk gets one synchronous ``LLM.chat`` call. Sizing the
+            inner chunks by bytes (rather than page count) adapts to the
+            spread between small pecha folios and large modern pages, and
+            bounds vLLM's transient ~2× host-RAM spike during chat
+            rendering (vLLM copies every PIL image to the EngineCore
+            subprocess at chat time).
+         c. After each chunk, decoded images are dropped (``image=None``
+            + ``image.close()``) and rows are written to the parquet
+            stream.
     2. The vLLM ``LLM`` is owned by the JobWorker instance and reused
        across all volumes (model load: ~46 s warm). Caches are reset
        between volumes per ``OCRQwenV1Config.reset_caches_between_volumes``.
@@ -59,7 +64,8 @@ _SOURCE_BUCKET = os.environ.get("BEC_SOURCE_S3_BUCKET", "archive.tbrc.org")
 class _FetchedPage:
     filename: str
     etag: str
-    image: Image.Image
+    image: Image.Image | None  # cleared after the page is sent to vLLM
+    decoded_bytes: int          # W*H*3, used by the chunk-by-byte-budget loop
 
 
 @dataclass
@@ -68,6 +74,35 @@ class _FailedPage:
     stage: str  # "fetch" | "decode"
     etag: str | None
     error: str
+
+
+def _split_by_bytes(
+    pages: list[_FetchedPage], max_bytes: int
+) -> list[list[_FetchedPage]]:
+    """Greedy first-fit chunking by accumulated ``decoded_bytes``.
+
+    Preserves input order so parquet rows match the manifest order. Each
+    chunk holds at least one page even if that single page exceeds
+    ``max_bytes`` (otherwise we'd loop forever). ``max_bytes <= 0`` is
+    treated as "no chunking" (single chunk with everything).
+    """
+    if not pages:
+        return []
+    if max_bytes <= 0:
+        return [pages]
+    chunks: list[list[_FetchedPage]] = []
+    current: list[_FetchedPage] = []
+    current_bytes = 0
+    for p in pages:
+        if current and current_bytes + p.decoded_bytes > max_bytes:
+            chunks.append(current)
+            current = []
+            current_bytes = 0
+        current.append(p)
+        current_bytes += p.decoded_bytes
+    if current:
+        chunks.append(current)
+    return chunks
 
 
 class OCRQwenV1JobWorker:
@@ -197,10 +232,10 @@ class OCRQwenV1JobWorker:
             for batch_idx in range(n_batches):
                 start = batch_idx * batch_size
                 stop = min(start + batch_size, n_expected)
-                chunk_manifest = manifest[start:stop]
+                batch_manifest = manifest[start:stop]
 
                 t_fetch = time.time()
-                fetched, failed = self._fetch_and_decode(vol_prefix, chunk_manifest)
+                fetched, failed = self._fetch_and_decode(vol_prefix, batch_manifest)
                 t_fetch_total += time.time() - t_fetch
 
                 # Record fetch/decode failures up-front; they don't go to the
@@ -218,50 +253,72 @@ class OCRQwenV1JobWorker:
                     logger.warning(
                         f"[ocr_qwen_v1] {vol.w_id}/{vol.i_id}: batch "
                         f"{batch_idx + 1}/{n_batches} ({start}:{stop}) — "
-                        f"all {len(chunk_manifest)} pages failed before OCR"
+                        f"all {len(batch_manifest)} pages failed before OCR"
                     )
                     continue
 
-                t_ocr = time.time()
-                outputs = self._ocr_batch(fetched)
-                t_ocr_total += time.time() - t_ocr
+                # Split this batch into OCR sub-chunks bounded by total
+                # decoded bytes. Bounds vLLM's transient ~2× host-RAM spike
+                # during chat rendering — see config.llm_chat_chunk_max_bytes.
+                ocr_chunks = _split_by_bytes(fetched, cfg.llm_chat_chunk_max_bytes)
+                n_ocr_chunks = len(ocr_chunks)
 
-                for page, out in zip(fetched, outputs, strict=True):
-                    if not out.outputs:
-                        writer.write_error(
+                for ci, ocr_chunk in enumerate(ocr_chunks):
+                    chunk_bytes = sum(p.decoded_bytes for p in ocr_chunk)
+
+                    t_ocr = time.time()
+                    outputs = self._ocr_batch(ocr_chunk)
+                    t_ocr_total += time.time() - t_ocr
+
+                    for page, out in zip(ocr_chunk, outputs, strict=True):
+                        if not out.outputs:
+                            writer.write_error(
+                                filename=page.filename,
+                                source_etag=page.etag,
+                                stage="ocr",
+                                error_message="empty vLLM output",
+                            )
+                            ocr_failures += 1
+                            errors_by_stage["ocr"] = errors_by_stage.get("ocr", 0) + 1
+                            continue
+                        gen = out.outputs[0]
+                        finish_reason = gen.finish_reason or ""
+                        truncated = finish_reason == "length"
+                        writer.write_success(
                             filename=page.filename,
                             source_etag=page.etag,
-                            stage="ocr",
-                            error_message="empty vLLM output",
+                            page_text=gen.text or "",
+                            output_tokens=len(gen.token_ids),
+                            finish_reason=finish_reason,
+                            truncated=truncated,
                         )
-                        ocr_failures += 1
-                        errors_by_stage["ocr"] = errors_by_stage.get("ocr", 0) + 1
-                        continue
-                    gen = out.outputs[0]
-                    finish_reason = gen.finish_reason or ""
-                    truncated = finish_reason == "length"
-                    writer.write_success(
-                        filename=page.filename,
-                        source_etag=page.etag,
-                        page_text=gen.text or "",
-                        output_tokens=len(gen.token_ids),
-                        finish_reason=finish_reason,
-                        truncated=truncated,
-                    )
-                    if truncated:
-                        ocr_truncated += 1
+                        if truncated:
+                            ocr_truncated += 1
+
+                    # Drop the decoded image buffers for this OCR chunk so
+                    # the parent process doesn't keep them resident while
+                    # later chunks run. ``close()`` releases the PIL buffer
+                    # eagerly; ``image = None`` clears the reference held
+                    # by the dataclass.
+                    for page in ocr_chunk:
+                        if page.image is not None:
+                            try:
+                                page.image.close()
+                            except Exception:  # noqa: BLE001 — PIL close is best-effort
+                                pass
+                            page.image = None
+                    del outputs
+
+                    if n_ocr_chunks > 1:
+                        logger.debug(
+                            f"[ocr_qwen_v1] {vol.w_id}/{vol.i_id}: batch "
+                            f"{batch_idx + 1}/{n_batches} ocr-chunk "
+                            f"{ci + 1}/{n_ocr_chunks} done "
+                            f"({len(ocr_chunk)} pages, {chunk_bytes / 1e6:.0f} MB)"
+                        )
 
                 n_ocr_done += len(fetched)
-
-                # Eagerly drop the decoded image buffers — this is the whole
-                # point of batching. Without this we'd just be paying the
-                # batching overhead with no memory win.
-                for p in fetched:
-                    try:
-                        p.image.close()
-                    except Exception:  # noqa: BLE001 — PIL close is best-effort
-                        pass
-                del fetched, outputs
+                del fetched
                 gc.collect()
 
                 logger.info(
@@ -366,7 +423,10 @@ class OCRQwenV1JobWorker:
                 )
                 return
 
-            ok_by_filename[filename] = _FetchedPage(filename=filename, etag=etag, image=img)
+            decoded_bytes = img.size[0] * img.size[1] * 3  # RGB uint8
+            ok_by_filename[filename] = _FetchedPage(
+                filename=filename, etag=etag, image=img, decoded_bytes=decoded_bytes,
+            )
 
         with ThreadPoolExecutor(max_workers=cfg.s3_fetch_concurrency) as pool:
             futures = [
@@ -392,25 +452,23 @@ class OCRQwenV1JobWorker:
     # ------------------------------------------------------------------
 
     def _ocr_batch(self, pages: list[_FetchedPage]):
-        """Run one synchronous ``LLM.chat`` call over a batch of pages.
+        """Run one synchronous ``LLM.chat`` call over ``pages``.
 
-        Called once per ``ocr_batch_size``-sized slice of the volume.
-        Returns the raw vLLM ``RequestOutput`` list in the same order as
-        ``pages``.
+        Called once per OCR sub-chunk (i.e. once per ``llm_chat_chunk_max_bytes``
+        slice of one fetch batch). Returns the raw vLLM ``RequestOutput``
+        list in the same order as ``pages``. The text prompt is included
+        only when ``cfg.prompt`` is non-empty — the model was trained with
+        image-only user content, and omitting the text part matches that
+        exactly.
         """
         prompt = self.cfg.prompt
-        messages = [
-            [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "image_pil", "image_pil": p.image},
-                        {"type": "text", "text": prompt},
-                    ],
-                }
-            ]
-            for p in pages
-        ]
+        messages = []
+        for p in pages:
+            assert p.image is not None, f"image for {p.filename} was cleared before OCR"
+            content: list[dict] = [{"type": "image_pil", "image_pil": p.image}]
+            if prompt:
+                content.append({"type": "text", "text": prompt})
+            messages.append([{"role": "user", "content": content}])
         return self._llm.chat(messages, sampling_params=self._sampling, use_tqdm=False)
 
     # ------------------------------------------------------------------

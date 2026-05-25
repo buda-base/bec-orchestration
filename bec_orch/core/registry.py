@@ -139,6 +139,46 @@ def _auto_register() -> None:
     except AttributeError as e:
         logger.warning(f"Failed to auto-register ocrv1 worker: {e}. Worker class may not exist in module.")
 
+    # Try to import and register ocr_qwen_v1 worker
+    try:
+        from dataclasses import fields
+
+        from bec_orch.jobs.ocr_qwen_v1.config import OCRQwenV1Config
+        from bec_orch.jobs.ocr_qwen_v1.worker import OCRQwenV1JobWorker
+
+        def ocr_qwen_v1_factory(job_config: dict[str, Any] | None) -> JobWorker:
+            """Factory for OCRQwenV1JobWorker — builds config from job_config.
+
+            Every ``OCRQwenV1Config`` field has a sensible default (from the
+            benchmark sweeps in ``scratch/findings.md``), so an empty job
+            config is valid; any keys present in ``job_config`` override the
+            defaults.
+            """
+            cfg_kwargs: dict[str, Any] = {}
+            if job_config:
+                allowed = {f.name for f in fields(OCRQwenV1Config)}
+                for k, v in job_config.items():
+                    if k in allowed:
+                        cfg_kwargs[k] = v
+                    else:
+                        logger.warning(
+                            f"[ocr_qwen_v1] ignoring unknown config key '{k}' "
+                            f"(allowed: {sorted(allowed)})"
+                        )
+            cfg = OCRQwenV1Config(**cfg_kwargs)
+            return OCRQwenV1JobWorker(cfg)
+
+        register_job_worker("ocr_qwen_v1", ocr_qwen_v1_factory)
+    except ImportError as e:
+        logger.warning(
+            f"Failed to auto-register ocr_qwen_v1 worker: {e}. "
+            f"Dependencies (vllm, boto3, Pillow, pyarrow) may not be installed."
+        )
+    except AttributeError as e:
+        logger.warning(
+            f"Failed to auto-register ocr_qwen_v1 worker: {e}. Worker class may not exist in module."
+        )
+
 
 # Run auto-registration on module import
 _auto_register()

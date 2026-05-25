@@ -76,12 +76,12 @@ class OCRQwenV1Config:
     # ------------------------------------------------------------------
     # Generation
     # ------------------------------------------------------------------
-    # Per-page user prompt. The chat template prepends the standard
-    # ``<|im_start|>user … <|vision_start|><|image_pad|><|vision_end|>``
-    # bookkeeping. Empty string also works (the model is trained to OCR
-    # without an explicit instruction) but the explicit prompt is slightly
-    # more consistent across pages.
-    prompt: str = "Transcribe this page."
+    # Per-page user prompt. The model was trained with an image-only user
+    # message (no text content at all) — empty string here means we omit the
+    # text part entirely from the chat message, matching training. Benchmark
+    # on 687 Uchen pages: identical median CER and ~0.4pp mean CER difference
+    # with vs. without a prompt — well within noise. Default = no prompt.
+    prompt: str = ""
 
     # Hard cap on output tokens. Distribution on real BDRC pechas:
     # p50=2049, p90=2227, p99=2672. 3072 catches >99 % of legitimate pages
@@ -141,6 +141,30 @@ class OCRQwenV1Config:
     # (also used by LDV1 / OCRV1).
     parquet_compression: Literal["zstd", "snappy", "gzip", "none"] = "zstd"
 
+    # Soft cap on total decoded-image bytes per ``LLM.chat()`` call. vLLM's
+    # chat path copies every PIL image to the EngineCore subprocess during
+    # chat rendering, transiently ~2× host RAM for the chunk; sizing chunks
+    # by bytes (rather than page count) adapts to the wide spread between
+    # small pecha folios (~3 MB after RGB+resize) and bigger modern book
+    # pages (up to 12 MB hard ceiling, since max_image_pixels=4_000_000
+    # caps decoded RGB at 4M × 3 = 12 MB).
+    #
+    # 1 GB keeps peak host RAM under ~2.5 GB on a 16 GB g5.xlarge worker
+    # even with worst-case images, while still giving the GPU big-enough
+    # batches to saturate (>~64 pages worth, well above vLLM's saturation
+    # point at our 8K max_model_len). A chunk always contains at least one
+    # image, even on the off chance someone later raises max_image_pixels
+    # above this budget.
+    #
+    # Streaming chunked calls also lets the parquet writer drain throughout
+    # the volume rather than at the end, so a mid-volume crash preserves
+    # the rows from already-completed chunks.
+    #
+    # Set to 0 to disable chunking and send the whole volume in one
+    # ``LLM.chat`` call (faster by a few %, but risks OOM on large volumes
+    # or under-provisioned worker boxes).
+    llm_chat_chunk_max_bytes: int = 1_000_000_000
+
     # Also write a sidecar ``<basename>-errors.jsonl`` with per-page failure
     # details. Cheap to keep on; turn off only if storage is precious.
     write_errors_jsonl: bool = True
@@ -191,3 +215,8 @@ class OCRQwenV1Config:
             raise ValueError(f"s3_fetch_concurrency must be ≥ 1, got {self.s3_fetch_concurrency}")
         if not 0.0 <= self.max_page_failure_rate <= 1.0:
             raise ValueError(f"max_page_failure_rate out of [0,1]: {self.max_page_failure_rate}")
+        if self.llm_chat_chunk_max_bytes < 0:
+            raise ValueError(
+                f"llm_chat_chunk_max_bytes must be ≥ 0 (0 disables chunking), "
+                f"got {self.llm_chat_chunk_max_bytes}"
+            )

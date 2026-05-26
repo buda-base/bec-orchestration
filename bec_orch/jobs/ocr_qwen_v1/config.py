@@ -118,7 +118,7 @@ class OCRQwenV1Config:
     #   once. > 0 encourages topical drift. Almost never wanted for OCR
     #   (we explicitly DO want to repeat tokens — they're real glyphs);
     #   exposed for completeness.
-    repetition_penalty: float = 1.15
+    repetition_penalty: float = 1.0
     frequency_penalty: float = 0.0
     presence_penalty: float = 0.0
 

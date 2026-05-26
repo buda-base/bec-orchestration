@@ -1,16 +1,25 @@
 """Blind (no-reference) quality evaluation for ``ocr_qwen_v1``.
 
 Walks a folder of images (non-recursively), runs the OCR Qwen model on each
-image under several vLLM measurement configurations, and emits:
+image under several vLLM measurement configurations, and emits a CSV +
+markdown report comparing the cost of each configuration.
+
+Architecturally this mirrors the production worker: images are decoded in
+parallel (thread pool) in batches of ``--batch-size`` and then handed to
+**one** ``llm.chat`` call per batch so vLLM can pack their prefills and
+interleave their decode steps. Doing one chat call per image — the original
+draft of this script — leaves a 5-20× factor of throughput on the floor.
+
+Outputs:
 
   <out_dir>/
     by_image/<sweep_id>/<image>.json   raw per-image metrics (resumable)
     <sweep_id>.jsonl                   flat per-sweep rows (one line per image)
     results.csv                        final CSV (one row per image, from the
                                        ``full`` sweep)
-    report.md                          wall-time comparison of sweeps showing
-                                       how each vLLM measurement (logprobs,
-                                       n=2, second temperature) impacts cost
+    report.md                          cost comparison of sweeps showing how
+                                       each vLLM measurement (logprobs, n=2,
+                                       second temperature) impacts throughput
 
 CSV columns (per user spec):
     image_file_name        exact basename of the image
@@ -28,9 +37,11 @@ are skipped. ``--sweeps`` lets you select a subset of measurement configs.
 
 Usage:
     python -m bec_orch.jobs.ocr_qwen_v1.blind_eval \
-        --images /path/to/images \
-        --out    /path/to/eval_out \
-        --sweeps minimal,entropy,consistency,full
+        --images     /path/to/images \
+        --out        /path/to/eval_out \
+        --sweeps     minimal,entropy,consistency,full \
+        --batch-size 128            # images per llm.chat call
+        --decode-workers 16         # parallel image decoders
 
 Or with the venv's python directly:
     /opt/pytorch/bin/python -m bec_orch.jobs.ocr_qwen_v1.blind_eval ...
@@ -47,6 +58,7 @@ import os
 import statistics
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
@@ -286,20 +298,65 @@ def _build_messages(image, prompt: str) -> list[dict]:
     return [{"role": "user", "content": content}]
 
 
+def _decode_one(path: Path, cfg: OCRQwenV1Config) -> tuple[Path, Any | None, str | None, float]:
+    """Decode a single image. Returns (path, image_or_None, error_or_None, decode_s)."""
+    t = time.perf_counter()
+    try:
+        img = decode_image(path, cfg)
+    except Exception as e:  # noqa: BLE001
+        return path, None, str(e), time.perf_counter() - t
+    return path, img, None, time.perf_counter() - t
+
+
+def _decode_batch_parallel(
+    paths: list[Path], cfg: OCRQwenV1Config, max_workers: int
+) -> list[tuple[Path, Any | None, str | None, float]]:
+    """Parallel decode mirroring the worker's ``_fetch_and_decode`` pattern.
+
+    Decoding is CPU-bound (libvips/PIL), so a thread pool is enough — libvips
+    releases the GIL during decompression. Return order matches input order
+    so downstream code can pair decoded images with the original path list.
+    """
+    results: list[tuple[Path, Any | None, str | None, float] | None] = [None] * len(paths)
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures = {pool.submit(_decode_one, p, cfg): i for i, p in enumerate(paths)}
+        for fut in as_completed(futures):
+            i = futures[fut]
+            results[i] = fut.result()
+    # mypy: filtered above — every slot is set when the pool finishes.
+    return [r for r in results if r is not None]
+
+
 def run_sweep(
     llm: Any,
     sweep: SweepDef,
     cfg: OCRQwenV1Config,
     images: list[Path],
     out_dir: Path,
+    *,
+    batch_size: int,
+    decode_workers: int,
     overwrite: bool,
 ) -> tuple[float, int]:
-    """Run one sweep over all images. Returns ``(wall_seconds, n_processed)``.
+    """Run one sweep over all images, **batched** like the production worker.
 
-    Per-image state is written to ``out_dir/by_image/<sweep>/<image>.json`` so
-    re-runs skip already-completed images unless ``overwrite=True``.
+    Each batch:
+      1. Decode ``batch_size`` images in parallel (CPU-bound thread pool).
+      2. Build one chat message per (image × sampling-params variant) and
+         hand the entire flat list to a single ``llm.chat`` call. vLLM packs
+         prefill across the whole batch and interleaves decode steps, which
+         is where the throughput comes from — calling ``llm.chat`` once per
+         image throws all of that away.
+      3. Map each ``RequestOutput`` back to its owner image and write
+         per-image jsons.
+
+    Per-image state is written to ``out_dir/by_image/<sweep>/<image>.json``
+    so re-runs skip already-completed images unless ``overwrite=True``.
+
+    Returns ``(wall_seconds, n_processed_this_run)``.
     """
     sampling = sweep.build_sampling_params(cfg)
+    sp_per_image = len(sampling)  # 1 for minimal/entropy/consistency, 2 for full
 
     per_image_dir = out_dir / "by_image" / sweep.name
     per_image_dir.mkdir(parents=True, exist_ok=True)
@@ -316,62 +373,108 @@ def run_sweep(
                 per_image_dir,
             )
 
-    todo = [p for p in images if p.name not in already_done and p.stem not in already_done]
+    todo = [p for p in images if p.stem not in already_done]
+    n_batches = max(1, (len(todo) + batch_size - 1) // batch_size)
     logger.info(
-        "[%s] %s — processing %d/%d image(s)",
+        "[%s] %s — processing %d/%d image(s) in %d batch(es) of up to %d "
+        "(× %d sampling-params variant(s) = up to %d chat requests/batch)",
         sweep.name,
         sweep.description,
         len(todo),
         len(images),
+        n_batches,
+        batch_size,
+        sp_per_image,
+        batch_size * sp_per_image,
     )
 
     t_sweep_start = time.perf_counter()
     n_processed = 0
 
-    # Open the JSONL in append mode so the report can be rebuilt without
-    # re-running everything.
     with sweep_jsonl.open("a", encoding="utf-8") as jsonl_f:
-        for img_path in todo:
+        for batch_idx in range(n_batches):
+            batch_paths = todo[batch_idx * batch_size : (batch_idx + 1) * batch_size]
+            if not batch_paths:
+                continue
+
+            # 1) Parallel decode.
             t_dec = time.perf_counter()
-            try:
-                img = decode_image(img_path, cfg)
-            except Exception as e:  # noqa: BLE001
-                logger.warning("[%s] decode failed for %s: %s", sweep.name, img_path.name, e)
-                _write_per_image(
-                    per_image_dir,
-                    img_path,
-                    {"error": f"decode failed: {e}", "sweep": sweep.name},
-                    jsonl_f,
-                )
-                continue
-            decode_s = time.perf_counter() - t_dec
+            decoded = _decode_batch_parallel(batch_paths, cfg, decode_workers)
+            decode_wall_s = time.perf_counter() - t_dec
+            decode_s_by_path = {path: ds for path, _, _, ds in decoded}
 
-            # Build one chat message per sampling-params variant. With
-            # ``sampling=[sp_t0, sp_t1]`` and ``messages=[m, m]``, vLLM
-            # treats them as two independent requests batched concurrently.
-            messages = [_build_messages(img, cfg.prompt) for _ in sampling]
-            t_call = time.perf_counter()
-            try:
-                outputs = llm.chat(messages, sampling_params=sampling, use_tqdm=False)
-            except Exception as e:  # noqa: BLE001
-                logger.exception("[%s] llm.chat failed for %s", sweep.name, img_path.name)
-                _write_per_image(
-                    per_image_dir,
-                    img_path,
-                    {"error": f"llm.chat failed: {e}", "sweep": sweep.name},
-                    jsonl_f,
-                )
-                continue
-            elapsed_s = time.perf_counter() - t_call
+            # 2) Build the flat chat request list. ``owners[i]`` and
+            # ``run_idx[i]`` together identify which (image, sampling-variant)
+            # ``outputs[i]`` corresponds to.
+            messages: list[list[dict]] = []
+            sampling_flat: list[Any] = []
+            owners: list[Path] = []
+            run_idx: list[int] = []  # index into ``sampling`` for that owner
+            decode_failures: list[tuple[Path, str]] = []
+            for path, img, err, _ in decoded:
+                if err is not None or img is None:
+                    decode_failures.append((path, err or "unknown decode error"))
+                    continue
+                for j, sp in enumerate(sampling):
+                    messages.append(_build_messages(img, cfg.prompt))
+                    sampling_flat.append(sp)
+                    owners.append(path)
+                    run_idx.append(j)
 
-            # Each ``RequestOutput`` may have one OR multiple
-            # ``CompletionOutput``s (n>1 via the ``consistency`` sweep).
-            # Flatten everything in declaration order.
-            runs: list[RunMetrics] = []
-            for ro in outputs:
+            # 3) Single big chat call. vLLM batches the whole thing.
+            outputs: list[Any] = []
+            chat_wall_s = 0.0
+            if messages:
+                t_call = time.perf_counter()
+                try:
+                    outputs = llm.chat(
+                        messages, sampling_params=sampling_flat, use_tqdm=False
+                    )
+                except Exception as e:  # noqa: BLE001
+                    logger.exception(
+                        "[%s] llm.chat failed for batch %d/%d (%d images)",
+                        sweep.name,
+                        batch_idx + 1,
+                        n_batches,
+                        len(batch_paths),
+                    )
+                    # Whole-batch failure — record an error row per image so
+                    # we don't loop on this batch on the next resume.
+                    for path in batch_paths:
+                        if path in decode_s_by_path:
+                            _write_per_image(
+                                per_image_dir,
+                                path,
+                                {
+                                    "image_file_name": path.name,
+                                    "sweep": sweep.name,
+                                    "error": f"llm.chat failed: {e}",
+                                    "decode_s": decode_s_by_path.get(path, 0.0),
+                                },
+                                jsonl_f,
+                            )
+                            n_processed += 1
+                    # Free buffers and move on.
+                    for _, img, _, _ in decoded:
+                        if img is not None:
+                            try:
+                                img.close()
+                            except Exception:  # noqa: BLE001
+                                pass
+                    del decoded
+                    gc.collect()
+                    continue
+                chat_wall_s = time.perf_counter() - t_call
+
+            # 4) Re-group outputs by owner image, preserving sampling order.
+            #    Each ``RequestOutput`` may itself have N>1 ``CompletionOutput``s
+            #    (consistency sweep uses ``n=2``); we flatten those in declaration
+            #    order so they line up with the user's "run index 0 / 1" contract.
+            runs_by_path: dict[Path, list[RunMetrics]] = {}
+            for path, _, ro in zip(owners, run_idx, outputs, strict=True):
                 comps = list(getattr(ro, "outputs", []) or [])
                 if not comps:
-                    runs.append(
+                    runs_by_path.setdefault(path, []).append(
                         RunMetrics(
                             text="",
                             num_generated_tokens=0,
@@ -386,36 +489,79 @@ def run_sweep(
                     )
                     continue
                 for comp in comps:
-                    runs.append(_extract_run_metrics(comp, ro))
+                    runs_by_path.setdefault(path, []).append(_extract_run_metrics(comp, ro))
 
-            edit_dist = _edit_distance(runs[0].text, runs[1].text) if len(runs) >= 2 else None
+            # 5) Write per-image jsons.
+            for path, runs in runs_by_path.items():
+                edit_dist = _edit_distance(runs[0].text, runs[1].text) if len(runs) >= 2 else None
+                # ``elapsed_s`` per image = end-to-end vLLM latency of the
+                # primary run when available (more meaningful than dividing
+                # batch wall by image count, since vLLM doesn't process all
+                # images in lockstep).
+                primary = runs[0]
+                if primary.e2e_latency_s is not None:
+                    per_image_elapsed = primary.e2e_latency_s
+                else:
+                    per_image_elapsed = chat_wall_s / max(len(runs_by_path), 1)
+                result = ImageResult(
+                    image_file_name=path.name,
+                    sweep=sweep.name,
+                    elapsed_s=per_image_elapsed,
+                    decode_s=decode_s_by_path.get(path, 0.0),
+                    runs=runs,
+                    edit_dist=edit_dist,
+                )
+                _write_per_image(per_image_dir, path, asdict(result), jsonl_f)
+                n_processed += 1
 
-            result = ImageResult(
-                image_file_name=img_path.name,
-                sweep=sweep.name,
-                elapsed_s=elapsed_s,
-                decode_s=decode_s,
-                runs=runs,
-                edit_dist=edit_dist,
+            # 6) Record decode failures.
+            for path, err in decode_failures:
+                _write_per_image(
+                    per_image_dir,
+                    path,
+                    {
+                        "image_file_name": path.name,
+                        "sweep": sweep.name,
+                        "error": f"decode failed: {err}",
+                        "decode_s": decode_s_by_path.get(path, 0.0),
+                    },
+                    jsonl_f,
+                )
+                n_processed += 1
+
+            # 7) Free decoded image buffers eagerly (matches the worker).
+            for _, img, _, _ in decoded:
+                if img is not None:
+                    try:
+                        img.close()
+                    except Exception:  # noqa: BLE001
+                        pass
+            del decoded, outputs, runs_by_path
+            gc.collect()
+
+            n_ok = len(batch_paths) - len(decode_failures)
+            logger.info(
+                "[%s] batch %d/%d done: %d image(s) (%d chat req) in %.1fs "
+                "(decode_par=%.1fs, chat=%.1fs, %.2fs/img)",
+                sweep.name,
+                batch_idx + 1,
+                n_batches,
+                len(batch_paths),
+                n_ok * sp_per_image,
+                decode_wall_s + chat_wall_s,
+                decode_wall_s,
+                chat_wall_s,
+                (decode_wall_s + chat_wall_s) / max(len(batch_paths), 1),
             )
-            _write_per_image(per_image_dir, img_path, asdict(result), jsonl_f)
-            n_processed += 1
-
-            # Free image buffer asap.
-            try:
-                img.close()
-            except Exception:  # noqa: BLE001
-                pass
-            del img, outputs
-            if n_processed % 16 == 0:
-                gc.collect()
 
     sweep_wall = time.perf_counter() - t_sweep_start
     logger.info(
-        "[%s] done in %.1fs (%d processed this run)",
+        "[%s] sweep done in %.1fs (%d image(s) processed this invocation, "
+        "%.2fs/img)",
         sweep.name,
         sweep_wall,
         n_processed,
+        sweep_wall / max(n_processed, 1),
     )
     return sweep_wall, n_processed
 
@@ -572,7 +718,7 @@ def write_report(
 
     aggs = {name: _agg(name) for name in SWEEPS}
     base = aggs.get("minimal", {})
-    base_wall = base.get("wall_s_sum") or 0.0
+    base_work = base.get("wall_s_sum") or 0.0
 
     lines: list[str] = []
     lines.append("# ocr_qwen_v1 — blind eval report\n")
@@ -580,51 +726,66 @@ def write_report(
         f"Input folder had **{n_images_total}** image(s). Sweeps executed in this "
         f"invocation: {', '.join(f'`{k}`' for k, v in sweep_counts.items() if v > 0) or '(none — all sweeps were already complete)'}.\n"
     )
-    lines.append("## Wall-time breakdown\n")
+    lines.append("## Cost breakdown\n")
     lines.append(
-        "Wall-time below excludes image decode (which is sweep-independent — it's a "
-        "constant CPU cost paid once per image regardless of vLLM settings).\n"
+        "Two cost columns:\n\n"
+        "- **GPU-work (s)** is the sum of per-image vLLM end-to-end latencies\n"
+        "  (`RequestStateStats.last_token_ts − arrival_time`). With batched\n"
+        "  execution, sibling requests in the same batch overlap, so this sum\n"
+        "  exceeds the actual wall clock — it is the right metric for *relative*\n"
+        "  cost comparisons between sweeps but **not** an estimate of run-time.\n"
+        "- **Wall (this run)** is the actual `time.perf_counter` delta for the\n"
+        "  current invocation. Only populated for sweeps that ran in this\n"
+        "  invocation (resumed-only sweeps show `–`).\n\n"
+        "Image decode is excluded — it is a sweep-independent CPU cost paid once\n"
+        "per image regardless of vLLM settings.\n"
     )
     lines.append(
-        "| sweep | n | description | wall (s) | per page (s) | vs minimal | mean ITL (ms/tok) | tokens/sweep | mean entropy (nats) |\n"
-        "|---|---:|---|---:|---:|---:|---:|---:|---:|\n"
+        "| sweep | n | description | GPU-work (s) | per page (s) | vs minimal | wall this run (s) | mean ITL (ms/tok) | tokens/sweep | mean entropy (nats) |\n"
+        "|---|---:|---|---:|---:|---:|---:|---:|---:|---:|\n"
     )
     for name, sw in SWEEPS.items():
         a = aggs[name]
         if not a or a["n"] == 0:
-            lines.append(f"| `{name}` | 0 | {sw.description} | – | – | – | – | – | – |\n")
+            lines.append(f"| `{name}` | 0 | {sw.description} | – | – | – | – | – | – | – |\n")
             continue
         rel = ""
-        if base_wall > 0 and name != "minimal":
-            rel = f"+{(a['wall_s_sum'] - base_wall) / base_wall * 100:.0f} %"
+        if base_work > 0 and name != "minimal":
+            rel = f"+{(a['wall_s_sum'] - base_work) / base_work * 100:.0f} %"
         elif name == "minimal":
             rel = "baseline"
+        run_wall = sweep_walls.get(name)
+        run_wall_str = f"{run_wall:.1f}" if run_wall is not None else "–"
         lines.append(
             f"| `{name}` | {a['n']} | {sw.description} | "
             f"{a['wall_s_sum']:.1f} | {a['wall_s_sum'] / a['n']:.2f} | {rel} | "
+            f"{run_wall_str} | "
             f"{_fmt(a['itl_mean_ms'])} | {a['tokens_sum']} | "
             f"{_fmt(a['entropy_mean_nats']) if not math.isnan(a['entropy_mean_nats']) else '–'} |\n"
         )
 
     lines.append("\n## Interpretation\n")
     lines.append(
-        "- `minimal` is the baseline. Any extra cost in the other rows is purely "
-        "the overhead of the additional vLLM measurement (logprobs collection, "
-        "extra completion via `n=2`, or a second-temperature run).\n"
-        "- `entropy` − `minimal` ≈ cost of capturing top-5 logprobs at every "
-        "decode step. Usually a few %.\n"
-        "- `consistency` − `minimal` ≈ cost of one extra completion per request "
-        "(vLLM continues-batches the two, so it's well below 2x).\n"
-        "- `full` − `entropy` ≈ cost of running the t=1 second pass for "
-        "edit-distance computation. This is roughly a second pass at full price, "
-        "but reuses prefix cache + vision tower outputs, so usually ~1.4× of the "
-        "`entropy` row.\n"
+        "- `minimal` is the baseline. Any extra cost in the other rows is purely\n"
+        "  the overhead of the additional vLLM measurement (logprobs collection,\n"
+        "  extra completion via `n=2`, or a second-temperature run).\n"
+        "- `entropy` − `minimal` ≈ cost of capturing top-5 logprobs at every\n"
+        "  decode step. Usually a few %.\n"
+        "- `consistency` − `minimal` ≈ cost of one extra completion per request\n"
+        "  (vLLM continues-batches the two, so it's well below 2×).\n"
+        "- `full` − `entropy` ≈ cost of running the t=1 second pass for\n"
+        "  edit-distance computation. This is roughly a second pass at full price,\n"
+        "  but reuses prefix cache + vision tower outputs, so usually ~1.4× of\n"
+        "  the `entropy` row.\n"
+        "- The **wall-this-run** column is what you'll feel; the **GPU-work**\n"
+        "  column is what you're paying for in GPU-seconds. The gap between\n"
+        "  them is the batching speed-up — bigger batch sizes widen it.\n"
     )
     if sweep_walls:
         lines.append("\n## This invocation\n")
         for name, w in sweep_walls.items():
             n = sweep_counts.get(name, 0)
-            lines.append(f"- `{name}`: processed {n} image(s) in {w:.1f}s\n")
+            lines.append(f"- `{name}`: processed {n} image(s) in {w:.1f}s wall-clock\n")
 
     report_path.write_text("".join(lines), encoding="utf-8")
     return report_path
@@ -716,6 +877,27 @@ def main(argv: list[str] | None = None) -> int:
         help="override OCRQwenV1Config.gpu_memory_utilization (e.g. 0.55 on a shared GPU)",
     )
     p.add_argument(
+        "--batch-size",
+        type=int,
+        default=128,
+        help=(
+            "number of images packed into one llm.chat call (matches the production "
+            "worker default). With sweep=full this means 2× that many chat requests "
+            "per batch (t=0 + t=1). Lower it (e.g. 32 or 64) if you hit host-RAM "
+            "pressure during prefill — see notes in worker.py for the memory model."
+        ),
+    )
+    p.add_argument(
+        "--decode-workers",
+        type=int,
+        default=16,
+        help=(
+            "parallel image-decode threads per batch. Same pattern as the worker's "
+            "s3_fetch_concurrency, but here the source is the local disk so a smaller "
+            "pool is plenty (decoding is CPU-bound and libvips releases the GIL)."
+        ),
+    )
+    p.add_argument(
         "--no-vllm",
         action="store_true",
         help="skip vLLM execution and only rebuild CSV+report from on-disk per-image jsons",
@@ -764,6 +946,8 @@ def main(argv: list[str] | None = None) -> int:
                     cfg,
                     images,
                     args.out,
+                    batch_size=args.batch_size,
+                    decode_workers=args.decode_workers,
                     overwrite=args.overwrite,
                 )
                 sweep_walls[name] = wall

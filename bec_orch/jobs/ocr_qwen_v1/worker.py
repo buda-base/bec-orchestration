@@ -142,7 +142,9 @@ class OCRQwenV1JobWorker:
 
         logger.info(
             f"[ocr_qwen_v1] loading vLLM model={cfg.model_id} dtype={cfg.dtype} "
-            f"gpu_mem_util={cfg.gpu_memory_utilization} max_model_len={cfg.max_model_len}"
+            f"gpu_mem_util={cfg.gpu_memory_utilization} max_model_len={cfg.max_model_len} "
+            f"rep_penalty={cfg.repetition_penalty} freq_penalty={cfg.frequency_penalty} "
+            f"presence_penalty={cfg.presence_penalty}"
         )
         t0 = time.time()
         llm = LLM(
@@ -164,6 +166,9 @@ class OCRQwenV1JobWorker:
         return SamplingParams(
             temperature=cfg.temperature,
             max_tokens=cfg.max_tokens,
+            repetition_penalty=cfg.repetition_penalty,
+            frequency_penalty=cfg.frequency_penalty,
+            presence_penalty=cfg.presence_penalty,
         )
 
     # ------------------------------------------------------------------

@@ -92,6 +92,36 @@ class OCRQwenV1Config:
     # Deterministic decoding for reproducibility + better batching cohesion.
     temperature: float = 0.0
 
+    # Repetition / frequency / presence penalties (passed straight through to
+    # ``vllm.SamplingParams``). The classic OCR-with-LLM failure mode is the
+    # model getting stuck emitting the same syllable or line until it hits
+    # ``max_tokens`` — these knobs (especially ``repetition_penalty``) suppress
+    # that behaviour at decode time.
+    #
+    # ``repetition_penalty`` (multiplicative, default 1.0):
+    #   > 1.0 penalises tokens already seen in prompt+generation so far,
+    #   < 1.0 encourages repetition. 1.05–1.20 is the usable range for OCR;
+    #   higher than ~1.25 starts hurting legitimately repeated content
+    #   (refrains, glyph runs, mantra-style passages). Set to 1.15 by default
+    #   — well above 1.0 to break stuck loops, but still safe for the
+    #   repetition that's normal in Tibetan pecha text.
+    #
+    # ``frequency_penalty`` (additive, scales with count, default 0.0):
+    #   logit -= count * frequency_penalty. > 0 discourages already-seen
+    #   tokens proportionally to how many times they've been emitted.
+    #   Kept at 0 by default — ``repetition_penalty`` is the right primary
+    #   knob for OCR; bump this only if a specific run shows runaway
+    #   repetition that the multiplicative penalty alone doesn't kill.
+    #
+    # ``presence_penalty`` (additive, fixed, default 0.0):
+    #   logit -= presence_penalty for any token already emitted at least
+    #   once. > 0 encourages topical drift. Almost never wanted for OCR
+    #   (we explicitly DO want to repeat tokens — they're real glyphs);
+    #   exposed for completeness.
+    repetition_penalty: float = 1.15
+    frequency_penalty: float = 0.0
+    presence_penalty: float = 0.0
+
     # ------------------------------------------------------------------
     # Image preprocessing
     # ------------------------------------------------------------------
@@ -216,6 +246,21 @@ class OCRQwenV1Config:
             raise ValueError(f"max_model_len too small: {self.max_model_len}")
         if self.max_tokens < 64 or self.max_tokens > self.max_model_len:
             raise ValueError(f"max_tokens out of range: {self.max_tokens}")
+        # vLLM ranges: repetition_penalty must be > 0 (multiplicative);
+        # frequency_penalty and presence_penalty must be in [-2, 2].
+        if self.repetition_penalty <= 0:
+            raise ValueError(
+                f"repetition_penalty must be > 0 (1.0 = no penalty), "
+                f"got {self.repetition_penalty}"
+            )
+        if not -2.0 <= self.frequency_penalty <= 2.0:
+            raise ValueError(
+                f"frequency_penalty out of [-2, 2]: {self.frequency_penalty}"
+            )
+        if not -2.0 <= self.presence_penalty <= 2.0:
+            raise ValueError(
+                f"presence_penalty out of [-2, 2]: {self.presence_penalty}"
+            )
         if self.max_image_side < 256:
             raise ValueError(f"max_image_side too small (quality cliff): {self.max_image_side}")
         if self.max_image_pixels < 256 * 256:

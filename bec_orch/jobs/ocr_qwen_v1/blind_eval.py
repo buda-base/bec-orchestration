@@ -31,6 +31,11 @@ CSV columns (per user spec):
     edit_dist              Levenshtein character edit distance between the
                            t=0 transcription and the t=1 transcription
                            (raw, not normalised)
+    transcription          model output text from the primary run (the t=0
+                           run when ``full`` was used; otherwise the first
+                           run of whichever sweep is available). The CSV is
+                           QUOTE_ALL so newlines in the transcription don't
+                           break parsers.
 
 The script can be re-run safely; sweeps that already wrote a per-image json
 are skipped. ``--sweeps`` lets you select a subset of measurement configs.
@@ -115,14 +120,12 @@ class SweepDef:
             # Greedy + top-5 logprobs so we can compute per-step entropy.
             return [SamplingParams(temperature=0.0, **logprobs_kw, **common)]
         if self.name == "consistency":
-            # Two greedy samples at moderate temperature — the Gemini doc's
+            # Two samples at moderate temperature — the Gemini doc's
             # recommended ``n=2`` consistency trick. Cheaper than two separate
             # SamplingParams because vLLM packs them under one request.
-            return [
-                SamplingParams(
-                    n=2, best_of=2, temperature=0.5, **logprobs_kw, **common
-                )
-            ]
+            # NB: ``best_of`` was removed from SamplingParams in vLLM V1; with
+            # ``n=2`` and temperature>0 you already get two distinct samples.
+            return [SamplingParams(n=2, temperature=0.5, **logprobs_kw, **common)]
         if self.name == "full":
             # The user's primary CSV target: t=0 with logprobs (drives ITL /
             # throughput / entropy columns) AND t=1 without logprobs (drives
@@ -630,6 +633,7 @@ def write_final_csv(out_dir: Path, images: list[Path]) -> Path:
         "num_generated_tokens",
         "mean_sequence_entropy",
         "edit_dist",
+        "transcription",
     ]
 
     def _load(sweep: str, stem: str) -> dict | None:
@@ -644,13 +648,14 @@ def write_final_csv(out_dir: Path, images: list[Path]) -> Path:
     import csv as _csv
 
     with csv_path.open("w", encoding="utf-8", newline="") as f:
-        w = _csv.writer(f)
+        # QUOTE_ALL so multi-line transcriptions don't break the CSV.
+        w = _csv.writer(f, quoting=_csv.QUOTE_ALL)
         w.writerow(cols)
         for img_path in images:
             stem = img_path.stem
             data = _load("full", stem) or _load("entropy", stem) or _load("minimal", stem)
             if data is None or "runs" not in data or not data["runs"]:
-                w.writerow([img_path.name, "", "", "", "", ""])
+                w.writerow([img_path.name, "", "", "", "", "", ""])
                 continue
             primary = data["runs"][0]
             edit_dist = data.get("edit_dist")
@@ -662,6 +667,7 @@ def write_final_csv(out_dir: Path, images: list[Path]) -> Path:
                     primary.get("num_generated_tokens") or "",
                     _fmt(primary.get("mean_sequence_entropy")),
                     "" if edit_dist is None else int(edit_dist),
+                    primary.get("text") or "",
                 ]
             )
     return csv_path

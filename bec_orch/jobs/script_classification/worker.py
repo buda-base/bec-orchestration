@@ -69,7 +69,7 @@ class ScriptClassificationJobWorker:
 
         from .vendor.loader import get_pipeline
 
-        self._pipe = get_pipeline()
+        self._pipe = get_pipeline(cfg)
         # Pipeline already computes a real model_version internally (short
         # checkpoint hashes from hf_hub_download's resolved snapshot path) —
         # reuse it rather than re-deriving from repo-id strings.

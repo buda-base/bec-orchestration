@@ -1,10 +1,13 @@
-import io
+import logging
 from pathlib import Path
 
+import torch
 from huggingface_hub import hf_hub_download
 from PIL import Image
 
 from . import config, transforms
+
+logger = logging.getLogger(__name__)
 
 # Blank-page pre-filter disabled: untested, no promising results. Every
 # image proceeds unconditionally to orientation + 6-class scoring. Kept
@@ -38,7 +41,24 @@ def _row(**overrides) -> dict:
 
 
 class Pipeline:
-    def __init__(self):
+    def __init__(self, cfg=None):
+        # Duck-typed rather than importing ScriptClassificationConfig, so
+        # vendor/ (kept diffable against upstream) doesn't gain a dependency
+        # on the job-level config package. Deviation from upstream: upstream
+        # is CPU-only. `use_gpu` defaults to True (GPU used whenever CUDA is
+        # available) with a warn-and-fallback to CPU, never a hard failure
+        # -- matches ldv1/worker.py's device-selection convention.
+        device = "cpu"
+        if getattr(cfg, "use_gpu", True):
+            if torch.cuda.is_available():
+                device = "cuda"
+                logger.info(f"[script_classification] using GPU: {torch.cuda.get_device_name(0)}")
+            else:
+                logger.warning(
+                    "[script_classification] use_gpu=True but CUDA not available, using CPU"
+                )
+        self._device = device
+
         self._processor = transforms.get_processor()
 
         orient_path = hf_hub_download(
@@ -48,8 +68,10 @@ class Pipeline:
             repo_id=config.SIXCLASS_REPO_ID, filename=config.CHECKPOINT_FILENAME
         )
 
-        self._orientation = Classifier.from_checkpoint(orient_path, config.BACKBONE_ID)
-        self._sixclass = Classifier.from_checkpoint(six_path, config.BACKBONE_ID)
+        self._orientation = Classifier.from_checkpoint(
+            orient_path, config.BACKBONE_ID, device=device
+        )
+        self._sixclass = Classifier.from_checkpoint(six_path, config.BACKBONE_ID, device=device)
 
         self.model_version = (
             f"orientation:{_short_sha(orient_path)};sixclass:{_short_sha(six_path)}"
@@ -62,9 +84,12 @@ class Pipeline:
             return _row(status="error", error=str(e), model_version=self.model_version)
 
     def _run(self, image_bytes: bytes) -> dict:
-        img = Image.open(io.BytesIO(image_bytes))
-        exif_tag = img.getexif().get(0x0112)  # raw tag only, never applied to pixels
-        img = img.convert("RGB")
+        # decode_and_resize decodes AND resizes-short-edge in a single pass
+        # (libvips fast-path, PIL fallback) -- see transforms.py. img here
+        # is already small (~config.CROP_SIZE short edge), so the 180°
+        # rotation below (when needed) operates on the small result instead
+        # of a full-resolution re-decode/re-resize.
+        img, exif_tag = transforms.decode_and_resize(image_bytes)
 
         # if is_blank(img):
         #     return _row(
@@ -72,6 +97,10 @@ class Pipeline:
         #         exif_orientation_tag=exif_tag,
         #         model_version=self.model_version,
         #     )
+        # NOTE: if re-enabled, is_blank(img) would now see the short-edge-
+        # resized image (post decode_and_resize), not the full-resolution
+        # decode as before this restructure -- re-validate any blank-
+        # detection thresholds against the resized input before re-enabling.
 
         tensor_orig = transforms.preprocess(img)
         orient_label, orient_probs = self._orientation.predict(tensor_orig)
@@ -79,6 +108,12 @@ class Pipeline:
 
         if orient_label == config.ORIENTATION_FLIPPED_LABEL:
             rotation_applied = 180
+            # img is already short-edge-resized, so this rotation is cheap
+            # regardless of decode library -- resize-short-edge happens
+            # exactly once (above), never redone at full resolution. This is
+            # mathematically exact: for a uniform-scale aspect-preserving
+            # resize, 180° rotation commutes with resize, so this is pixel-
+            # identical to the old rotate-full-res-then-resize order.
             img_rot = img.transpose(Image.Transpose.ROTATE_180)  # lossless, not .rotate(180)
             tensor_final = transforms.preprocess(img_rot)
         else:

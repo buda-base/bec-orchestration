@@ -48,12 +48,17 @@ class ScriptClassificationConfig:
     # ------------------------------------------------------------------
     # The vendored pipeline's contract is one image per ``pipe.run()`` call
     # (no batched tensor inference exists in the vendored code, and building
-    # that would be over-engineering for v1). CPU torch inference is
-    # effectively serial per-process anyway, so raising this only buys
-    # overlap between S3 fetch and inference of previous pages, not
-    # parallel model calls. Default 1 = strictly sequential classification.
+    # that would be over-engineering for v1). Torch inference is effectively
+    # serial per-process anyway, so raising this only buys overlap between
+    # S3 fetch and inference of previous pages, not parallel model calls.
+    # Default 1 = strictly sequential classification.
     # Raise only after profiling on the target instance.
     inference_workers: int = 1
+
+    # When True (default), both classifiers run on CUDA if available --
+    # falls back to CPU with a logged warning if CUDA isn't present (never
+    # a hard failure). See vendor/pipeline.py::Pipeline.__init__.
+    use_gpu: bool = True
 
     # ------------------------------------------------------------------
     # Output writer

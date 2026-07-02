@@ -12,7 +12,7 @@ by BDRC on the HuggingFace Hub.
 | | |
 |---|---|
 | Models | `BDRC/tibetan-page-orientation-classifier`, `BDRC/6-class-tibetan-script-classifier` |
-| Engine | vendored PyTorch pipeline (CPU-only for v1, synchronous, one image per call) |
+| Engine | vendored PyTorch pipeline (GPU by default with CPU fallback, synchronous, one image per call) |
 | Integration | code vendored into `vendor/` — see "Known limitations" below |
 
 ## Output
@@ -57,15 +57,29 @@ Parquet schema:
 - **No `flip_applied` column.** Upstream returns both `flip_applied` (bool)
   and `rotation_applied` (int, 0/180) — these are a 1:1 encoding of the
   same fact. Only `rotation_applied` is kept.
-- **CPU-only.** The vendored `Classifier`/`DINOv3Classifier` code has no
-  `.to(device)` calls, matching upstream as-is. Revisit if per-page latency
-  on the target CPU instance proves too slow (see "Running locally" below
-  for how to measure this).
+- **GPU by default, CPU fallback.** Deviation from upstream (which is
+  CPU-only, no `.to(device)` calls anywhere). `ScriptClassificationConfig.use_gpu`
+  defaults to `True`: both classifiers run on CUDA when available. If CUDA
+  isn't available, `vendor/pipeline.py::Pipeline.__init__` logs a warning
+  and falls back to CPU — never a hard failure, so this also works
+  unchanged in a CPU-only dev/smoke-test environment. Set `use_gpu = False`
+  to force CPU even when a GPU is present.
 - **Sequential inference.** `pipe.run()` is one image per call by upstream
   contract — there is no batched tensor inference in the vendored code.
   `ScriptClassificationConfig.inference_workers` defaults to `1`
   (strictly sequential); raising it only overlaps S3 fetch with inference
   of previous pages, it does not create batched model calls.
+- **Decode/resize restructured (behavior-preserving).** Upstream decodes
+  with PIL and redundantly re-resizes from full resolution for both the
+  upright and 180°-rotated passes. This vendor decodes via `libvips` when
+  available (fused decode+resize in one pass, falling back to PIL
+  otherwise — see `vendor/transforms.py::decode_and_resize`) and resizes
+  short-edge exactly once per page; the rotated pass rotates that
+  already-small result instead of re-resizing from full resolution. Output
+  is mathematically identical (a uniform-scale resize commutes with 180°
+  rotation) at lower cost, and was validated to produce 0 label
+  disagreements against the old PIL-only path across 180 real sample pages
+  spanning all 6 script classes.
 
 ## Vendored code
 

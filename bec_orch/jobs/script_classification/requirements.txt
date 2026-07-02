@@ -5,8 +5,11 @@
 #
 # IMPORTANT:
 # - Do NOT add `torch` / `torchvision` here — the DLAMI build is used as-is.
-#   This job is CPU-only for v1 (see vendor/models.py — no `.to(device)`
-#   calls), so no CUDA-specific torch build is required.
+#   GPU use is on by default (ScriptClassificationConfig.use_gpu = True);
+#   vendor/models.py moves both classifiers to CUDA when available, falling
+#   back to CPU with a logged warning otherwise (see
+#   vendor/pipeline.py::Pipeline.__init__) -- no CUDA-specific torch build
+#   is required beyond what the DLAMI already provides.
 # - Upstream (https://github.com/OpenPecha/tibetan-manuscript-classifier)
 #   pins `requires-python>=3.14`; nothing in the vendored code
 #   (bec_orch/jobs/script_classification/vendor/) is actually 3.14-specific.
@@ -27,3 +30,11 @@ huggingface_hub>=0.35
 pyarrow
 s3fs
 boto3
+
+# libvips fast-path decode+resize for vendor/transforms.py (falls back to
+# PIL automatically if unavailable -- see the _VIPS_OK guard there).
+# `[binary]` pulls in a self-contained libvips build (no system
+# `apt install libvips` needed) -- same pin style as the top-level
+# requirements.txt and ../ldv1/requirements.txt.
+pyvips==3.1.1
+pyvips[binary]

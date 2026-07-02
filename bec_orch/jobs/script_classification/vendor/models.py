@@ -1,12 +1,22 @@
 import torch
 import torch.nn as nn
-from transformers import AutoModel
+from transformers import AutoConfig, AutoModel
 
 
 class DINOv3Classifier(nn.Module):
     def __init__(self, model_id: str, num_classes: int, dropout: float = 0.1, pooling: str = "cls"):
         super().__init__()
-        self.backbone = AutoModel.from_pretrained(model_id)
+        # Deviation from upstream: upstream calls AutoModel.from_pretrained(model_id),
+        # which downloads the full gated backbone checkpoint just to have every
+        # one of its weights immediately overwritten by from_checkpoint()'s
+        # load_state_dict(ckpt["model_state_dict"]) below (confirmed empirically:
+        # the checkpoint's state dict contains all 211 backbone.* keys, and
+        # load_state_dict defaults to strict=True). Building from config only
+        # fetches the small config.json (still needs gated-repo access, but no
+        # full weight download/materialization) since the real fine-tuned
+        # weights get loaded right after regardless of initial values.
+        config = AutoConfig.from_pretrained(model_id)
+        self.backbone = AutoModel.from_config(config)
         self.pooling = pooling
         hidden = self.backbone.config.hidden_size
         # "cls_mean_std" (used by the 6-class checkpoint) concatenates CLS with
@@ -35,12 +45,17 @@ class DINOv3Classifier(nn.Module):
 
 
 class Classifier:
-    def __init__(self, model: DINOv3Classifier, idx_to_label: dict):
-        self.model = model.eval()
+    # Deviation from upstream: adds device handling (upstream is CPU-only,
+    # no .to(device) anywhere). `device` defaults to "cpu" so any external/
+    # test caller that constructs `Classifier(model, idx_to_label)` directly
+    # keeps working unchanged.
+    def __init__(self, model: DINOv3Classifier, idx_to_label: dict, device: str = "cpu"):
+        self.model = model.eval().to(device)
         self.idx_to_label = idx_to_label
+        self.device = device
 
     @classmethod
-    def from_checkpoint(cls, path: str, model_id: str) -> "Classifier":
+    def from_checkpoint(cls, path: str, model_id: str, device: str = "cpu") -> "Classifier":
         ckpt = torch.load(path, map_location="cpu", weights_only=False)
         # checkpoints store either idx_to_label (str keys) or label_to_idx; normalize to int-keyed idx_to_label
         if "idx_to_label" in ckpt:
@@ -50,11 +65,11 @@ class Classifier:
         pooling = ckpt.get("pooling", "cls")
         model = DINOv3Classifier(model_id, num_classes=len(idx_to_label), pooling=pooling)
         model.load_state_dict(ckpt["model_state_dict"])
-        return cls(model, idx_to_label)
+        return cls(model, idx_to_label, device=device)
 
     @torch.no_grad()
     def predict(self, pixel_values):
-        logits = self.model(pixel_values)
+        logits = self.model(pixel_values.to(self.device))
         probs = torch.softmax(logits, dim=-1)[0].tolist()
         idx = max(range(len(probs)), key=probs.__getitem__)
         return self.idx_to_label[idx], probs

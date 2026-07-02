@@ -21,7 +21,14 @@ EnvironmentFile=/etc/bec/worker.env
 
 WorkingDirectory=/home/ubuntu/bec-orchestration
 
-# CPU-only for v1 (see vendor/models.py) — no CUDA/NCCL env vars needed.
+# GPU is used by default when available (ScriptClassificationConfig.use_gpu
+# = True; see vendor/pipeline.py::Pipeline.__init__), falling back to CPU
+# with a logged warning otherwise -- no NCCL env vars needed (single-GPU,
+# single-process, no distributed inference here). If this unit is deployed
+# to a CPU-only instance type, no config changes are required; it just runs
+# on CPU. Memory limits below were sized for CPU-only inference and may
+# need revisiting once run on a GPU instance type (CUDA context overhead) --
+# tune after a real smoke test (see README).
 Environment="PATH=/opt/pytorch/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 Environment="HF_HOME=/var/cache/bec-script-classification/hf"
 Environment="HF_HUB_DISABLE_PROGRESS_BARS=1"

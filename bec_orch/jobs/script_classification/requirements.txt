@@ -1,0 +1,29 @@
+# This project is validated on AWS Deep Learning AMI (DLAMI) for PyTorch (GPU).
+# Assumptions: Ubuntu 22.04, Python 3.12.12, DLAMI-provided torch/torchvision/
+# pillow already installed (see ../ldv1/requirements.txt for the reference
+# versions pinned in that AMI family).
+#
+# IMPORTANT:
+# - Do NOT add `torch` / `torchvision` here — the DLAMI build is used as-is.
+#   This job is CPU-only for v1 (see vendor/models.py — no `.to(device)`
+#   calls), so no CUDA-specific torch build is required.
+# - Upstream (https://github.com/OpenPecha/tibetan-manuscript-classifier)
+#   pins `requires-python>=3.14`; nothing in the vendored code
+#   (bec_orch/jobs/script_classification/vendor/) is actually 3.14-specific.
+#   Confirmed importable on 3.12.12 — verify transformers>=4.56 supports the
+#   DINOv3 architecture on this Python/torch combination before deploying.
+# - DLAMI ships numpy==1.26.4; upstream's own pyproject.toml wants
+#   numpy>=2.0. Verify this combination actually works during smoke testing
+#   (see README.md) before deciding whether a numpy upgrade is needed here
+#   — an upgrade could affect opencv-python-headless (ldv1) if venvs are
+#   ever shared.
+#
+# Requires an HF_TOKEN env var (or `huggingface-cli login`) before first run:
+# BDRC/tibetan-page-orientation-classifier, BDRC/6-class-tibetan-script-classifier,
+# and facebook/dinov3-vits16-pretrain-lvd1689m are all gated HF repos.
+
+transformers>=4.56.0
+huggingface_hub>=0.35
+pyarrow
+s3fs
+boto3

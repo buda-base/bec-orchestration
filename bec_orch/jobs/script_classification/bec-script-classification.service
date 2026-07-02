@@ -1,0 +1,82 @@
+[Unit]
+Description=BEC Worker - script_classification (BDRC Tibetan script classifier)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+
+User=ubuntu
+Group=ubuntu
+
+# Load environment variables: BEC_SQL_*, BEC_REGION, BEC_DEST_S3_BUCKET,
+# BEC_SOURCE_S3_BUCKET, AWS_* credentials, and HF_TOKEN.
+#
+# HF_TOKEN is REQUIRED: BDRC/tibetan-page-orientation-classifier,
+# BDRC/6-class-tibetan-script-classifier, and
+# facebook/dinov3-vits16-pretrain-lvd1689m are all gated HF repos. Without
+# it, model download in ScriptClassificationJobWorker.__init__ fails and the
+# worker never becomes ready.
+EnvironmentFile=/etc/bec/worker.env
+
+WorkingDirectory=/home/ubuntu/bec-orchestration
+
+# CPU-only for v1 (see vendor/models.py) — no CUDA/NCCL env vars needed.
+Environment="PATH=/opt/pytorch/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+Environment="HF_HOME=/var/cache/bec-script-classification/hf"
+Environment="HF_HUB_DISABLE_PROGRESS_BARS=1"
+Environment="PYTHONUNBUFFERED=1"
+Environment="TRANSFORMERS_VERBOSITY=warning"
+# Don't phone home (respected by recent huggingface_hub/transformers; also
+# pointless on a fleet of 100 workers).
+Environment="DO_NOT_TRACK=1"
+
+# Worker:
+#   --visibility-timeout 1800 matches ScriptClassificationConfig.volume_timeout_s (30 min)
+ExecStart=/opt/pytorch/bin/bec worker \
+    --job-name script_classification \
+    --visibility-timeout 1800
+
+# Graceful shutdown — lets the worker finish the in-flight volume and write
+# its parquet artifact before exiting.
+KillMode=mixed
+KillSignal=SIGTERM
+TimeoutStopSec=2000
+
+# Restart on crash but back off so a wedged process doesn't hot-loop.
+Restart=on-failure
+RestartSec=30
+StartLimitInterval=600
+StartLimitBurst=3
+
+# Cgroup memory limits. Conservative starting point — no vLLM subprocess
+# here (unlike ocr_qwen_v1), just two small DINOv3 ViT-S/16 models plus
+# batch bytes, but there's no CPU-only-inference precedent job in this repo
+# yet to copy exact numbers from. Tune after a real smoke test (see README).
+MemoryHigh=6G
+MemoryMax=8G
+
+LimitNOFILE=65536
+LimitNPROC=4096
+LimitCORE=0
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=bec-script-classification
+
+# Security hardening, with the few writable paths HuggingFace needs:
+#   - /tmp                                : scratch (PrivateTmp)
+#   - /var/cache/bec-script-classification : HuggingFace Hub model cache
+#                                             (auto-created by CacheDirectory
+#                                             below, made writable)
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=-/var/log/bec
+
+CacheDirectory=bec-script-classification
+CacheDirectoryMode=0750
+
+[Install]
+WantedBy=multi-user.target

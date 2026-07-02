@@ -12,7 +12,7 @@ by BDRC on the HuggingFace Hub.
 | | |
 |---|---|
 | Models | `BDRC/tibetan-page-orientation-classifier`, `BDRC/6-class-tibetan-script-classifier` |
-| Engine | vendored PyTorch pipeline (GPU by default with CPU fallback, synchronous, one image per call) |
+| Engine | vendored PyTorch pipeline (GPU by default with CPU fallback, batched — one model call per S3-fetch batch) |
 | Integration | code vendored into `vendor/` — see "Known limitations" below |
 
 ## Output
@@ -64,11 +64,29 @@ Parquet schema:
   and falls back to CPU — never a hard failure, so this also works
   unchanged in a CPU-only dev/smoke-test environment. Set `use_gpu = False`
   to force CPU even when a GPU is present.
-- **Sequential inference.** `pipe.run()` is one image per call by upstream
-  contract — there is no batched tensor inference in the vendored code.
-  `ScriptClassificationConfig.inference_workers` defaults to `1`
-  (strictly sequential); raising it only overlaps S3 fetch with inference
-  of previous pages, it does not create batched model calls.
+- **Batched inference.** Deviation from upstream (which contracts one image
+  per `pipe.run()` call). `vendor/pipeline.py::Pipeline.run_batch(list[bytes])`
+  is the worker's actual entry point: it decode+resize+crops every image in
+  the batch in parallel (`ScriptClassificationConfig.inference_workers`
+  thread pool), normalizes the whole batch in one HF-processor call, runs
+  the orientation model **once** for the whole batch, corrects the
+  six-class model's input in place — `torch.flip`ping just the rows the
+  orientation model called "flipped" (mathematically identical to the old
+  per-image rotate-then-renormalize for the common case, since
+  normalization commutes with a spatial flip) — then runs the six-class
+  model **once** more. A per-image decode failure only marks that one image
+  `status="error"`; a failure in a shared batch step (normalize, or either
+  model's forward pass) marks every surviving image in that batch as
+  `status="error"` rather than crashing the worker. The single-image
+  `pipe.run()` still exists unchanged (used by the smoke-test snippet
+  below) but is no longer what the worker calls in production.
+  **Known narrow exception**: `_center_crop`'s rare white-padding fallback
+  (only hit when resize rounding leaves a crop 1px short) does *not*
+  commute exactly under this restructure — confirmed via synthetic
+  1px-short test images (see `vendor/pipeline.py::Pipeline.run_batch`'s
+  docstring), though the predicted label never changed in that check. This
+  branch is rare enough (a rounding artifact) that it's shipped as-is with
+  this caveat rather than adding a slower per-image fallback path for it.
 - **Decode/resize restructured (behavior-preserving).** Upstream decodes
   with PIL and redundantly re-resizes from full resolution for both the
   upright and 180°-rotated passes. This vendor decodes via `libvips` when
@@ -96,9 +114,9 @@ syncs. It's vendored (not an external pip/git dependency) because:
 ## Failure semantics
 
 - A per-volume failure rate **above `max_page_failure_rate` (default 5%)**
-  marks the task **retryable** (likely a transient S3 issue, since
-  `pipe.run()` itself never raises — classification errors are also
-  captured as `status="error"` rows, not exceptions).
+  marks the task **retryable** (likely a transient S3 issue, since neither
+  `pipe.run()` nor `pipe.run_batch()` ever raises — classification errors
+  are also captured as `status="error"` rows, not exceptions).
 - A failure rate **at or below the threshold** is considered a success —
   bad pages are still recorded in the parquet with `status="error"`.
 

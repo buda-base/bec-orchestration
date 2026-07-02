@@ -67,9 +67,21 @@ class Classifier:
         model.load_state_dict(ckpt["model_state_dict"])
         return cls(model, idx_to_label, device=device)
 
-    @torch.no_grad()
     def predict(self, pixel_values):
+        return self.predict_batch(pixel_values)[0]
+
+    @torch.no_grad()
+    def predict_batch(self, pixel_values):
+        # Deviation from upstream: batched inference. Safe to reuse for
+        # batch size 1 (what `predict` does above) -- DINOv3Classifier.head
+        # is LayerNorm (per-sample, not per-batch) + Dropout (disabled by
+        # .eval() in __init__), and the ViT backbone itself has no
+        # BatchNorm anywhere, so there is no cross-row coupling regardless
+        # of batch size.
         logits = self.model(pixel_values.to(self.device))
-        probs = torch.softmax(logits, dim=-1)[0].tolist()
-        idx = max(range(len(probs)), key=probs.__getitem__)
-        return self.idx_to_label[idx], probs
+        probs = torch.softmax(logits, dim=-1).tolist()
+        out = []
+        for row in probs:
+            idx = max(range(len(row)), key=row.__getitem__)
+            out.append((self.idx_to_label[idx], row))
+        return out

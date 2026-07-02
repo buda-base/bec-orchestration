@@ -164,3 +164,37 @@ def preprocess(img: Image.Image):
     )["pixel_values"]
     assert pv.shape[-2:] == (config.CROP_SIZE, config.CROP_SIZE)
     return pv
+
+
+def decode_resize_crop(
+    image_bytes: bytes, target: int = config.CROP_SIZE
+) -> tuple[Image.Image, int | None]:
+    """Decode + resize-short-edge + center-crop in one call -- the unit of
+    CPU-bound work batched inference parallelizes across a thread pool (see
+    ``pipeline.py::Pipeline.run_batch``). After this, ``img`` is guaranteed
+    exactly ``target x target``, so a list of these can go straight into
+    ``preprocess_batch`` without any further resizing.
+    """
+    img, exif_tag = decode_and_resize(image_bytes, target)
+    cropped = _center_crop(img, target)
+    return cropped, exif_tag
+
+
+def preprocess_batch(imgs: list[Image.Image]):
+    """Batched counterpart to ``preprocess`` -- normalizes a list of
+    already-cropped (``CROP_SIZE x CROP_SIZE``) images in a single HF
+    processor call, producing one ``[N, 3, CROP_SIZE, CROP_SIZE]`` tensor.
+
+    Deliberately duplicates ``preprocess``'s tiny processor-call body rather
+    than having ``preprocess`` delegate to this (or vice versa) -- keeps the
+    already-validated single-image path untouched.
+    """
+    pv = get_processor()(
+        images=imgs,
+        do_resize=False,
+        do_center_crop=False,
+        return_tensors="pt",
+    )["pixel_values"]
+    assert pv.shape[0] == len(imgs)
+    assert pv.shape[-2:] == (config.CROP_SIZE, config.CROP_SIZE)
+    return pv

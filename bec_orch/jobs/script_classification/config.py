@@ -28,7 +28,14 @@ class ScriptClassificationConfig:
     # ------------------------------------------------------------------
     # Pages fetched from S3 (raw bytes only — the vendored pipeline decodes
     # internally) per fetch -> classify -> write cycle. Bounds how many raw
-    # image byte-strings are resident in the parent process at once.
+    # image byte-strings are resident in the parent process at once. As of
+    # batched inference (vendor/pipeline.py::Pipeline.run_batch), this ALSO
+    # doubles as the model's forward-pass batch size -- the whole fetched
+    # batch is classified in one run_batch() call, one model call per
+    # batch rather than one per image. There is no separate model-batch-size
+    # cap: ViT-S/16 activation memory at N=64, 448x448 is trivial on either
+    # CPU or GPU. If this is ever raised substantially for unrelated
+    # S3-throughput reasons, be aware it also raises the model batch size.
     classify_batch_size: int = 64
 
     # ThreadPoolExecutor size for parallel S3 GET. Classification is
@@ -46,14 +53,20 @@ class ScriptClassificationConfig:
     # ------------------------------------------------------------------
     # Inference
     # ------------------------------------------------------------------
-    # The vendored pipeline's contract is one image per ``pipe.run()`` call
-    # (no batched tensor inference exists in the vendored code, and building
-    # that would be over-engineering for v1). Torch inference is effectively
-    # serial per-process anyway, so raising this only buys overlap between
-    # S3 fetch and inference of previous pages, not parallel model calls.
-    # Default 1 = strictly sequential classification.
-    # Raise only after profiling on the target instance.
-    inference_workers: int = 1
+    # ThreadPoolExecutor size for parallel per-image decode+resize+crop
+    # *within* a single classify batch (see
+    # vendor/pipeline.py::Pipeline.run_batch's self._decode_pool). This is
+    # where batched inference's CPU-side parallelism lives -- each of the
+    # two model forward passes is now a single batched call per classify
+    # batch, not one call per image, so this knob controls decode/crop
+    # throughput, not model-call concurrency. Default is a placeholder sized
+    # by analogy to ldv1's tile_workers (24) -- NOT derived from real fleet
+    # data, profile on the actual target instance type before trusting it in
+    # production. See bec-script-classification.service's
+    # MemoryHigh/MemoryMax, which were sized for the OLD one-image-at-a-time
+    # decode profile and may need re-tuning now that up to this many
+    # full-resolution image decodes can be in flight concurrently.
+    inference_workers: int = 16
 
     # When True (default), both classifiers run on CUDA if available --
     # falls back to CPU with a logged warning if CUDA isn't present (never

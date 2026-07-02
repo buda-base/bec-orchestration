@@ -1,4 +1,5 @@
 import logging
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import torch
@@ -58,6 +59,16 @@ class Pipeline:
                     "[script_classification] use_gpu=True but CUDA not available, using CPU"
                 )
         self._device = device
+
+        # Thread pool for parallel per-image decode+resize+crop inside
+        # run_batch() (CPU-bound work; libvips releases the GIL, so this
+        # genuinely parallelizes). Owned for the process lifetime -- Pipeline
+        # itself is already a process-lifetime singleton via loader.py's
+        # get_pipeline(), so there's no per-volume teardown/recreation.
+        self._decode_pool = ThreadPoolExecutor(
+            max_workers=max(1, getattr(cfg, "inference_workers", 1)),
+            thread_name_prefix="scriptcls-decode",
+        )
 
         self._processor = transforms.get_processor()
 
@@ -132,3 +143,111 @@ class Pipeline:
             final_label=six_label,
             model_version=self.model_version,
         )
+
+    def run_batch(self, images_bytes: list[bytes]) -> list[dict]:
+        """Batched counterpart to ``run``: same contract (never raises, one
+        row per input, same order), but decodes+preprocesses the whole batch
+        in parallel and runs each model exactly once per call instead of
+        once per image.
+
+        Failure isolation (mirrors ``ldv1``'s tile-batching pattern): a
+        per-image decode failure is dropped before batching (never padded
+        into the tensor) and immediately becomes a ``status="error"`` row
+        for that image only. A failure in a whole-batch step (the shared
+        normalize call or either model's forward pass) marks every
+        surviving image in the batch as ``status="error"`` rather than
+        raising and losing the whole batch.
+
+        Known narrow residual risk, checked empirically: ``_center_crop``'s
+        rare white-padding fallback (only hit when resize rounding leaves a
+        crop 1px short -- see ``transforms.py``) computes its paste offset
+        via floor division, biasing the extra padding pixel to the
+        bottom/right. Rotating the source image before cropping (the old
+        per-image path) vs. cropping then flipping the padded, normalized
+        tensor (this method) do NOT produce pixel-identical output in this
+        branch -- confirmed via synthetic 1px-short test images (max
+        normalized-tensor diff ~4.5, ~19% of pixels affected). However, on
+        those same test images neither the orientation nor six-class
+        predicted label changed. This is a narrow, rare (rounding-only) edge
+        case, not exhaustively re-tested against every possible crop-short
+        scenario -- flagged here rather than silently assumed safe.
+        """
+        n = len(images_bytes)
+        if n == 0:
+            return []
+        results: list[dict | None] = [None] * n
+
+        # Step 1: decode+resize+crop each image in parallel. Futures are
+        # submitted (and collected) in input order -- not as_completed() --
+        # so results[] indices line up without a re-sort step; the threads
+        # themselves still run concurrently.
+        futures = [self._decode_pool.submit(transforms.decode_resize_crop, b) for b in images_bytes]
+        imgs: list[Image.Image] = []
+        exif_tags: list[int | None] = []
+        idxs: list[int] = []
+        for i, fut in enumerate(futures):
+            try:
+                img, tag = fut.result()
+                imgs.append(img)
+                exif_tags.append(tag)
+                idxs.append(i)
+            except Exception as e:
+                results[i] = _row(status="error", error=str(e), model_version=self.model_version)
+
+        if not imgs:  # every image in the batch failed to decode
+            return results
+
+        # Step 2: one batched normalize call -> [M,3,CROP_SIZE,CROP_SIZE].
+        try:
+            tensor_orig = transforms.preprocess_batch(imgs)
+        except Exception as e:
+            for i in idxs:
+                results[i] = _row(status="error", error=str(e), model_version=self.model_version)
+            return results
+
+        # Step 3: one orientation forward pass for the whole batch.
+        try:
+            orient_results = self._orientation.predict_batch(tensor_orig)
+        except Exception as e:
+            for i in idxs:
+                results[i] = _row(status="error", error=str(e), model_version=self.model_version)
+            return results
+
+        # Step 4: build the sixclass input in place. Same [M,...] shape as
+        # tensor_orig -- the batch does NOT grow. Rows the orientation model
+        # called "flipped" are overwritten with their 180°-rotated version
+        # at the same row index; every image still contributes exactly one
+        # row, mirroring _run's tensor_final = tensor_orig (reuse) vs.
+        # tensor_final = preprocess(img_rot) (replace) either/or.
+        flip_mask = [label == config.ORIENTATION_FLIPPED_LABEL for label, _ in orient_results]
+        tensor_final = tensor_orig.clone()
+        flip_pos = [j for j, f in enumerate(flip_mask) if f]
+        if flip_pos:
+            pos = torch.tensor(flip_pos, dtype=torch.long)
+            tensor_final[pos] = torch.flip(tensor_orig[pos], dims=(-2, -1))
+
+        # Step 5: one sixclass forward pass for the whole (corrected) batch.
+        try:
+            six_results = self._sixclass.predict_batch(tensor_final)
+        except Exception as e:
+            for i in idxs:
+                results[i] = _row(status="error", error=str(e), model_version=self.model_version)
+            return results
+
+        # Step 6: assemble successful rows back into their original positions.
+        for j, i in enumerate(idxs):
+            orient_label, orient_probs = orient_results[j]
+            six_label, six_probs = six_results[j]
+            results[i] = _row(
+                exif_orientation_tag=exif_tags[j],
+                orientation_pred=orient_label,
+                orientation_prob=max(orient_probs),
+                rotation_applied=180 if flip_mask[j] else 0,
+                sixclass_label=six_label,
+                sixclass_probs=six_probs,
+                final_label=six_label,
+                model_version=self.model_version,
+            )
+
+        assert all(r is not None for r in results)
+        return results

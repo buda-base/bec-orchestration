@@ -2,11 +2,18 @@
 
 Wraps the vendored ``tibetan-manuscript-classifier`` pipeline (orientation +
 6-class script classification; blank-page pre-filter disabled — see
-``vendor/pipeline.py``). Its entire integration surface is
-``pipe.run(image_bytes) -> dict``: it decodes, preprocesses, and classifies
-internally and never raises. So the worker's only job is: fetch raw bytes
-per page from S3 (in fixed-size batches, to bound resident memory), hand
-them straight to ``pipe.run()``, and stream results to parquet.
+``vendor/pipeline.py``). Its integration surface is
+``pipe.run_batch(list[bytes]) -> list[dict]`` (plus the single-image
+``pipe.run(bytes) -> dict``, still available and used by the README's local
+smoke-test snippet): both decode, preprocess, and classify internally and
+never raise. So the worker's only job is: fetch raw bytes per page from S3
+(in fixed-size batches, to bound resident memory), hand the whole batch
+straight to ``pipe.run_batch()``, and stream results to parquet.
+``run_batch()`` internally parallelizes per-image decode+crop across a
+small thread pool it owns (sized by ``cfg.inference_workers``) before
+running two single batched-tensor model forward passes — this worker has no
+knowledge of any of that, preserving the same fetch/classify separation as
+before.
 
 The pipeline (both HF checkpoints) is loaded once in ``__init__`` and
 reused across every volume this worker process handles — there is no
@@ -174,8 +181,11 @@ class ScriptClassificationJobWorker:
                     continue
 
                 t_classify = time.time()
-                for page in fetched:
-                    row = self._pipe.run(page.data)  # never raises
+                # never raises; len(rows) == len(fetched), order-aligned
+                # (_fetch_raw_bytes returns `fetched` in stable manifest
+                # order, and run_batch is contracted to preserve it).
+                rows = self._pipe.run_batch([page.data for page in fetched])
+                for page, row in zip(fetched, rows):
                     if row["status"] == "ok":
                         writer.write_success(
                             filename=page.filename,

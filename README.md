@@ -44,6 +44,7 @@ bec_orch/
       base.py            # JobWorker Protocol / ABC + shared helpers for job workers
       shared/            # shared code used across multiple jobs
       ldv1/              # line detection v1 job worker ()
+      script_classification/
 
     orch/                # for orchestration of workers (not used on the instance)
       __init__.py

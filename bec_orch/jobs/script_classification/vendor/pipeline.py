@@ -219,12 +219,17 @@ class Pipeline:
         # at the same row index; every image still contributes exactly one
         # row, mirroring _run's tensor_final = tensor_orig (reuse) vs.
         # tensor_final = preprocess(img_rot) (replace) either/or.
-        flip_mask = [label == config.ORIENTATION_FLIPPED_LABEL for label, _ in orient_results]
-        tensor_final = tensor_orig.clone()
-        flip_pos = [j for j, f in enumerate(flip_mask) if f]
-        if flip_pos:
-            pos = torch.tensor(flip_pos, dtype=torch.long)
-            tensor_final[pos] = torch.flip(tensor_orig[pos], dims=(-2, -1))
+        try:
+            flip_mask = [label == config.ORIENTATION_FLIPPED_LABEL for label, _ in orient_results]
+            tensor_final = tensor_orig.clone()
+            flip_pos = [j for j, f in enumerate(flip_mask) if f]
+            if flip_pos:
+                pos = torch.tensor(flip_pos, dtype=torch.long)
+                tensor_final[pos] = torch.flip(tensor_orig[pos], dims=(-2, -1))
+        except Exception as e:
+            for i in idxs:
+                results[i] = _row(status="error", error=str(e), model_version=self.model_version)
+            return results
 
         # Step 5: one sixclass forward pass for the whole (corrected) batch.
         try:
@@ -235,19 +240,24 @@ class Pipeline:
             return results
 
         # Step 6: assemble successful rows back into their original positions.
-        for j, i in enumerate(idxs):
-            orient_label, orient_probs = orient_results[j]
-            six_label, six_probs = six_results[j]
-            results[i] = _row(
-                exif_orientation_tag=exif_tags[j],
-                orientation_pred=orient_label,
-                orientation_prob=max(orient_probs),
-                rotation_applied=180 if flip_mask[j] else 0,
-                sixclass_label=six_label,
-                sixclass_probs=six_probs,
-                final_label=six_label,
-                model_version=self.model_version,
-            )
+        try:
+            for j, i in enumerate(idxs):
+                orient_label, orient_probs = orient_results[j]
+                six_label, six_probs = six_results[j]
+                results[i] = _row(
+                    exif_orientation_tag=exif_tags[j],
+                    orientation_pred=orient_label,
+                    orientation_prob=max(orient_probs),
+                    rotation_applied=180 if flip_mask[j] else 0,
+                    sixclass_label=six_label,
+                    sixclass_probs=six_probs,
+                    final_label=six_label,
+                    model_version=self.model_version,
+                )
+            assert all(r is not None for r in results)
+        except Exception as e:
+            for i in idxs:
+                results[i] = _row(status="error", error=str(e), model_version=self.model_version)
+            return results
 
-        assert all(r is not None for r in results)
         return results

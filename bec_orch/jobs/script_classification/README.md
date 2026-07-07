@@ -96,6 +96,14 @@ under `orientation_labels` / `sixclass_labels` (JSON arrays), plus
   docstring), though the predicted label never changed in that check. This
   branch is rare enough (a rounding artifact) that it's shipped as-is with
   this caveat rather than adding a slower per-image fallback path for it.
+- **S3 fetch overlaps compute.** A background prefetch thread fetches the
+  next batch(es) of raw bytes from S3 (`ScriptClassificationConfig.prefetch_batches`
+  deep, bounded queue) while the main thread runs the current batch's CPU
+  decode + GPU forwards, so neither the network nor the GPU idles waiting for
+  the other. The worker logs `cum_fetch_wait` — near-zero means fetch is
+  fully hidden; a large value means S3 is the bottleneck (raise
+  `s3_fetch_concurrency` and/or `prefetch_batches`). Costs ~`prefetch_batches`
+  extra batches of resident raw bytes.
 - **Decode/resize restructured (behavior-preserving).** Upstream decodes
   with PIL and redundantly re-resizes from full resolution for both the
   upright and 180°-rotated passes. This vendor decodes via `libvips` when

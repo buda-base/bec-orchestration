@@ -15,6 +15,13 @@ running two single batched-tensor model forward passes — this worker has no
 knowledge of any of that, preserving the same fetch/classify separation as
 before.
 
+To keep neither the network nor the GPU idle waiting for the other, a
+background prefetch thread fetches the next batch(es) of raw bytes from S3
+(``cfg.prefetch_batches`` deep, bounded queue) while the main thread runs
+the CPU decode + GPU forwards of the current batch — overlapping the S3
+fetch stall with compute. Ordering and the per-page failure/threshold
+semantics are unchanged.
+
 The pipeline (both HF checkpoints) is loaded once in ``__init__`` and
 reused across every volume this worker process handles — there is no
 per-volume cache to reset (unlike ``ocr_qwen_v1``'s vLLM KV/prefix cache):
@@ -25,6 +32,8 @@ from __future__ import annotations
 
 import logging
 import os
+import queue
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
@@ -152,18 +161,65 @@ class ScriptClassificationJobWorker:
 
         n_classified = 0
         errors_by_stage: dict[str, int] = {}
-        t_fetch_total = 0.0
         t_classify_total = 0.0
+        t_fetch_wait_total = 0.0  # main-thread time blocked waiting on the fetcher
+
+        # --- CPU/GPU vs S3 overlap -------------------------------------
+        # A background thread prefetches raw bytes for upcoming batches
+        # (network/S3-bound) into a bounded queue, while this (main) thread
+        # decodes on the CPU pool and runs the GPU forwards of the current
+        # batch. The queue depth (cfg.prefetch_batches) bounds how many
+        # fetched-but-unclassified batches are resident, capping raw-byte
+        # memory. `t_fetch_wait_total` ~ 0 means fetch is fully hidden behind
+        # compute; a large value means S3 is the bottleneck (raise
+        # s3_fetch_concurrency / prefetch_batches).
+        prefetch_depth = max(1, getattr(cfg, "prefetch_batches", 1))
+        fetch_q: queue.Queue = queue.Queue(maxsize=prefetch_depth)
+        stop_event = threading.Event()
+        producer_error: list[BaseException] = []
+        _SENTINEL = None
+
+        def _producer() -> None:
+            try:
+                for b_idx in range(n_batches):
+                    if stop_event.is_set():
+                        return
+                    b_start = b_idx * batch_size
+                    b_stop = min(b_start + batch_size, n_expected)
+                    b_manifest = manifest[b_start:b_stop]
+                    fetched, failed = self._fetch_raw_bytes(vol_prefix, b_manifest)
+                    # Block on a full queue, but wake periodically to honor a
+                    # stop request so we never deadlock if the consumer bails.
+                    while not stop_event.is_set():
+                        try:
+                            fetch_q.put((b_idx, b_manifest, fetched, failed), timeout=0.5)
+                            break
+                        except queue.Full:
+                            continue
+            except BaseException as e:  # noqa: BLE001 - surfaced to consumer
+                producer_error.append(e)
+            finally:
+                # Guarantee the consumer sees end-of-stream. Block until the
+                # sentinel lands (queue may be transiently full) unless the
+                # consumer has bailed (stop_event set + draining in finally).
+                while not stop_event.is_set():
+                    try:
+                        fetch_q.put(_SENTINEL, timeout=0.5)
+                        break
+                    except queue.Full:
+                        continue
+
+        fetcher = threading.Thread(target=_producer, name="scriptcls-prefetch", daemon=True)
+        fetcher.start()
 
         try:
-            for batch_idx in range(n_batches):
-                start = batch_idx * batch_size
-                stop = min(start + batch_size, n_expected)
-                batch_manifest = manifest[start:stop]
-
-                t_fetch = time.time()
-                fetched, failed = self._fetch_raw_bytes(vol_prefix, batch_manifest)
-                t_fetch_total += time.time() - t_fetch
+            while True:
+                t_wait = time.time()
+                item = fetch_q.get()
+                t_fetch_wait_total += time.time() - t_wait
+                if item is _SENTINEL:
+                    break
+                batch_idx, batch_manifest, fetched, failed = item
 
                 for f in failed:
                     writer.write_error(
@@ -177,8 +233,8 @@ class ScriptClassificationJobWorker:
                 if not fetched:
                     logger.warning(
                         f"[script_classification] {vol.w_id}/{vol.i_id}: batch "
-                        f"{batch_idx + 1}/{n_batches} ({start}:{stop}) — "
-                        f"all {len(batch_manifest)} pages failed before classification"
+                        f"{batch_idx + 1}/{n_batches} — all "
+                        f"{len(batch_manifest)} pages failed before classification"
                     )
                     continue
 
@@ -218,8 +274,14 @@ class ScriptClassificationJobWorker:
                     f"[script_classification] {vol.w_id}/{vol.i_id}: batch "
                     f"{batch_idx + 1}/{n_batches} done "
                     f"(classified {n_classified}/{n_expected}, "
-                    f"cum_fetch={t_fetch_total:.1f}s, cum_classify={t_classify_total:.1f}s)"
+                    f"cum_classify={t_classify_total:.1f}s, "
+                    f"cum_fetch_wait={t_fetch_wait_total:.1f}s)"
                 )
+
+            # A fetcher-thread failure (e.g. get_s3_folder_prefix / boto init
+            # issues) is surfaced here rather than silently truncating.
+            if producer_error:
+                raise producer_error[0]
 
             if n_classified == 0:
                 # Every single page failed before reaching the model — terminal.
@@ -227,6 +289,15 @@ class ScriptClassificationJobWorker:
                     f"all {n_expected} pages failed before classification for {vol.w_id}/{vol.i_id}"
                 )
         finally:
+            # Stop the producer and drain any parked item so it can't deadlock
+            # on a full queue, then reap the thread (no per-volume leak).
+            stop_event.set()
+            try:
+                while True:
+                    fetch_q.get_nowait()
+            except queue.Empty:
+                pass
+            fetcher.join(timeout=30)
             writer.close()
 
         elapsed_ms = (time.time() - t_start) * 1000
@@ -237,7 +308,7 @@ class ScriptClassificationJobWorker:
             f"[script_classification] {vol.w_id}/{vol.i_id}: done in {elapsed_ms / 1000:.1f}s "
             f"({n_expected} pages, success={writer.success_count}, "
             f"errors={n_errors}, rate={failure_rate:.2%}, "
-            f"fetch={t_fetch_total:.1f}s, classify={t_classify_total:.1f}s)"
+            f"classify={t_classify_total:.1f}s, fetch_wait={t_fetch_wait_total:.1f}s)"
         )
 
         if failure_rate > cfg.max_page_failure_rate:

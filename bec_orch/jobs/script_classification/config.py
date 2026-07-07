@@ -43,6 +43,16 @@ class ScriptClassificationConfig:
     # ``decode_workers`` below) and the batched model forward passes.
     s3_fetch_concurrency: int = 32
 
+    # Number of batches the background prefetch thread may fetch ahead of the
+    # classifier (bounded queue depth). >=1 enables overlap of S3 fetch with
+    # compute: the next batch's S3 GETs run on a background thread while the
+    # current batch is decoded on the CPU pool and classified on the GPU, so
+    # neither the network nor the GPU sits idle waiting for the other. Costs
+    # roughly this many extra batches of resident raw-image bytes (each up to
+    # classify_batch_size images), so keep it small -- 1 is enough to hide
+    # fetch behind compute whenever decode time >= fetch time.
+    prefetch_batches: int = 1
+
     # Per-page S3 GET timeout (boto3 read/connect timeout).
     s3_get_timeout_s: int = 30
 
@@ -104,6 +114,8 @@ class ScriptClassificationConfig:
             raise ValueError(f"classify_batch_size must be >= 1, got {self.classify_batch_size}")
         if self.s3_fetch_concurrency < 1:
             raise ValueError(f"s3_fetch_concurrency must be >= 1, got {self.s3_fetch_concurrency}")
+        if self.prefetch_batches < 1:
+            raise ValueError(f"prefetch_batches must be >= 1, got {self.prefetch_batches}")
         if self.s3_get_timeout_s < 1:
             raise ValueError(f"s3_get_timeout_s must be >= 1, got {self.s3_get_timeout_s}")
         if self.s3_max_attempts < 1:

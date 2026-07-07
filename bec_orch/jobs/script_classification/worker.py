@@ -10,7 +10,7 @@ never raise. So the worker's only job is: fetch raw bytes per page from S3
 (in fixed-size batches, to bound resident memory), hand the whole batch
 straight to ``pipe.run_batch()``, and stream results to parquet.
 ``run_batch()`` internally parallelizes per-image decode+crop across a
-small thread pool it owns (sized by ``cfg.inference_workers``) before
+small thread pool it owns (sized by ``cfg.decode_workers``) before
 running two single batched-tensor model forward passes — this worker has no
 knowledge of any of that, preserving the same fetch/classify separation as
 before.
@@ -144,6 +144,8 @@ class ScriptClassificationJobWorker:
             parquet_uri=parquet_uri,
             errors_jsonl_uri=errors_uri,
             model_version=self._model_version,
+            orientation_labels=self._pipe.orientation_labels,
+            sixclass_labels=self._pipe.sixclass_labels,
             flush_every=cfg.parquet_flush_every,
             compression=cfg.parquet_compression,
         )
@@ -193,6 +195,7 @@ class ScriptClassificationJobWorker:
                             exif_orientation_tag=row["exif_orientation_tag"],
                             orientation_pred=row["orientation_pred"],
                             orientation_prob=row["orientation_prob"],
+                            orientation_probs=row["orientation_probs"],
                             rotation_applied=row["rotation_applied"],
                             sixclass_label=row["sixclass_label"],
                             sixclass_probs=row["sixclass_probs"],

@@ -9,6 +9,7 @@ Schema (one row per processed page):
     exif_orientation_tag    int32 (nullable) raw EXIF tag, read but never applied to pixels
     orientation_pred         string          "non_flipped" | "flipped"
     orientation_prob         float32         probability of the predicted orientation class
+    orientation_probs        list<float32>   full orientation probability vector, model label order
     rotation_applied         int32           degrees actually applied before 6-class scoring: 0 or 180
     sixclass_label           string          argmax script class
     sixclass_probs           list<float32>   full probability vector, checkpoint's idx_to_label order
@@ -16,6 +17,13 @@ Schema (one row per processed page):
     model_version            string          short checkpoint hashes for both models
     error_stage              string          "" / "fetch" / "classify"
     error_message            string          short error description (truncated to 512 chars)
+
+The two probability vectors (``orientation_probs`` / ``sixclass_probs``) are
+the models' full softmax output — everything the model emits, not just the
+argmax. To make them self-describing, the per-class label ordering is stored
+in the parquet file's schema metadata under the keys ``orientation_labels``
+and ``sixclass_labels`` (JSON arrays; ``probs[i]`` corresponds to
+``labels[i]``), alongside ``model_version``.
 
 No ``blank`` column: the upstream blank-page pre-filter is disabled (see
 ``vendor/pipeline.py``), so every image is scored — a permanently-constant
@@ -43,7 +51,20 @@ logger = logging.getLogger(__name__)
 _MAX_ERROR_MSG_LEN = 512
 
 
-def script_classification_build_schema() -> pa.Schema:
+def script_classification_build_schema(
+    orientation_labels: list[str] | None = None,
+    sixclass_labels: list[str] | None = None,
+    model_version: str | None = None,
+) -> pa.Schema:
+    # File-level metadata makes the probability vectors self-describing:
+    # probs[i] <-> labels[i]. Zero per-row cost (stored once in the footer).
+    metadata: dict[bytes, bytes] = {}
+    if orientation_labels is not None:
+        metadata[b"orientation_labels"] = json.dumps(orientation_labels).encode("utf-8")
+    if sixclass_labels is not None:
+        metadata[b"sixclass_labels"] = json.dumps(sixclass_labels).encode("utf-8")
+    if model_version is not None:
+        metadata[b"model_version"] = model_version.encode("utf-8")
     return pa.schema(
         [
             pa.field("img_file_name", pa.string()),
@@ -53,6 +74,7 @@ def script_classification_build_schema() -> pa.Schema:
             pa.field("exif_orientation_tag", pa.int32()),
             pa.field("orientation_pred", pa.string()),
             pa.field("orientation_prob", pa.float32()),
+            pa.field("orientation_probs", pa.list_(pa.float32())),
             pa.field("rotation_applied", pa.int32()),
             pa.field("sixclass_label", pa.string()),
             pa.field("sixclass_probs", pa.list_(pa.float32())),
@@ -60,7 +82,8 @@ def script_classification_build_schema() -> pa.Schema:
             pa.field("model_version", pa.string()),
             pa.field("error_stage", pa.string()),
             pa.field("error_message", pa.string()),
-        ]
+        ],
+        metadata=metadata or None,
     )
 
 
@@ -80,6 +103,8 @@ class StreamingScriptClassificationWriter:
         errors_jsonl_uri: str | None,
         model_version: str,
         *,
+        orientation_labels: list[str] | None = None,
+        sixclass_labels: list[str] | None = None,
         flush_every: int = 256,
         compression: str = "zstd",
     ) -> None:
@@ -88,7 +113,11 @@ class StreamingScriptClassificationWriter:
         self.model_version = model_version
         self.flush_every = flush_every
         self.compression = compression if compression != "none" else None
-        self.schema = script_classification_build_schema()
+        self.schema = script_classification_build_schema(
+            orientation_labels=orientation_labels,
+            sixclass_labels=sixclass_labels,
+            model_version=model_version,
+        )
 
         self._records: list[dict] = []
         self._error_records: list[dict] = []
@@ -110,6 +139,7 @@ class StreamingScriptClassificationWriter:
         exif_orientation_tag: int | None,
         orientation_pred: str | None,
         orientation_prob: float | None,
+        orientation_probs: list[float] | None,
         rotation_applied: int | None,
         sixclass_label: str | None,
         sixclass_probs: list[float] | None,
@@ -125,6 +155,7 @@ class StreamingScriptClassificationWriter:
                 "exif_orientation_tag": exif_orientation_tag,
                 "orientation_pred": orientation_pred,
                 "orientation_prob": orientation_prob,
+                "orientation_probs": orientation_probs,
                 "rotation_applied": rotation_applied,
                 "sixclass_label": sixclass_label,
                 "sixclass_probs": sixclass_probs,
@@ -155,6 +186,7 @@ class StreamingScriptClassificationWriter:
                 "exif_orientation_tag": None,
                 "orientation_pred": None,
                 "orientation_prob": None,
+                "orientation_probs": None,
                 "rotation_applied": None,
                 "sixclass_label": None,
                 "sixclass_probs": None,

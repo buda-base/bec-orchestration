@@ -36,6 +36,7 @@ Parquet schema:
 | `exif_orientation_tag` | int32 (nullable) | raw EXIF tag, read but never applied to pixels |
 | `orientation_pred` | string | `"non_flipped"` \| `"flipped"` |
 | `orientation_prob` | float32 | probability of the predicted orientation class |
+| `orientation_probs` | list\<float32\> | full orientation softmax vector, model label order |
 | `rotation_applied` | int32 | degrees actually applied before 6-class scoring: `0` or `180` |
 | `sixclass_label` | string | argmax script class |
 | `sixclass_probs` | list\<float32\> | full probability vector, ordered by the checkpoint's label mapping |
@@ -43,6 +44,13 @@ Parquet schema:
 | `model_version` | string | short checkpoint hashes for both models |
 | `error_stage` | string | `""` / `"fetch"` / `"classify"` |
 | `error_message` | string | short error (max 512 chars) |
+
+Both probability vectors (`orientation_probs`, `sixclass_probs`) are the
+models' complete softmax output. Their per-class label ordering (`probs[i]`
+⇄ `labels[i]`) is stored **once** in the parquet file's schema metadata
+under `orientation_labels` / `sixclass_labels` (JSON arrays), plus
+`model_version` — read e.g. via
+`pyarrow.parquet.read_schema(path).metadata`.
 
 ## Known limitations / deviations from upstream
 
@@ -67,9 +75,10 @@ Parquet schema:
 - **Batched inference.** Deviation from upstream (which contracts one image
   per `pipe.run()` call). `vendor/pipeline.py::Pipeline.run_batch(list[bytes])`
   is the worker's actual entry point: it decode+resize+crops every image in
-  the batch in parallel (`ScriptClassificationConfig.inference_workers`
-  thread pool), normalizes the whole batch in one HF-processor call, runs
-  the orientation model **once** for the whole batch, corrects the
+  the batch in parallel (`ScriptClassificationConfig.decode_workers`
+  thread pool), normalizes the whole batch in one HF-processor call, moves
+  it to the model device once, runs the orientation model **once** for the
+  whole batch, corrects the
   six-class model's input in place — `torch.flip`ping just the rows the
   orientation model called "flipped" (mathematically identical to the old
   per-image rotate-then-renormalize for the common case, since

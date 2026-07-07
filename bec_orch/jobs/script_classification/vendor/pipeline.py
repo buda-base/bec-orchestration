@@ -23,6 +23,7 @@ _NULL_FIELDS = dict(
     exif_orientation_tag=None,
     orientation_pred=None,
     orientation_prob=None,
+    orientation_probs=None,
     rotation_applied=None,
     sixclass_label=None,
     sixclass_probs=None,
@@ -66,7 +67,7 @@ class Pipeline:
         # itself is already a process-lifetime singleton via loader.py's
         # get_pipeline(), so there's no per-volume teardown/recreation.
         self._decode_pool = ThreadPoolExecutor(
-            max_workers=max(1, getattr(cfg, "inference_workers", 1)),
+            max_workers=max(1, getattr(cfg, "decode_workers", 1)),
             thread_name_prefix="scriptcls-decode",
         )
 
@@ -87,6 +88,20 @@ class Pipeline:
         self.model_version = (
             f"orientation:{_short_sha(orient_path)};sixclass:{_short_sha(six_path)}"
         )
+
+    @staticmethod
+    def _ordered_labels(idx_to_label: dict) -> list[str]:
+        # Class name per logit index (0..C-1), so a bare probability vector
+        # (orientation_probs / sixclass_probs) is self-describing downstream.
+        return [idx_to_label[i] for i in range(len(idx_to_label))]
+
+    @property
+    def orientation_labels(self) -> list[str]:
+        return self._ordered_labels(self._orientation.idx_to_label)
+
+    @property
+    def sixclass_labels(self) -> list[str]:
+        return self._ordered_labels(self._sixclass.idx_to_label)
 
     def run(self, image_bytes: bytes) -> dict:
         try:
@@ -137,6 +152,7 @@ class Pipeline:
             exif_orientation_tag=exif_tag,
             orientation_pred=orient_label,
             orientation_prob=orient_prob,
+            orientation_probs=orient_probs,
             rotation_applied=rotation_applied,
             sixclass_label=six_label,
             sixclass_probs=six_probs,
@@ -198,8 +214,12 @@ class Pipeline:
             return results
 
         # Step 2: one batched normalize call -> [M,3,CROP_SIZE,CROP_SIZE].
+        # Move to the model device exactly ONCE here: both forward passes and
+        # the in-place flip below then operate on-device, so the batch crosses
+        # the host->device boundary a single time (predict_batch's own
+        # ``.to(device)`` becomes a no-op for an already-on-device tensor).
         try:
-            tensor_orig = transforms.preprocess_batch(imgs)
+            tensor_orig = transforms.preprocess_batch(imgs).to(self._device)
         except Exception as e:
             for i in idxs:
                 results[i] = _row(status="error", error=str(e), model_version=self.model_version)
@@ -224,7 +244,9 @@ class Pipeline:
             tensor_final = tensor_orig.clone()
             flip_pos = [j for j, f in enumerate(flip_mask) if f]
             if flip_pos:
-                pos = torch.tensor(flip_pos, dtype=torch.long)
+                # Index tensor on the same device as the batch so the gather/
+                # flip/scatter stays entirely on-device (no host round-trip).
+                pos = torch.tensor(flip_pos, dtype=torch.long, device=tensor_orig.device)
                 tensor_final[pos] = torch.flip(tensor_orig[pos], dims=(-2, -1))
         except Exception as e:
             for i in idxs:
@@ -248,6 +270,7 @@ class Pipeline:
                     exif_orientation_tag=exif_tags[j],
                     orientation_pred=orient_label,
                     orientation_prob=max(orient_probs),
+                    orientation_probs=orient_probs,
                     rotation_applied=180 if flip_mask[j] else 0,
                     sixclass_label=six_label,
                     sixclass_probs=six_probs,

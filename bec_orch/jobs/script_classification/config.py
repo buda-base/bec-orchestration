@@ -38,10 +38,9 @@ class ScriptClassificationConfig:
     # S3-throughput reasons, be aware it also raises the model batch size.
     classify_batch_size: int = 64
 
-    # ThreadPoolExecutor size for parallel S3 GET. Classification is
-    # CPU-bound and effectively single-threaded per call (see
-    # ``inference_workers`` below), so this is sized for S3 throughput, not
-    # to match inference concurrency.
+    # ThreadPoolExecutor size for parallel S3 GET. This is sized for S3
+    # throughput and is independent of the CPU-side decode parallelism (see
+    # ``decode_workers`` below) and the batched model forward passes.
     s3_fetch_concurrency: int = 32
 
     # Per-page S3 GET timeout (boto3 read/connect timeout).
@@ -56,17 +55,18 @@ class ScriptClassificationConfig:
     # ThreadPoolExecutor size for parallel per-image decode+resize+crop
     # *within* a single classify batch (see
     # vendor/pipeline.py::Pipeline.run_batch's self._decode_pool). This is
-    # where batched inference's CPU-side parallelism lives -- each of the
-    # two model forward passes is now a single batched call per classify
-    # batch, not one call per image, so this knob controls decode/crop
-    # throughput, not model-call concurrency. Default is a placeholder sized
-    # by analogy to ldv1's tile_workers (24) -- NOT derived from real fleet
-    # data, profile on the actual target instance type before trusting it in
-    # production. See bec-script-classification.service's
-    # MemoryHigh/MemoryMax, which were sized for the OLD one-image-at-a-time
-    # decode profile and may need re-tuning now that up to this many
-    # full-resolution image decodes can be in flight concurrently.
-    inference_workers: int = 16
+    # where the CPU-side parallelism lives -- each of the two model forward
+    # passes is a single batched call per classify batch, not one call per
+    # image, so this knob controls decode/crop throughput, NOT model-call
+    # concurrency (hence the name: decode workers, not inference workers).
+    # Default is a placeholder sized by analogy to ldv1's tile_workers (24)
+    # -- NOT derived from real fleet data, profile on the actual target
+    # instance type before trusting it in production. See
+    # bec-script-classification.service's MemoryHigh/MemoryMax, which were
+    # sized for the OLD one-image-at-a-time decode profile and may need
+    # re-tuning now that up to this many decodes can be in flight
+    # concurrently.
+    decode_workers: int = 16
 
     # When True (default), both classifiers run on CUDA if available --
     # falls back to CPU with a logged warning if CUDA isn't present (never
@@ -108,8 +108,8 @@ class ScriptClassificationConfig:
             raise ValueError(f"s3_get_timeout_s must be >= 1, got {self.s3_get_timeout_s}")
         if self.s3_max_attempts < 1:
             raise ValueError(f"s3_max_attempts must be >= 1, got {self.s3_max_attempts}")
-        if self.inference_workers < 1:
-            raise ValueError(f"inference_workers must be >= 1, got {self.inference_workers}")
+        if self.decode_workers < 1:
+            raise ValueError(f"decode_workers must be >= 1, got {self.decode_workers}")
         if self.parquet_flush_every < 1:
             raise ValueError(f"parquet_flush_every must be >= 1, got {self.parquet_flush_every}")
         if self.volume_timeout_s <= 0:

@@ -218,6 +218,47 @@ def _auto_register() -> None:
             f"Failed to auto-register script_classification worker: {e}. Worker class may not exist in module."
         )
 
+    # Try to import and register script_classification_v2 worker
+    try:
+        from dataclasses import fields
+
+        from bec_orch.jobs.script_classification_v2.config import ScriptClassificationV2Config
+        from bec_orch.jobs.script_classification_v2.worker import (
+            ScriptClassificationV2JobWorker,
+        )
+
+        def script_classification_v2_factory(job_config: dict[str, Any] | None) -> JobWorker:
+            """Factory for ScriptClassificationV2JobWorker — builds config from job_config.
+
+            Every ``ScriptClassificationV2Config`` field has a default, so an
+            empty job config is valid; any keys present in ``job_config``
+            override the defaults.
+            """
+            cfg_kwargs: dict[str, Any] = {}
+            if job_config:
+                allowed = {f.name for f in fields(ScriptClassificationV2Config)}
+                for k, v in job_config.items():
+                    if k in allowed:
+                        cfg_kwargs[k] = v
+                    else:
+                        logger.warning(
+                            f"[script_classification_v2] ignoring unknown config key '{k}' "
+                            f"(allowed: {sorted(allowed)})"
+                        )
+            cfg = ScriptClassificationV2Config(**cfg_kwargs)
+            return ScriptClassificationV2JobWorker(cfg)
+
+        register_job_worker("script_classification_v2", script_classification_v2_factory)
+    except ImportError as e:
+        logger.warning(
+            f"Failed to auto-register script_classification_v2 worker: {e}. "
+            f"Dependencies (torch, transformers, huggingface_hub, Pillow, pyarrow) may not be installed."
+        )
+    except AttributeError as e:
+        logger.warning(
+            f"Failed to auto-register script_classification_v2 worker: {e}. Worker class may not exist in module."
+        )
+
 
 # Run auto-registration on module import
 _auto_register()

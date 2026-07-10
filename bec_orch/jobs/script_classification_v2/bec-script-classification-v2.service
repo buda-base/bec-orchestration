@@ -1,0 +1,70 @@
+[Unit]
+Description=BEC Worker - script_classification_v2 (BDRC 8-class Tibetan page classifier)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+
+User=ubuntu
+Group=ubuntu
+
+# Load environment variables: BEC_SQL_*, BEC_REGION, BEC_DEST_S3_BUCKET,
+# BEC_SOURCE_S3_BUCKET, AWS_* credentials, and HF_TOKEN.
+#
+# HF_TOKEN is REQUIRED: BDRC/8-class-tibetan-page-classifier is a gated HF
+# repo. Without it, model download in ScriptClassificationV2JobWorker.__init__
+# fails and the worker never becomes ready.
+EnvironmentFile=/etc/bec/worker.env
+
+WorkingDirectory=/home/ubuntu/bec-orchestration
+
+Environment="PATH=/opt/pytorch/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+Environment="HF_HOME=/var/cache/bec-script-classification-v2/hf"
+Environment="HF_HUB_DISABLE_PROGRESS_BARS=1"
+Environment="PYTHONUNBUFFERED=1"
+Environment="TRANSFORMERS_VERBOSITY=warning"
+Environment="DO_NOT_TRACK=1"
+
+# --visibility-timeout 1800 matches ScriptClassificationV2Config.volume_timeout_s (30 min)
+ExecStart=/opt/pytorch/bin/bec worker \
+    --job-name script_classification_v2 \
+    --visibility-timeout 1800
+
+# Graceful shutdown — lets the worker finish the in-flight volume and write
+# its parquet artifact before exiting.
+KillMode=mixed
+KillSignal=SIGTERM
+TimeoutStopSec=2000
+
+Restart=on-failure
+RestartSec=30
+StartLimitInterval=600
+StartLimitBurst=3
+
+# Cgroup memory limits. Single small DINOv3 ViT-S/16 model plus one batch of
+# decoded pages — even lighter than script_classification (one head, not two).
+# Sized with headroom for a g5.xlarge (15 GiB RAM); raise proportionally if
+# classify_batch_size is increased substantially.
+MemoryHigh=10G
+MemoryMax=12G
+
+LimitNOFILE=65536
+LimitNPROC=4096
+LimitCORE=0
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=bec-script-classification-v2
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=-/var/log/bec
+
+CacheDirectory=bec-script-classification-v2
+CacheDirectoryMode=0750
+
+[Install]
+WantedBy=multi-user.target

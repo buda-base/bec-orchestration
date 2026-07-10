@@ -1,0 +1,26 @@
+# Same environment assumptions as ../script_classification/requirements.txt:
+# AWS Deep Learning AMI (DLAMI) for PyTorch (GPU), Ubuntu, Python 3.12,
+# DLAMI-provided torch/torchvision/pillow used as-is.
+#
+# IMPORTANT:
+# - Do NOT add `torch` / `torchvision` here — the DLAMI build is used as-is.
+#   GPU use is on by default (ScriptClassificationV2Config.use_gpu = True);
+#   vendor/models.py moves the classifier to CUDA when available, falling back
+#   to CPU with a logged warning otherwise.
+# - transformers>=4.56 is required for the DINOv3 architecture classes
+#   (DINOv3ViTModel / DINOv3ViTConfig / DINOv3ViTImageProcessor) used by the
+#   gate-free fallback in vendor/models.py / vendor/transforms.py.
+#
+# Requires an HF_TOKEN env var (or `huggingface-cli login`) before first run:
+# BDRC/8-class-tibetan-page-classifier is a gated HF repo.
+
+transformers>=4.56.0
+huggingface_hub>=0.35
+pyarrow
+s3fs
+boto3
+
+# libvips fast-path decode+resize for vendor/transforms.py (PIL fallback if
+# unavailable). `[binary]` pulls a self-contained libvips build.
+pyvips==3.1.1
+pyvips[binary]

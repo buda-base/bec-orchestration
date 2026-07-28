@@ -34,6 +34,18 @@ load_dotenv()
 @click.option("--job-name", type=str, required=True, help="Job name from database (e.g., ldv1, ocr)")
 @click.option("--poll-wait", type=int, default=20, help="SQS long-poll wait time (seconds)")
 @click.option("--visibility-timeout", type=int, default=300, help="SQS visibility timeout (seconds)")
+@click.option(
+    "--visibility-extend-every",
+    type=int,
+    default=60,
+    help="Re-arm the visibility timeout every N seconds while a volume is processing (0 disables)",
+)
+@click.option(
+    "--visibility-max-total",
+    type=int,
+    default=14400,
+    help="Stop extending visibility after N seconds, so a stuck worker releases the volume",
+)
 @click.option("--shutdown-after-empty", type=int, default=6, help="Shutdown after N empty polls")
 @click.option("--s3-source-bucket", type=str, default="archive.tbrc.org", help="Source S3 bucket for images")
 @click.option("--s3-dest-bucket", type=str, help="Destination S3 bucket (default: from BEC_DEST_S3_BUCKET env)")
@@ -43,6 +55,8 @@ def worker(
     job_name,
     poll_wait,
     visibility_timeout,
+    visibility_extend_every,
+    visibility_max_total,
     shutdown_after_empty,
     s3_source_bucket,
     s3_dest_bucket,
@@ -101,6 +115,8 @@ def worker(
         job_name=job_name,
         poll_wait_seconds=poll_wait,
         visibility_timeout_seconds=visibility_timeout,
+        visibility_extend_every_seconds=visibility_extend_every,
+        visibility_max_total_seconds=visibility_max_total,
         shutdown_after_empty_polls=shutdown_after_empty,
     )
 
@@ -237,6 +253,7 @@ def run_volume(
         job_name=job_name,
         poll_wait_seconds=0,  # Not used for direct processing
         visibility_timeout_seconds=0,  # Not used for direct processing
+        visibility_extend_every_seconds=0,  # Not used for direct processing
         shutdown_after_empty_polls=0,  # Not used for direct processing
     )
 

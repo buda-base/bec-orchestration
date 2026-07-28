@@ -316,6 +316,8 @@ Worker shutdown complete
 bec worker --job-name ldv1 \
   --poll-wait 20 \
   --visibility-timeout 300 \
+  --visibility-extend-every 60 \
+  --visibility-max-total 14400 \
   --shutdown-after-empty 6 \
   --s3-source-bucket archive.tbrc.org \
   --s3-dest-bucket artifacts.example.com \
@@ -327,6 +329,8 @@ Options:
 - `--job-name`: Job name (required)
 - `--poll-wait`: SQS long-poll wait time in seconds (default: 20)
 - `--visibility-timeout`: SQS visibility timeout in seconds (default: 300)
+- `--visibility-extend-every`: While a volume is processing, re-arm the visibility timeout every N seconds so a long volume is not redelivered to a second worker (default: 60, `0` disables)
+- `--visibility-max-total`: Stop extending after N seconds in flight, so a stuck worker releases the volume for redelivery instead of holding it forever (default: 14400)
 - `--shutdown-after-empty`: Shutdown after N empty polls (default: 6)
 - `--s3-source-bucket`: Source bucket for images (default: archive.tbrc.org)
 - `--s3-dest-bucket`: Destination bucket for artifacts (from env if not specified)
@@ -556,7 +560,7 @@ Ensure your AWS credentials have these SQS permissions:
 1. **Always use environment variables for secrets** (passwords, keys)
 2. **Use DLQ for failed tasks** (automatically configured)
 3. **Monitor queue depth** to scale workers up/down
-4. **Set appropriate visibility timeout** (should be > max task duration)
+4. **Set appropriate visibility timeout** (should be > typical task duration; the worker extends it automatically while a volume is processing, up to `--visibility-max-total`)
 5. **Use meaningful job names** for easy identification
 6. **Keep job config in version control** (JSON files)
 7. **Test with small batches first** before enqueueing thousands of volumes

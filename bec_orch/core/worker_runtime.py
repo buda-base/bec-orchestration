@@ -23,6 +23,7 @@ from bec_orch.core.models import (
     VolumeRef,
 )
 from bec_orch.core.registry import get_job_worker_factory
+from bec_orch.core.visibility import VisibilityExtender
 from bec_orch.errors import RetryableTaskError, TerminalTaskError
 from bec_orch.io.db import DBClient, etag_to_bytes
 from bec_orch.io.sqs import SQSClient
@@ -225,7 +226,6 @@ class BECWorkerRuntime:
             except Exception as e:
                 logger.error(f"Failed to process message: {e}", exc_info=True)
                 # Don't delete message - let it go back to queue or DLQ
-                # Could implement visibility timeout extension here
             finally:
                 self._processing_message = False
 
@@ -300,14 +300,26 @@ class BECWorkerRuntime:
     def _process_message(self, msg: SqsTaskMessage) -> None:
         """
         High-level flow for SQS message processing.
-        Wraps _process_volume and handles SQS-specific logic (message deletion).
+        Wraps _process_volume and handles SQS-specific logic (visibility, message deletion).
         """
+        extender = VisibilityExtender(
+            sqs=self.sqs,
+            queue_url=self.queue_url,
+            receipt_handle=msg.receipt_handle,
+            timeout_seconds=self.cfg.visibility_timeout_seconds,
+            extend_every_seconds=self.cfg.visibility_extend_every_seconds,
+            max_total_seconds=self.cfg.visibility_max_total_seconds,
+            message_id=msg.message_id,
+        )
+        extender.start()
         try:
             self._process_volume(msg, force=False, is_direct=False)
             logger.info(f"Successfully processed message: {msg.message_id}")
         except Exception:
             # Don't delete message - let it go back to queue or DLQ
             raise
+        finally:
+            extender.stop()
 
     def _process_volume(self, msg: SqsTaskMessage, force: bool = False, is_direct: bool = False) -> None:
         """

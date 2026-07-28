@@ -7,6 +7,22 @@ from botocore.exceptions import ClientError
 
 from bec_orch.core.models import SqsTaskMessage, VolumeRef
 
+# SQS error codes meaning the receipt handle can no longer be acted upon: the
+# message was deleted, its visibility already expired, or it was redelivered to
+# another consumer (which invalidates our handle).
+_NOT_INFLIGHT_ERROR_CODES = {
+    "AWS.SimpleQueueService.MessageNotInflight",
+    "InvalidParameterValue",
+    "ReceiptHandleIsInvalid",
+}
+
+# ChangeMessageVisibility rejects anything above 12 h.
+MAX_VISIBILITY_TIMEOUT_SECONDS = 43200
+
+
+class MessageNotInflightError(RuntimeError):
+    """Raised when a receipt handle is stale: the message is no longer in flight."""
+
 
 class SQSClient:
     """AWS SQS client for task queue management."""
@@ -117,12 +133,20 @@ class SQSClient:
             queue_url: SQS queue URL
             receipt_handle: Receipt handle from received message
             timeout_seconds: New visibility timeout in seconds (0-43200)
+
+        Raises:
+            MessageNotInflightError: The message is no longer in flight (deleted,
+                already visible again, or handed to another consumer).
+            RuntimeError: Any other SQS failure (throttling, network, IAM, ...).
         """
         try:
             self.client.change_message_visibility(
                 QueueUrl=queue_url, ReceiptHandle=receipt_handle, VisibilityTimeout=timeout_seconds
             )
         except ClientError as e:
+            code = e.response.get("Error", {}).get("Code", "")
+            if code in _NOT_INFLIGHT_ERROR_CODES:
+                raise MessageNotInflightError(f"Message no longer in flight ({code}): {e}") from e
             raise RuntimeError(f"Failed to change visibility: {e}") from e
 
     def send_raw(self, queue_url: str, body: str, w_id: str | None = None, i_id: str | None = None) -> None:

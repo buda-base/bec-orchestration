@@ -33,11 +33,16 @@ def enqueue_volumes(
     # Prepare all messages first
     messages = []
     for volume in volumes:
-        body = json.dumps({
-            'w_id': volume.w_id,
-            'i_id': volume.i_id,
-        })
-        messages.append((body, volume.w_id, volume.i_id))
+        source = (volume.source or 'bdrc').strip().lower()
+        payload = {'w_id': volume.w_id, 'i_id': volume.i_id}
+        # Keep BDRC messages byte-for-byte as before; only add routing fields
+        # for non-default sources.
+        if source != 'bdrc':
+            payload['source'] = source
+        if volume.i_version:
+            payload['i_version'] = volume.i_version
+        body = json.dumps(payload)
+        messages.append((body, volume.w_id, volume.i_id, source, volume.i_version))
     
     # Send in batches (much faster than one at a time)
     if messages:
@@ -60,7 +65,9 @@ def enqueue_volume_list_from_file(
     """
     Enqueue volumes from a file.
     
-    File format: one volume per line, format: "W12345,I0123" or "W12345 I0123"
+    File format: one volume per line. Fields separated by comma or whitespace:
+        "W12345,I0123"                          (BDRC, default)
+        "W12345,I0123,ocr_benchmark,202603"     (source + i_version)
     Lines starting with # are comments.
     
     Args:
@@ -84,14 +91,19 @@ def enqueue_volume_list_from_file(
             if not line or line.startswith('#'):
                 continue
             
-            # Parse line: "W12345,I0123" or "W12345 I0123"
+            # Parse line: w_id i_id [source [i_version]] (comma or space separated)
             parts = line.replace(',', ' ').split()
-            if len(parts) != 2:
-                logger.warning(f"Line {line_num}: Invalid format, expected 'W12345 I0123', got: {line}")
+            if len(parts) < 2:
+                logger.warning(
+                    f"Line {line_num}: Invalid format, expected at least 'W12345 I0123', got: {line}"
+                )
                 continue
-            
-            w_id, i_id = parts
-            volume = VolumeRef(w_id=w_id, i_id=i_id)
+
+            w_id = parts[0]
+            i_id = parts[1]
+            source = (parts[2].strip().lower() if len(parts) > 2 else 'bdrc')
+            i_version = parts[3] if len(parts) > 3 else None
+            volume = VolumeRef(w_id=w_id, i_id=i_id, source=source, i_version=i_version)
             
             # Apply filter if provided
             if filter_func is not None:

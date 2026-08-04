@@ -172,6 +172,19 @@ def worker(
 @click.option("--w", "w_id", type=str, required=True, help="Work ID (e.g., W22084)")
 @click.option("--i", "i_id", type=str, required=True, help="Image group ID (e.g., I0886)")
 @click.option(
+    "--source",
+    type=str,
+    default="bdrc",
+    help="Image source: 'bdrc' (default, archive.tbrc.org) or 'ocr_benchmark'",
+)
+@click.option(
+    "--i-version",
+    "i_version",
+    type=str,
+    default=None,
+    help="Image version (required for non-BDRC sources, e.g. ocr_benchmark)",
+)
+@click.option(
     "-f",
     "--force",
     is_flag=True,
@@ -186,6 +199,8 @@ def run_volume(
     job_name,
     w_id,
     i_id,
+    source,
+    i_version,
     force,
     verbose,
     s3_source_bucket,
@@ -296,7 +311,9 @@ def run_volume(
         )
 
         # Process the specific volume
-        runtime.process_volume_directly(w_id, i_id, force=force)
+        runtime.process_volume_directly(
+            w_id, i_id, force=force, source=source, i_version=i_version
+        )
 
         console.print(f"[green]✓[/green] Volume {w_id}/{i_id} processed successfully")
 

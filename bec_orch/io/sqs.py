@@ -7,6 +7,32 @@ from botocore.exceptions import ClientError
 
 from bec_orch.core.models import SqsTaskMessage, VolumeRef
 
+# A message ready to be batched: (body, w_id, i_id, source, i_version).
+# Trailing elements are optional; only ``body`` is strictly required.
+VolumeMessage = tuple
+
+_DEFAULT_SOURCE = "bdrc"
+
+
+def _volume_message_attributes(
+    w_id: str | None,
+    i_id: str | None,
+    source: str | None = None,
+    i_version: str | None = None,
+) -> dict:
+    """Build SQS MessageAttributes for a volume, skipping empty/default fields."""
+    attrs: dict = {}
+    if w_id:
+        attrs["w_id"] = {"StringValue": w_id, "DataType": "String"}
+    if i_id:
+        attrs["i_id"] = {"StringValue": i_id, "DataType": "String"}
+    # Only carry source when it's non-default, to keep BDRC messages unchanged.
+    if source and source != _DEFAULT_SOURCE:
+        attrs["source"] = {"StringValue": source, "DataType": "String"}
+    if i_version:
+        attrs["i_version"] = {"StringValue": i_version, "DataType": "String"}
+    return attrs
+
 # SQS error codes meaning the receipt handle can no longer be acted upon: the
 # message was deleted, its visibility already expired, or it was redelivered to
 # another consumer (which invalidates our handle).
@@ -72,32 +98,39 @@ class SQSClient:
             receipt_handle = msg["ReceiptHandle"]
             body = msg.get("Body", "")
 
-            # Parse message attributes for w_id and i_id
+            # Parse message attributes for volume fields
             attrs = msg.get("MessageAttributes", {})
 
-            # Try to parse w_id and i_id from message attributes
-            w_id = None
-            i_id = None
+            def _attr(name: str) -> str | None:
+                return attrs[name].get("StringValue") if name in attrs else None
 
-            if "w_id" in attrs:
-                w_id = attrs["w_id"].get("StringValue")
-            if "i_id" in attrs:
-                i_id = attrs["i_id"].get("StringValue")
+            w_id = _attr("w_id")
+            i_id = _attr("i_id")
+            source = _attr("source")
+            i_version = _attr("i_version")
 
-            # If not in attributes, try to parse from body as JSON
-            if not w_id or not i_id:
+            # The body is the canonical carrier; fall back to it for anything
+            # not present as a message attribute.
+            if not (w_id and i_id and source and i_version):
                 try:
                     body_data = json.loads(body) if body else {}
-                    w_id = w_id or body_data.get("w_id")
-                    i_id = i_id or body_data.get("i_id")
                 except (json.JSONDecodeError, ValueError):
-                    pass
+                    body_data = {}
+                w_id = w_id or body_data.get("w_id")
+                i_id = i_id or body_data.get("i_id")
+                source = source or body_data.get("source")
+                i_version = i_version or body_data.get("i_version")
 
             # If still not found, raise error
             if not w_id or not i_id:
                 raise ValueError(f"Message missing w_id or i_id: {message_id}")
 
-            volume = VolumeRef(w_id=w_id, i_id=i_id)
+            volume = VolumeRef(
+                w_id=w_id,
+                i_id=i_id,
+                source=(source or "bdrc").strip().lower(),
+                i_version=i_version or None,
+            )
 
             return SqsTaskMessage(message_id=message_id, receipt_handle=receipt_handle, body=body, volume=volume)
 
@@ -149,7 +182,15 @@ class SQSClient:
                 raise MessageNotInflightError(f"Message no longer in flight ({code}): {e}") from e
             raise RuntimeError(f"Failed to change visibility: {e}") from e
 
-    def send_raw(self, queue_url: str, body: str, w_id: str | None = None, i_id: str | None = None) -> None:
+    def send_raw(
+        self,
+        queue_url: str,
+        body: str,
+        w_id: str | None = None,
+        i_id: str | None = None,
+        source: str | None = None,
+        i_version: str | None = None,
+    ) -> None:
         """
         Send a raw message to the queue.
 
@@ -158,14 +199,11 @@ class SQSClient:
             body: Message body (typically JSON string)
             w_id: Optional work ID (will be added as message attribute)
             i_id: Optional image group ID (will be added as message attribute)
+            source: Optional image source (added as message attribute if set)
+            i_version: Optional image version (added as message attribute if set)
         """
         try:
-            message_attributes = {}
-
-            if w_id:
-                message_attributes["w_id"] = {"StringValue": w_id, "DataType": "String"}
-            if i_id:
-                message_attributes["i_id"] = {"StringValue": i_id, "DataType": "String"}
+            message_attributes = _volume_message_attributes(w_id, i_id, source, i_version)
 
             kwargs = {"QueueUrl": queue_url, "MessageBody": body}
 
@@ -177,7 +215,7 @@ class SQSClient:
         except ClientError as e:
             raise RuntimeError(f"Failed to send SQS message: {e}") from e
 
-    def send_batch(self, queue_url: str, messages: list[tuple[str, str | None, str | None]]) -> int:
+    def send_batch(self, queue_url: str, messages: "list[VolumeMessage]") -> int:
         """
         Send multiple messages to the queue in batches.
 
@@ -186,10 +224,9 @@ class SQSClient:
 
         Args:
             queue_url: SQS queue URL
-            messages: List of (body, w_id, i_id) tuples
-                body: Message body (typically JSON string)
-                w_id: Optional work ID (will be added as message attribute)
-                i_id: Optional image group ID (will be added as message attribute)
+            messages: List of VolumeMessage tuples: (body, w_id, i_id, source, i_version)
+                Only ``body`` is required; the rest become message attributes when set.
+                Legacy 3-tuples (body, w_id, i_id) are still accepted.
 
         Returns:
             Total count of messages successfully sent
@@ -206,19 +243,19 @@ class SQSClient:
                 batch = messages[i : i + batch_size]
                 entries = []
 
-                for idx, (body, w_id, i_id) in enumerate(batch):
+                for idx, msg in enumerate(batch):
+                    body = msg[0]
+                    w_id = msg[1] if len(msg) > 1 else None
+                    i_id = msg[2] if len(msg) > 2 else None
+                    source = msg[3] if len(msg) > 3 else None
+                    i_version = msg[4] if len(msg) > 4 else None
+
                     entry = {
                         "Id": str(idx),  # Must be unique within this batch
                         "MessageBody": body,
                     }
 
-                    # Add message attributes if provided
-                    message_attributes = {}
-                    if w_id:
-                        message_attributes["w_id"] = {"StringValue": w_id, "DataType": "String"}
-                    if i_id:
-                        message_attributes["i_id"] = {"StringValue": i_id, "DataType": "String"}
-
+                    message_attributes = _volume_message_attributes(w_id, i_id, source, i_version)
                     if message_attributes:
                         entry["MessageAttributes"] = message_attributes
 

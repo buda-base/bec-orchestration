@@ -23,6 +23,12 @@ from bec_orch.core.models import (
     VolumeRef,
 )
 from bec_orch.core.registry import get_job_worker_factory
+from bec_orch.core.sources import (
+    MANIFEST_DIMENSIONS_JSON,
+    MANIFEST_LIST_OBJECTS,
+    ResolvedVolume,
+    resolve_volume,
+)
 from bec_orch.core.visibility import VisibilityExtender
 from bec_orch.errors import RetryableTaskError, TerminalTaskError
 from bec_orch.io.db import DBClient, etag_to_bytes
@@ -247,7 +253,14 @@ class BECWorkerRuntime:
             except Exception as e:
                 logger.error(f"Failed to close DB connection: {e}")
 
-    def process_volume_directly(self, w_id: str, i_id: str, force: bool = False) -> None:
+    def process_volume_directly(
+        self,
+        w_id: str,
+        i_id: str,
+        force: bool = False,
+        source: str = "bdrc",
+        i_version: str | None = None,
+    ) -> None:
         """
         Process a single volume directly without pulling from SQS.
 
@@ -263,9 +276,17 @@ class BECWorkerRuntime:
         Raises:
             KeyboardInterrupt: If user cancels, re-raised with message about --force
         """
-        volume = VolumeRef(w_id=w_id, i_id=i_id)
+        volume = VolumeRef(
+            w_id=w_id,
+            i_id=i_id,
+            source=(source or "bdrc").strip().lower(),
+            i_version=i_version or None,
+        )
 
-        logger.info(f"Processing volume directly: {w_id}/{i_id} (force={force})")
+        logger.info(
+            f"Processing volume directly: {w_id}/{i_id} "
+            f"(source={volume.source}, i_version={volume.i_version}, force={force})"
+        )
 
         # Create a fake SQS message for compatibility with existing flow
         fake_msg = SqsTaskMessage(
@@ -353,17 +374,25 @@ class BECWorkerRuntime:
             f"(message_id={msg.message_id}, force={force}, direct={is_direct})"
         )
 
+        # Resolve source routing once (buckets, prefixes, db identity).
+        resolved = resolve_volume(volume, self.s3_source_bucket)
+
         # Get volume manifest from S3
         manifest = self._get_volume_manifest(volume)
-        logger.info(f"Loaded manifest: {len(manifest.manifest)} files, etag={manifest.s3_etag}")
+        logger.info(
+            f"Loaded manifest: {len(manifest.manifest)} files, etag={manifest.s3_etag} "
+            f"(source={resolved.source}, images s3://{resolved.image_bucket}/{resolved.image_prefix})"
+        )
 
-        # Ensure volume exists in DB (with retry on connection errors)
+        # Ensure volume exists in DB (with retry on connection errors).
+        # db_w_id is namespaced per-source so non-BDRC volumes never collide
+        # with the real BDRC volume of the same id.
         etag_bytes = etag_to_bytes(manifest.s3_etag)
         volume_id = self._execute_with_retry(
             "ensure_volume",
             self.db.ensure_volume,
-            volume.w_id,
-            volume.i_id,
+            resolved.db_w_id,
+            resolved.db_i_id,
             etag_bytes,
             manifest.last_modified_iso,
             len(manifest.manifest),
@@ -494,6 +523,9 @@ class BECWorkerRuntime:
                 config_str=self.job_record.config_text,
                 volume_manifest=manifest,
                 artifacts_location=artifacts_location,
+                source=resolved.source,
+                source_bucket=resolved.image_bucket,
+                image_prefix=resolved.image_prefix,
             )
 
             logger.info(f"Running job worker for volume {volume.w_id}/{volume.i_id}")
@@ -572,17 +604,24 @@ class BECWorkerRuntime:
 
     def _get_volume_manifest(self, volume: VolumeRef) -> VolumeManifest:
         """
-        Fetch volume manifest from S3.
+        Discover the volume's image list, routed by the volume's source.
 
-        The manifest is stored at: Works/{hash}/{w_id}/images/{w_id}-{suffix}/dimensions.json
-        It's gzipped JSON with format: [{"filename": "I123.jpg", ...}, ...]
+        - BDRC (default): gzipped JSON manifest at
+          Works/{hash}/{w_id}/images/{w_id}-{suffix}/dimensions.json, whose S3
+          etag drives artifact versioning + DB idempotency.
+        - Other sources (e.g. ocr_benchmark): list the image files under a flat
+          prefix and synthesize an etag from the source's version identifier.
         """
-        prefix = get_s3_folder_prefix(volume.w_id, volume.i_id)
-        manifest_key = f"{prefix}dimensions.json"
+        resolved = resolve_volume(volume, self.s3_source_bucket)
+        if resolved.manifest_mode == MANIFEST_LIST_OBJECTS:
+            return self._list_objects_manifest(resolved)
+        return self._dimensions_json_manifest(resolved)
 
+    def _dimensions_json_manifest(self, resolved: ResolvedVolume) -> VolumeManifest:
+        manifest_key = resolved.manifest_key
         try:
             # Get object with metadata
-            response = self.s3.get_object(Bucket=self.s3_source_bucket, Key=manifest_key)
+            response = self.s3.get_object(Bucket=resolved.manifest_bucket, Key=manifest_key)
             etag = response["ETag"].strip('"')
             last_modified = response["LastModified"].isoformat()
 
@@ -612,19 +651,79 @@ class BECWorkerRuntime:
 
         except ClientError as e:
             if e.response["Error"]["Code"] == "404":
-                raise TerminalTaskError(f"Manifest not found: s3://{self.s3_source_bucket}/{manifest_key}")
+                raise TerminalTaskError(
+                    f"Manifest not found: s3://{resolved.manifest_bucket}/{manifest_key}"
+                )
             raise RetryableTaskError(f"Failed to fetch manifest: {e}")
+
+    def _list_objects_manifest(self, resolved: ResolvedVolume) -> VolumeManifest:
+        """Build a manifest by listing image files under a flat prefix.
+
+        Used by sources that have no dimensions.json (e.g. ocr_benchmark). The
+        etag is synthesized from the source's version identifier, so reruns of
+        the same version are idempotent; bump the version to reprocess.
+        """
+        bucket = resolved.manifest_bucket
+        prefix = resolved.manifest_prefix
+        manifest: list[dict[str, Any]] = []
+        last_modified: str = ""
+        try:
+            paginator = self.s3.get_paginator("list_objects_v2")
+            for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+                for obj in page.get("Contents", []):
+                    key = obj["Key"]
+                    if key.endswith("/"):
+                        continue
+                    filename = key[len(prefix):] if key.startswith(prefix) else Path(key).name
+                    # Only direct children (flat folder), image files only.
+                    if not filename or "/" in filename:
+                        continue
+                    if Path(filename).suffix.lower() not in IMAGE_EXTENSIONS:
+                        continue
+                    manifest.append({"filename": filename})
+                    lm = obj.get("LastModified")
+                    if lm is not None:
+                        iso = lm.isoformat()
+                        if iso > last_modified:
+                            last_modified = iso
+        except ClientError as e:
+            raise RetryableTaskError(
+                f"Failed to list images at s3://{bucket}/{prefix}: {e}"
+            )
+
+        if not manifest:
+            raise TerminalTaskError(f"No images found at s3://{bucket}/{prefix}")
+
+        # Stable ordering (list_objects_v2 is lexicographic per page, but be safe).
+        manifest.sort(key=lambda item: item["filename"])
+
+        return VolumeManifest(
+            manifest=manifest,
+            s3_etag=resolved.forced_etag_hex or "",
+            last_modified_iso=last_modified,
+        )
 
     def _get_artifact_location(self, volume: VolumeRef, s3_etag: str) -> ArtifactLocation:
         """
         Compute artifact location for this job/volume/version.
 
         Format: {job_name}/{w_id}/{i_id}/{version}/
-        Where version is first 6 chars of etag (without quotes).
+        For BDRC, version is the first 6 chars of the manifest etag. For sources
+        that carry their own version (e.g. ocr_benchmark's i_version), that value
+        is used verbatim so artifacts mirror the source layout.
         """
-        version = s3_etag.replace('"', "").split("-")[0][:6]
-        prefix = f"{self.job_record.name}/{volume.w_id}/{volume.i_id}/{version}"
-        basename = f"{volume.w_id}-{volume.i_id}-{version}"
+        resolved = resolve_volume(volume, self.s3_source_bucket)
+        if resolved.forced_version:
+            version = resolved.forced_version
+        else:
+            version = s3_etag.replace('"', "").split("-")[0][:6]
+        # Use the same namespaced identity as the DB (db_w_id): for BDRC this is
+        # the raw w_id, so the path is byte-identical to the tens of thousands of
+        # already-produced production artifacts. For other sources it becomes
+        # e.g. "ocr_benchmark:W1TS1", keeping S3 and DB consistent and ensuring a
+        # BDRC volume can NEVER carry a source segment.
+        prefix = f"{self.job_record.name}/{resolved.db_w_id}/{resolved.db_i_id}/{version}"
+        basename = f"{resolved.db_w_id}-{resolved.db_i_id}-{version}"
 
         return ArtifactLocation(
             bucket=self.s3_dest_bucket,
@@ -847,12 +946,6 @@ def get_s3_folder_prefix(w_id: str, i_id: str) -> str:
        - hash is first 2 chars of MD5 of w_id
        - suffix is i_id without "I" prefix if it's I + 4 digits, else full i_id
     """
-    md5_hash = hashlib.md5(w_id.encode()).hexdigest()[:2]
+    from bec_orch.core.sources import bdrc_folder_prefix
 
-    # Compute suffix
-    if i_id.startswith("I") and i_id[1:].isdigit() and len(i_id) == 5:
-        suffix = i_id[1:]  # Remove 'I' prefix
-    else:
-        suffix = i_id
-
-    return f"Works/{md5_hash}/{w_id}/images/{w_id}-{suffix}/"
+    return bdrc_folder_prefix(w_id, i_id)

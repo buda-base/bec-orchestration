@@ -104,9 +104,10 @@ class ScriptClassificationV2JobWorker:
         if n_expected == 0:
             raise TerminalTaskError(f"empty manifest for volume {vol.w_id}/{vol.i_id}")
 
+        src_bucket = ctx.source_bucket or _SOURCE_BUCKET
         logger.info(
             f"[script_classification_v2] {vol.w_id}/{vol.i_id}: {n_expected} images "
-            f"(source s3://{_SOURCE_BUCKET})"
+            f"(source={ctx.source}, s3://{src_bucket}/{ctx.image_prefix})"
         )
 
         t_start = time.time()
@@ -128,9 +129,15 @@ class ScriptClassificationV2JobWorker:
         batch_size = max(1, cfg.classify_batch_size)
         n_batches = (n_expected + batch_size - 1) // batch_size
 
-        from bec_orch.core.worker_runtime import get_s3_folder_prefix
+        # Image location is resolved by the runtime (source-aware) and passed on
+        # the context; fall back to BDRC-style routing only if unset.
+        src_bucket = ctx.source_bucket or _SOURCE_BUCKET
+        if ctx.image_prefix:
+            vol_prefix = ctx.image_prefix
+        else:
+            from bec_orch.core.worker_runtime import get_s3_folder_prefix
 
-        vol_prefix = get_s3_folder_prefix(vol.w_id, vol.i_id)
+            vol_prefix = get_s3_folder_prefix(vol.w_id, vol.i_id)
 
         parquet_uri, errors_uri = self._artifact_uris(ctx)
         writer = StreamingScriptClassificationV2Writer(
@@ -162,7 +169,7 @@ class ScriptClassificationV2JobWorker:
                     b_start = b_idx * batch_size
                     b_stop = min(b_start + batch_size, n_expected)
                     b_manifest = manifest[b_start:b_stop]
-                    fetched, failed = self._fetch_raw_bytes(vol_prefix, b_manifest)
+                    fetched, failed = self._fetch_raw_bytes(src_bucket, vol_prefix, b_manifest)
                     while not stop_event.is_set():
                         try:
                             fetch_q.put((b_idx, b_manifest, fetched, failed), timeout=0.5)
@@ -292,7 +299,7 @@ class ScriptClassificationV2JobWorker:
     # ------------------------------------------------------------------
 
     def _fetch_raw_bytes(
-        self, vol_prefix: str, manifest: list[dict[str, Any]]
+        self, bucket: str, vol_prefix: str, manifest: list[dict[str, Any]]
     ) -> tuple[list[_FetchedPage], list[_FailedPage]]:
         cfg = self.cfg
         ok_by_filename: dict[str, _FetchedPage] = {}
@@ -301,7 +308,7 @@ class ScriptClassificationV2JobWorker:
         def _one(filename: str) -> None:
             key = f"{vol_prefix}{filename}"
             try:
-                resp = self._s3.get_object(Bucket=_SOURCE_BUCKET, Key=key)
+                resp = self._s3.get_object(Bucket=bucket, Key=key)
             except Exception as e:  # noqa: BLE001 — boto3 ClientError subtypes
                 ko_by_filename[filename] = _FailedPage(
                     filename=filename, stage="fetch", etag=None, error=f"s3 get failed: {e}"

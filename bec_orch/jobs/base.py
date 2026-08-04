@@ -13,6 +13,12 @@ class JobContext:
     config_str: str # raw string from SQL jobs.config
     volume_manifest: VolumeManifest
     artifacts_location: ArtifactLocation
+    # Resolved image source routing (see bec_orch.core.sources). Workers should
+    # fetch page images from f"s3://{source_bucket}/{image_prefix}{filename}"
+    # instead of recomputing the BDRC path, so alternate sources work.
+    source: str = "bdrc"
+    source_bucket: str = ""
+    image_prefix: str = ""
 
 class JobWorker(Protocol):
     """

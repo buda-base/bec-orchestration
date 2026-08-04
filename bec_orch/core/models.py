@@ -6,6 +6,13 @@ from typing import Any, Dict, List, Optional
 class VolumeRef:
     w_id: str
     i_id: str
+    # Logical location the images come from. "bdrc" (default) means the
+    # canonical archive.tbrc.org Works/... layout. Other sources (e.g.
+    # "ocr_benchmark") route S3 fetching elsewhere; see bec_orch.core.sources.
+    source: str = "bdrc"
+    # Version identifier for sources that carry one in their path
+    # (e.g. ocr_benchmark: .../{w_id}/{i_id}/{i_version}/). Ignored for "bdrc".
+    i_version: Optional[str] = None
 
 @dataclass(frozen=True)
 class VolumeManifest:

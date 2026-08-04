@@ -162,14 +162,26 @@ def enqueue(queue_url, job_name, file, volume, region, limit, force):
                 if conn is not None:
                     conn.close()
         else:
-            # Parse volume arguments
+            # Parse volume arguments: w_id,i_id[,source[,i_version]]
             volumes = []
             for vol_str in volume:
                 parts = vol_str.replace(',', ' ').split()
-                if len(parts) != 2:
-                    console.print(f"[red]Error:[/red] Invalid volume format: {vol_str} (expected W12345,I0123)")
+                if len(parts) < 2 or len(parts) > 4:
+                    console.print(
+                        f"[red]Error:[/red] Invalid volume format: {vol_str} "
+                        "(expected W12345,I0123 or W12345,I0123,ocr_benchmark,202603)"
+                    )
                     sys.exit(1)
-                volumes.append(VolumeRef(w_id=parts[0], i_id=parts[1]))
+                vol_source = parts[2].strip().lower() if len(parts) > 2 else 'bdrc'
+                vol_iversion = parts[3] if len(parts) > 3 else None
+                volumes.append(
+                    VolumeRef(
+                        w_id=parts[0],
+                        i_id=parts[1],
+                        source=vol_source,
+                        i_version=vol_iversion,
+                    )
+                )
             
             console.print(f"Enqueueing {len(volumes)} volume(s)...")
             count = enqueue_volumes(sqs, queue_url, volumes)
@@ -301,7 +313,14 @@ def redrive(source_queue_url, dest_queue_url, max_messages, region):
                 break
             
             # Send to destination queue
-            sqs.send_raw(dest_queue_url, msg.body, w_id=msg.volume.w_id, i_id=msg.volume.i_id)
+            sqs.send_raw(
+                dest_queue_url,
+                msg.body,
+                w_id=msg.volume.w_id,
+                i_id=msg.volume.i_id,
+                source=msg.volume.source,
+                i_version=msg.volume.i_version,
+            )
             
             # Delete from source
             sqs.delete(source_queue_url, msg.receipt_handle)

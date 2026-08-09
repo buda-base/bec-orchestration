@@ -118,6 +118,13 @@ class GoogleVisionV1Config:
     # ``{w}-{i}-{version}-gv.parquet`` / ``.jsonl.zst`` naming.
     artifact_suffix: str = "-gv"
 
+    # Top-level S3 prefix (in the dest bucket) for the parquet + jsonl.zst
+    # artifacts. Defaults to ``gv/`` so outputs land next to the other Google
+    # Vision runs at ``s3://{dest}/gv/{w}/{i}/{version}/`` instead of under the
+    # job-name namespace. Set to empty to fall back to the runtime's default
+    # ``{job_name}/...`` artifact location.
+    s3_artifact_prefix: str = "gv/"
+
     # ------------------------------------------------------------------
     # S3 (source images + destination artifacts)
     # ------------------------------------------------------------------
@@ -160,6 +167,7 @@ class GoogleVisionV1Config:
         # Normalize prefixes to end with exactly one "/".
         self.staging_prefix = self._norm_prefix(self.staging_prefix)
         self.output_prefix = self._norm_prefix(self.output_prefix)
+        self.s3_artifact_prefix = self._norm_prefix(self.s3_artifact_prefix)
 
     @staticmethod
     def _norm_prefix(prefix: str) -> str:

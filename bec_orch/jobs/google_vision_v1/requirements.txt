@@ -1,0 +1,15 @@
+# google_vision_v1 job dependencies.
+#
+# This job does NOT need torch / a GPU. It only talks to Google Vision + GCS,
+# reads images from S3, and writes parquet/zstd artifacts back to S3.
+#
+# boto3 is already a core orchestration dependency (see pyproject.toml); it is
+# listed here only for completeness when installing this job standalone.
+
+google-cloud-vision>=3.4.0
+google-cloud-storage>=2.10.0
+google-auth>=2.20.0
+
+pyarrow>=14.0.0
+zstandard>=0.21.0
+boto3>=1.26.0

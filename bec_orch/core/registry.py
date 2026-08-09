@@ -259,6 +259,144 @@ def _auto_register() -> None:
             f"Failed to auto-register script_classification_v2 worker: {e}. Worker class may not exist in module."
         )
 
+    # Try to import and register layout_detection_v1 worker
+    try:
+        from dataclasses import fields
+
+        from bec_orch.jobs.layout_detection_v1.config import LayoutDetectionV1Config
+        from bec_orch.jobs.layout_detection_v1.worker import LayoutDetectionV1JobWorker
+
+        def layout_detection_v1_factory(job_config: dict[str, Any] | None) -> JobWorker:
+            """Factory for LayoutDetectionV1JobWorker — builds config from job_config.
+
+            Every ``LayoutDetectionV1Config`` field has a default, so an empty
+            job config is valid; any keys present in ``job_config`` override the
+            defaults.
+            """
+            cfg_kwargs: dict[str, Any] = {}
+            if job_config:
+                allowed = {f.name for f in fields(LayoutDetectionV1Config)}
+                for k, v in job_config.items():
+                    if k in allowed:
+                        cfg_kwargs[k] = v
+                    else:
+                        logger.warning(
+                            f"[layout_detection_v1] ignoring unknown config key '{k}' "
+                            f"(allowed: {sorted(allowed)})"
+                        )
+            cfg = LayoutDetectionV1Config(**cfg_kwargs)
+            return LayoutDetectionV1JobWorker(cfg)
+
+        register_job_worker("layout_detection_v1", layout_detection_v1_factory)
+    except ImportError as e:
+        logger.warning(
+            f"Failed to auto-register layout_detection_v1 worker: {e}. "
+            f"Dependencies (torch, ultralytics, huggingface_hub, pyvips, pyarrow) may not be installed."
+        )
+    except AttributeError as e:
+        logger.warning(
+            f"Failed to auto-register layout_detection_v1 worker: {e}. Worker class may not exist in module."
+        )
+
+    # Try to import and register PaddleOCR-VL worker(s).
+    #
+    # The implementation in ``bec_orch.jobs.paddleocr`` is version-agnostic:
+    # everything model-specific (checkpoint, prompt, generation knobs) lives in
+    # ``PaddleOCRConfig``. To add ``paddleocr_v2`` when its checkpoint is ready,
+    # register another job name with different ``base_defaults`` — no new code:
+    #
+    #     register_job_worker(
+    #         "paddleocr_v2",
+    #         _make_paddleocr_factory({
+    #             "checkpoint_s3_uri": "s3://bec.bdrc.io/checkpoints/PaddleOCR/<v2>/epoch_0/",
+    #         }),
+    #     )
+    #
+    # (Job-creation config still overrides these per-job at runtime.)
+    try:
+        from dataclasses import fields
+
+        from bec_orch.jobs.paddleocr.config import PaddleOCRConfig
+        from bec_orch.jobs.paddleocr.worker import PaddleOCRJobWorker
+
+        def _make_paddleocr_factory(base_defaults: dict[str, Any] | None = None) -> WorkerFactory:
+            """Build a factory for a PaddleOCR-VL job.
+
+            ``base_defaults`` are job-specific overrides (e.g. a different
+            checkpoint for v2). The DB ``job_config`` overrides those in turn.
+            Unknown keys are ignored with a warning.
+            """
+            base_defaults = base_defaults or {}
+
+            def factory(job_config: dict[str, Any] | None) -> JobWorker:
+                allowed = {f.name for f in fields(PaddleOCRConfig)}
+                merged: dict[str, Any] = {}
+                for src in (base_defaults, job_config or {}):
+                    for k, v in src.items():
+                        if k in allowed:
+                            merged[k] = v
+                        else:
+                            logger.warning(
+                                f"[paddleocr] ignoring unknown config key '{k}' "
+                                f"(allowed: {sorted(allowed)})"
+                            )
+                cfg = PaddleOCRConfig(**merged)
+                return PaddleOCRJobWorker(cfg)
+
+            return factory
+
+        # v1 uses the defaults baked into PaddleOCRConfig verbatim.
+        register_job_worker("paddleocr_v1", _make_paddleocr_factory())
+    except ImportError as e:
+        logger.warning(
+            f"Failed to auto-register paddleocr worker: {e}. "
+            f"Dependencies (torch, transformers, pyewts, botok, pyvips, pyarrow) may not be installed."
+        )
+    except AttributeError as e:
+        logger.warning(
+            f"Failed to auto-register paddleocr worker: {e}. Worker class may not exist in module."
+        )
+
+    # Try to import and register google_vision_v1 worker (no GPU; Google Vision).
+    try:
+        from dataclasses import fields
+
+        from bec_orch.jobs.google_vision_v1.config import GoogleVisionV1Config
+        from bec_orch.jobs.google_vision_v1.worker import GoogleVisionV1JobWorker
+
+        def google_vision_v1_factory(job_config: dict[str, Any] | None) -> JobWorker:
+            """Factory for GoogleVisionV1JobWorker — builds config from job_config.
+
+            Every ``GoogleVisionV1Config`` field has a default, so an empty job
+            config is valid; any keys present in ``job_config`` override the
+            defaults. (In practice ``google_credentials_path`` is usually set.)
+            """
+            cfg_kwargs: dict[str, Any] = {}
+            if job_config:
+                allowed = {f.name for f in fields(GoogleVisionV1Config)}
+                for k, v in job_config.items():
+                    if k in allowed:
+                        cfg_kwargs[k] = v
+                    else:
+                        logger.warning(
+                            f"[google_vision_v1] ignoring unknown config key '{k}' "
+                            f"(allowed: {sorted(allowed)})"
+                        )
+            cfg = GoogleVisionV1Config(**cfg_kwargs)
+            return GoogleVisionV1JobWorker(cfg)
+
+        register_job_worker("google_vision_v1", google_vision_v1_factory)
+    except ImportError as e:
+        logger.warning(
+            f"Failed to auto-register google_vision_v1 worker: {e}. "
+            f"Dependencies (google-cloud-vision, google-cloud-storage, pyarrow, zstandard) "
+            f"may not be installed."
+        )
+    except AttributeError as e:
+        logger.warning(
+            f"Failed to auto-register google_vision_v1 worker: {e}. Worker class may not exist in module."
+        )
+
 
 # Run auto-registration on module import
 _auto_register()

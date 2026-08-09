@@ -24,14 +24,15 @@ memory** (no external Vision-state database — unlike the standalone
    batches finish (or `volume_timeout_s` is hit → retryable failure). The
    runtime's SQS visibility extender keeps the message in flight meanwhile.
 4. **Export** — download the Vision JSON from GCS, parse it, and write to the
-   destination S3 bucket under `s3_artifact_prefix` (default `gv/`, matching the
-   other Google Vision runs) at `gv/{w}/{i}/{version}/`:
+   destination S3 bucket at `{root}/{w}/{i}/{version}/`:
    - `{w}-{i}-{version}-gv.parquet` — one row per page (schema below)
    - `{w}-{i}-{version}-gv.jsonl.zst` — raw Vision responses (one JSON per line)
+   - `success.json` — the runtime's idempotency marker (written afterward)
 
-   The runtime still writes its own `success.json` idempotency marker under the
-   `{job_name}/{w}/{i}/{version}/` location. Set `s3_artifact_prefix` to empty
-   to write the data artifacts under that same `{job_name}/...` location instead.
+   `{root}` defaults to the job name, but is set to `gv` for this job via the
+   `artifact_prefix` config key so outputs sit next to the other Google Vision
+   runs at `s3://{dest}/gv/{w}/{i}/{version}/`. Everything (data + `success.json`)
+   stays together under that one directory.
 
 ## Parquet schema
 
@@ -61,8 +62,9 @@ JSON at job-creation time. Notable keys:
   `archive-mirror.tbrc.org` + `google_vision_v1_staging/`).
 - `output_bucket` / `output_prefix` — GCS Vision-output area (default
   `bec.bdrc.io` + `google_vision_v1_vision-json/`).
-- `s3_artifact_prefix` — top-level S3 prefix for the parquet + jsonl.zst
-  artifacts in the dest bucket (default `gv/`; empty → `{job_name}/...`).
+- `artifact_prefix` — top-level S3 directory (in the dest bucket) for the whole
+  artifact set (parquet + jsonl.zst + success.json). Interpreted by the runtime,
+  not this worker; defaults to the job name. Set to `gv` for this job.
 - `batch_size` (default 500), `max_concurrent_ops` (8), `poll_interval_s` (30),
   `volume_timeout_s` (10800), `max_page_failure_rate` (0.05).
 

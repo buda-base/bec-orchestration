@@ -423,17 +423,8 @@ class GoogleVisionV1JobWorker:
         jsonl_bytes = parsing.responses_to_jsonl_zst_bytes(raw_records, cfg.jsonl_zstd_level)
 
         loc = ctx.artifacts_location
+        prefix = loc.prefix.rstrip("/")
         base = f"{loc.basename}{cfg.artifact_suffix}"
-        # Write the data artifacts under a dedicated top-level prefix (default
-        # ``gv/``) so they sit alongside the other Google Vision runs, keeping
-        # the ``{w}/{i}/{version}`` tail (and thus the exact per-volume path +
-        # filenames) that the runtime derived. If ``s3_artifact_prefix`` is
-        # empty, fall back to the runtime's ``{job_name}/...`` location.
-        if cfg.s3_artifact_prefix:
-            tail = loc.prefix.strip("/").split("/", 1)[1]  # strip the job-name root
-            prefix = f"{cfg.s3_artifact_prefix}{tail}"
-        else:
-            prefix = loc.prefix.rstrip("/")
         parquet_key = f"{prefix}/{base}.parquet"
         jsonl_key = f"{prefix}/{base}.jsonl.zst"
 

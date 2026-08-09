@@ -707,7 +707,13 @@ class BECWorkerRuntime:
         """
         Compute artifact location for this job/volume/version.
 
-        Format: {job_name}/{w_id}/{i_id}/{version}/
+        Format: {root}/{w_id}/{i_id}/{version}/
+        ``root`` defaults to the job name, but a job can override it via the
+        ``artifact_prefix`` key in its ``jobs.config`` JSON (e.g. ``"gv"`` so the
+        Google Vision outputs land next to the other Google Vision runs). This
+        controls the WHOLE artifact location, so data files AND ``success.json``
+        stay together.
+
         For BDRC, version is the first 6 chars of the manifest etag. For sources
         that carry their own version (e.g. ocr_benchmark's i_version), that value
         is used verbatim so artifacts mirror the source layout.
@@ -717,12 +723,17 @@ class BECWorkerRuntime:
             version = resolved.forced_version
         else:
             version = s3_etag.replace('"', "").split("-")[0][:6]
+        # Optional per-job override of the top-level directory (defaults to the
+        # job name). Opt-in via jobs.config -> "artifact_prefix"; absent = legacy
+        # behaviour for every other job.
+        root = (getattr(self, "job_config", {}) or {}).get("artifact_prefix") or self.job_record.name
+        root = str(root).strip("/")
         # Use the same namespaced identity as the DB (db_w_id): for BDRC this is
         # the raw w_id, so the path is byte-identical to the tens of thousands of
         # already-produced production artifacts. For other sources it becomes
         # e.g. "ocr_benchmark:W1TS1", keeping S3 and DB consistent and ensuring a
         # BDRC volume can NEVER carry a source segment.
-        prefix = f"{self.job_record.name}/{resolved.db_w_id}/{resolved.db_i_id}/{version}"
+        prefix = f"{root}/{resolved.db_w_id}/{resolved.db_i_id}/{version}"
         basename = f"{resolved.db_w_id}-{resolved.db_i_id}-{version}"
 
         return ArtifactLocation(

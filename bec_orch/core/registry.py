@@ -350,7 +350,7 @@ def _auto_register() -> None:
     except ImportError as e:
         logger.warning(
             f"Failed to auto-register paddleocr worker: {e}. "
-            f"Dependencies (torch, transformers, pyewts, botok, pyvips, pyarrow) may not be installed."
+            f"Dependencies (vllm, transformers, opencv-python-headless, numpy, pyvips, pyarrow) may not be installed."
         )
     except AttributeError as e:
         logger.warning(

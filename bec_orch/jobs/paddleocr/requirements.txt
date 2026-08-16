@@ -1,0 +1,39 @@
+# Extra dependencies for the PaddleOCR-VL OCR job(s) (paddleocr_v1, paddleocr_v2, ...).
+#
+# Serving stack: vLLM (offline engine) + DRY + adaptive per-page resolution.
+# Installed into the DLAMI venv (e.g. /opt/pytorch): `pip install vllm`. vLLM
+# pins its own torch, so let pip resolve torch to whatever vLLM needs.
+#
+# vLLM >= 0.26 ships native PaddleOCRVLForConditionalGeneration support (the
+# checkpoint is patched by model_sync.py so trust_remote_code stays False).
+vllm>=0.26
+
+# Sequential image-token M-RoPE plugin. grow26-ep2 is a sequential-regime
+# checkpoint; stock vLLM ONLY serves the grid regime (it never reads
+# mm_token_type_ids), which regresses the model. This vLLM general plugin
+# overrides get_mrope_input_positions in every engine process. It MUST be
+# pip-installed into the SAME venv as vLLM so its entry point is discoverable:
+#     /opt/pytorch/bin/pip install ./vllm_paddleocr_seqpos
+# and OCR_VLLM_IMAGE_TOKEN_POSITIONS=sequential set (the systemd unit + worker
+# both set it). Set image_token_positions='grid' to skip the plugin.
+./vllm_paddleocr_seqpos
+# Processor / tokenizer / config for the checkpoint (vLLM also needs it). Left
+# unpinned so it resolves to whatever the installed vLLM requires.
+transformers>=4.57
+
+# Adaptive per-page resolution: OpenCV connected-components glyph-height proxy.
+opencv-python-headless
+numpy
+
+# NOTE: no pyewts / botok. The grow26-ep2 checkpoint uses a warmed Tibetan
+# unicode-stack tokenizer and emits Tibetan UNICODE directly; post-processing is
+# the vendored normalize_unicode_text (tibetan_normalize.py) only — no
+# Wylie/EWTS conversion.
+
+# Image IO / output / S3 (some already present via the root requirements).
+pyvips
+pyvips[binary]
+pillow
+pyarrow
+s3fs
+boto3

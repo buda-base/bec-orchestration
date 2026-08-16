@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vllm-paddleocr-seqpos"
+version = "0.1.0"
+description = "vLLM general plugin: serve PaddleOCR-VL with sequential (1D) image-token M-RoPE."
+requires-python = ">=3.10"
+# No install deps: the plugin only touches vllm/torch/numpy, which are already present in the
+# serving environment (importing them itself would wrongly pin versions).
+
+[project.entry-points."vllm.general_plugins"]
+# vLLM loads this in process0, the EngineCore process, and every worker process, and calls it
+# with no args. The plugin is a no-op unless OCR_VLLM_IMAGE_TOKEN_POSITIONS=sequential.
+paddleocr_seqpos = "vllm_paddleocr_seqpos:apply"
+
+[tool.setuptools]
+packages = ["vllm_paddleocr_seqpos"]

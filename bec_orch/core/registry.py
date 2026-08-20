@@ -301,18 +301,11 @@ def _auto_register() -> None:
     # Try to import and register PaddleOCR-VL worker(s).
     #
     # The implementation in ``bec_orch.jobs.paddleocr`` is version-agnostic:
-    # everything model-specific (checkpoint, prompt, generation knobs) lives in
-    # ``PaddleOCRConfig``. To add ``paddleocr_v2`` when its checkpoint is ready,
-    # register another job name with different ``base_defaults`` — no new code:
-    #
-    #     register_job_worker(
-    #         "paddleocr_v2",
-    #         _make_paddleocr_factory({
-    #             "checkpoint_s3_uri": "s3://bec.bdrc.io/checkpoints/PaddleOCR/<v2>/epoch_0/",
-    #         }),
-    #     )
-    #
-    # (Job-creation config still overrides these per-job at runtime.)
+    # everything model-specific (checkpoint, prompt, generation knobs, layout
+    # masking) lives in ``PaddleOCRConfig``. ``paddleocr_v2`` reuses the v1
+    # checkpoint and turns on header/footer background fill plus two-column
+    # split from ``layout_detection_v1``. A later checkpoint-only version is
+    # still a one-line ``base_defaults`` override.
     try:
         from dataclasses import fields
 
@@ -347,6 +340,15 @@ def _auto_register() -> None:
 
         # v1 uses the defaults baked into PaddleOCRConfig verbatim.
         register_job_worker("paddleocr_v1", _make_paddleocr_factory())
+        # v2: same checkpoint, paint header/footer from layout_detection_v1.
+        register_job_worker(
+            "paddleocr_v2",
+            _make_paddleocr_factory({
+                "layout_mask_enabled": True,
+                "layout_split_columns": True,
+                "layout_isolate_footnotes": True,
+            }),
+        )
     except ImportError as e:
         logger.warning(
             f"Failed to auto-register paddleocr worker: {e}. "

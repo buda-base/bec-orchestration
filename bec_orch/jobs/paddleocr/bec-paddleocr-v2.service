@@ -1,0 +1,96 @@
+[Unit]
+Description=BEC Worker - paddleocr_v2 (PaddleOCR-VL + layout header/footer mask)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+
+User=ubuntu
+Group=ubuntu
+
+# Load environment variables: BEC_SQL_*, BEC_REGION, BEC_DEST_S3_BUCKET,
+# AWS_* credentials, etc.
+EnvironmentFile=/etc/bec/worker.env
+
+WorkingDirectory=/home/ubuntu/bec-orchestration
+
+# vLLM (offline engine) uses CUDA; the HF cache + model checkpoint cache live
+# in a system-managed dir (writable; everything else under /home is read-only
+# via ProtectHome). PATH points at the venv that has vllm + transformers
+# installed (the DLAMI ships /opt/pytorch; vllm is pip-installed into it).
+Environment="PATH=/opt/pytorch/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+Environment="HF_HOME=/var/cache/bec-paddleocr/hf"
+Environment="HF_HUB_DISABLE_PROGRESS_BARS=1"
+Environment="PYTHONUNBUFFERED=1"
+Environment="XDG_CACHE_HOME=/var/cache/bec-paddleocr"
+# ProtectHome=read-only makes /home/ubuntu read-only, but flashinfer (used by
+# vLLM's attention backend) writes a JIT/workspace cache under ~/.cache. Point
+# HOME at the writable, systemd-managed cache dir so ~/.cache/flashinfer works.
+Environment="HOME=/var/cache/bec-paddleocr"
+Environment="TORCHINDUCTOR_CACHE_DIR=/var/cache/bec-paddleocr/torchinductor"
+Environment="TRITON_CACHE_DIR=/var/cache/bec-paddleocr/triton"
+Environment="VLLM_CACHE_ROOT=/var/cache/bec-paddleocr/vllm"
+Environment="FLASHINFER_WORKSPACE_BASE=/var/cache/bec-paddleocr/flashinfer"
+# vLLM's flashinfer sampler JIT-compiles a kernel that needs nvcc; greedy OCR
+# doesn't need it, so disable it on toolkit-less boxes. (The worker also sets
+# this defensively.)
+Environment="VLLM_USE_FLASHINFER_SAMPLER=0"
+# Image-token M-RoPE regime. grow26-ep2 is a sequential-regime checkpoint; stock
+# vLLM only serves grid, so the vllm_paddleocr_seqpos plugin must be pip-installed
+# into the venv and this flag set (the worker also sets it before the engine
+# starts; child EngineCore/worker processes inherit it).
+Environment="OCR_VLLM_IMAGE_TOKEN_POSITIONS=sequential"
+# Where the S3 checkpoint is synced to locally. Defaults to /opt/bec/models
+# (set in /etc/bec/worker.env); the sync is idempotent (skips files already
+# present), so a pre-baked AMI that ships the checkpoint here does no download.
+# Uncomment to override the worker.env value:
+# Environment="BEC_PADDLEOCR_MODEL_CACHE=/opt/bec/models"
+Environment="TRANSFORMERS_VERBOSITY=warning"
+Environment="TOKENIZERS_PARALLELISM=false"
+
+# Worker:
+#   --visibility-timeout 3600 matches PaddleOCRConfig.volume_timeout_s (1 h);
+#   some volumes are legitimately long.
+ExecStart=/opt/pytorch/bin/bec worker \
+    --job-name paddleocr_v2 \
+    --visibility-timeout 3600
+
+# Graceful shutdown: let the in-flight volume finish + write its parquet.
+# Must exceed the 1 h volume timeout plus a margin.
+KillMode=mixed
+KillSignal=SIGTERM
+TimeoutStopSec=3900
+
+Restart=on-failure
+RestartSec=30
+StartLimitInterval=600
+StartLimitBurst=3
+
+# File descriptors for the boto3 pool + HF logging.
+LimitNOFILE=65536
+LimitNPROC=4096
+LimitCORE=0
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=bec-paddleocr-v2
+
+# Security hardening, with the writable paths torch/HF need:
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=-/var/log/bec
+# Local checkpoint cache (BEC_PADDLEOCR_MODEL_CACHE); writable so the on-start
+# S3 sync can populate it. Harmless if the AMI already ships the checkpoint.
+ReadWritePaths=-/opt/bec
+
+# systemd auto-creates /var/cache/bec-paddleocr (mode 0750, owned by User=)
+# and adds it to ReadWritePaths — HF_HOME, the model cache and torch caches
+# all live under it.
+CacheDirectory=bec-paddleocr
+CacheDirectoryMode=0750
+
+[Install]
+WantedBy=multi-user.target

@@ -21,6 +21,12 @@ Schema (one row per processed page):
     skip_reason     string    classifier label / rule that caused the skip
     error_stage     string    "" / "fetch" / "decode" / "ocr"
     error_message   string    short error description (<=512 chars)
+    layout_masked   bool      True if header/footer boxes were painted with bg
+    n_masked_boxes  int32     number of header+footer boxes painted (0 if none)
+    n_columns       int32     1 = full page; 2+ = two-column split (joined text)
+    footnote_text   string    isolated footnote transcription (merged, or "")
+    n_footnotes     int32     number of footnote boxes OCR'd
+    removed         string    header/footer left out of page_text: none|h|f|hf
     model_id        string    checkpoint identifier that produced the row
 
 Errors are also optionally mirrored to ``<basename>-errors.jsonl.gz``.
@@ -63,6 +69,12 @@ def paddleocr_build_schema() -> pa.Schema:
             pa.field("skip_reason", pa.string()),
             pa.field("error_stage", pa.string()),
             pa.field("error_message", pa.string()),
+            pa.field("layout_masked", pa.bool_()),
+            pa.field("n_masked_boxes", pa.int32()),
+            pa.field("n_columns", pa.int32()),
+            pa.field("footnote_text", pa.string()),
+            pa.field("n_footnotes", pa.int32()),
+            pa.field("removed", pa.string()),
             pa.field("model_id", pa.string()),
         ]
     )
@@ -125,6 +137,12 @@ class StreamingPaddleOCRWriter:
         dry_fires: int = 0,
         dry_max_L: int = 0,
         retried: bool = False,
+        layout_masked: bool = False,
+        n_masked_boxes: int = 0,
+        n_columns: int = 1,
+        footnote_text: str = "",
+        n_footnotes: int = 0,
+        removed: str = "none",
     ) -> None:
         self._records.append(
             {
@@ -146,6 +164,12 @@ class StreamingPaddleOCRWriter:
                 "skip_reason": "",
                 "error_stage": "",
                 "error_message": "",
+                "layout_masked": bool(layout_masked),
+                "n_masked_boxes": int(n_masked_boxes),
+                "n_columns": int(n_columns),
+                "footnote_text": footnote_text or "",
+                "n_footnotes": int(n_footnotes),
+                "removed": removed or "none",
                 "model_id": self.model_id,
             }
         )
@@ -184,6 +208,12 @@ class StreamingPaddleOCRWriter:
                 "skip_reason": skip_reason or "",
                 "error_stage": "",
                 "error_message": "",
+                "layout_masked": False,
+                "n_masked_boxes": 0,
+                "n_columns": 0,
+                "footnote_text": "",
+                "n_footnotes": 0,
+                "removed": "none",
                 "model_id": self.model_id,
             }
         )
@@ -219,6 +249,12 @@ class StreamingPaddleOCRWriter:
                 "skip_reason": "",
                 "error_stage": stage,
                 "error_message": short,
+                "layout_masked": False,
+                "n_masked_boxes": 0,
+                "n_columns": 0,
+                "footnote_text": "",
+                "n_footnotes": 0,
+                "removed": "none",
                 "model_id": self.model_id,
             }
         )

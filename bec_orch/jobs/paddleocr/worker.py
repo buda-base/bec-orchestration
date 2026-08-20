@@ -25,8 +25,11 @@ Per volume:
      recorded, and rows are streamed to parquet.
 
 The engine + processor are loaded once on construction and reused for every
-volume. Everything model-specific comes from :class:`PaddleOCRConfig`, so
-``paddleocr_v2`` reuses this class unchanged.
+volume. Everything model-specific comes from :class:`PaddleOCRConfig`.
+``paddleocr_v2`` reuses this class with ``layout_mask_enabled=True`` and
+``layout_split_columns=True`` so header/footer detections from
+``layout_detection_v1`` are painted with the page background, and two-column
+pages are cropped and OCR'd as separate requests (joined with two line breaks).
 """
 
 from __future__ import annotations
@@ -50,6 +53,12 @@ from bec_orch.errors import RetryableTaskError, TerminalTaskError
 
 from .config import PaddleOCRConfig
 from .filter import load_skip_map
+from .layout_mask import apply_header_footer_mask, load_layout_map, removed_code
+from .layout_split import (
+    crop_body_regions,
+    crop_labeled_regions,
+    join_column_texts,
+)
 from .model_sync import sync_checkpoint
 from .parquet_writer import StreamingPaddleOCRWriter
 from .postprocess import normalize_text, rep_score
@@ -69,6 +78,15 @@ class _FetchedPage:
     etag: str
     image: Image.Image | None
     res_scale: float = 1.0
+    layout_masked: bool = False
+    n_masked_boxes: int = 0
+    # When a two-column split fired, these are the left-to-right crops to OCR
+    # instead of ``image``. None = OCR the full page.
+    column_images: list[Image.Image] | None = None
+    n_columns: int = 1
+    footnote_images: list[Image.Image] | None = None
+    n_footnotes: int = 0
+    removed: str = "none"
 
 
 @dataclass
@@ -92,6 +110,8 @@ class _OCRResult:
     # True if this page was re-decoded at temperature (high DRY severity) and
     # ``raw_text`` is the retry pick rather than the greedy output.
     retried: bool = False
+    footnote_text: str = ""
+    n_footnotes: int = 0
 
 
 class PaddleOCRJobWorker:
@@ -372,6 +392,7 @@ class PaddleOCRJobWorker:
         # Pre-filter via the sibling classification job. Skipped pages are
         # recorded (skipped=True) and dropped from the OCR manifest.
         ocr_manifest, n_skipped = self._apply_filter(ctx, manifest, writer)
+        layout_map = self._load_layout_map(ctx)
 
         n_to_ocr = len(ocr_manifest)
         batch_size = max(1, cfg.ocr_batch_size)
@@ -393,7 +414,9 @@ class PaddleOCRJobWorker:
                 batch_manifest = ocr_manifest[start:stop]
 
                 t_fetch = time.time()
-                fetched, failed = self._fetch_and_decode(vol_prefix, batch_manifest)
+                fetched, failed = self._fetch_and_decode(
+                    vol_prefix, batch_manifest, layout_map
+                )
                 t_fetch_total += time.time() - t_fetch
 
                 for f in failed:
@@ -457,6 +480,12 @@ class PaddleOCRJobWorker:
                                 dry_fires=res.dry_fires,
                                 dry_max_L=res.dry_max_L,
                                 retried=res.retried,
+                                layout_masked=page.layout_masked,
+                                n_masked_boxes=page.n_masked_boxes,
+                                n_columns=page.n_columns,
+                                footnote_text=normalize_text(res.footnote_text),
+                                n_footnotes=page.n_footnotes,
+                                removed=page.removed,
                             )
                             if res.truncated:
                                 ocr_truncated += 1
@@ -482,6 +511,18 @@ class PaddleOCRJobWorker:
 
                 # Free the decoded images for this batch.
                 for page in fetched:
+                    for im in (page.column_images or []):
+                        try:
+                            im.close()
+                        except Exception:  # noqa: BLE001 — best-effort
+                            pass
+                    page.column_images = None
+                    for im in (page.footnote_images or []):
+                        try:
+                            im.close()
+                        except Exception:  # noqa: BLE001 — best-effort
+                            pass
+                    page.footnote_images = None
                     if page.image is not None:
                         try:
                             page.image.close()
@@ -601,13 +642,84 @@ class PaddleOCRJobWorker:
         return ocr_manifest, n_skipped
 
     # ------------------------------------------------------------------
+    # layout_detection_v1 header/footer mask
+    # ------------------------------------------------------------------
+
+    def _load_layout_map(self, ctx: JobContext) -> dict[str, list[dict[str, Any]]]:
+        """Load sibling layout boxes; empty dict means "don't mask".
+
+        Missing layout is a warning (or a terminal failure if required), matching
+        the classification pre-filter's required/optional behaviour.
+        """
+        cfg = self.cfg
+        if not (cfg.layout_mask_enabled or cfg.layout_split_columns or cfg.layout_isolate_footnotes):
+            return {}
+
+        loc = ctx.artifacts_location
+        vol = ctx.volume
+        layout_map, found = load_layout_map(loc.bucket, loc.prefix, loc.basename, cfg)
+        if not found:
+            if cfg.layout_mask_required:
+                raise TerminalTaskError(
+                    f"{cfg.layout_mask_job_name} artifact missing for {vol.w_id}/{vol.i_id} "
+                    f"(layout_mask_required=True)"
+                )
+            logger.warning(
+                f"[paddleocr] {vol.w_id}/{vol.i_id}: no {cfg.layout_mask_job_name} output "
+                f"found — OCR-ing full unmasked pages (layout_mask_required=False)"
+            )
+            return {}
+
+        mask_labels = {s.strip().lower() for s in cfg.layout_mask_labels}
+        n_paintable = 0
+        n_boxes = 0
+        for boxes in layout_map.values():
+            hits = [
+                b for b in boxes
+                if str(b.get("label") or "").strip().lower() in mask_labels
+            ]
+            if hits:
+                n_paintable += 1
+                n_boxes += len(hits)
+        logger.info(
+            f"[paddleocr] {vol.w_id}/{vol.i_id}: layout mask on "
+            f"{n_paintable}/{len(layout_map)} pages ({n_boxes} {sorted(mask_labels)} boxes); "
+            f"protect={list(cfg.layout_mask_protect_labels)}"
+        )
+        if cfg.layout_split_columns:
+            from .layout_split import select_column_rects, text_area_rects
+
+            n_split = 0
+            for boxes in layout_map.values():
+                rects = text_area_rects(
+                    boxes, 1000, 1000, label=cfg.layout_column_label
+                )
+                if select_column_rects(
+                    rects,
+                    min_vert_overlap=cfg.layout_column_min_vert_overlap,
+                    max_horiz_overlap=cfg.layout_column_max_horiz_overlap,
+                ):
+                    n_split += 1
+            logger.info(
+                f"[paddleocr] {vol.w_id}/{vol.i_id}: two-column split on "
+                f"{n_split}/{len(layout_map)} pages "
+                f"(vert>={cfg.layout_column_min_vert_overlap:g}, "
+                f"horiz<{cfg.layout_column_max_horiz_overlap:g})"
+            )
+        return layout_map
+
+    # ------------------------------------------------------------------
     # Fetch + decode
     # ------------------------------------------------------------------
 
     def _fetch_and_decode(
-        self, vol_prefix: str, manifest: list[dict[str, Any]]
+        self,
+        vol_prefix: str,
+        manifest: list[dict[str, Any]],
+        layout_map: dict[str, list[dict[str, Any]]] | None = None,
     ) -> tuple[list[_FetchedPage], list[_FailedPage]]:
         cfg = self.cfg
+        layout_map = layout_map or {}
         ok_by_filename: dict[str, _FetchedPage] = {}
         ko_by_filename: dict[str, _FailedPage] = {}
 
@@ -642,8 +754,85 @@ class PaddleOCRJobWorker:
                     error=f"unexpected decode error: {e}",
                 )
                 return
+            layout_masked = False
+            n_masked_boxes = 0
+            column_images: list[Image.Image] | None = None
+            n_columns = 1
+            footnote_images: list[Image.Image] | None = None
+            n_footnotes = 0
+            removed = "none"
+            boxes = (
+                layout_map.get(filename)
+                if (
+                    cfg.layout_mask_enabled
+                    or cfg.layout_split_columns
+                    or cfg.layout_isolate_footnotes
+                )
+                else None
+            )
+            if boxes and cfg.layout_mask_enabled:
+                try:
+                    img, n_masked_boxes = apply_header_footer_mask(
+                        img,
+                        boxes,
+                        mask_labels=cfg.layout_mask_labels,
+                        protect_labels=cfg.layout_mask_protect_labels,
+                        pad_px=cfg.layout_mask_pad_px,
+                    )
+                    layout_masked = n_masked_boxes > 0
+                    removed = removed_code(boxes)
+                except Exception as e:  # noqa: BLE001 — never fail a page on masking
+                    logger.warning(
+                        f"[paddleocr] layout mask failed for {filename}: {e}; OCR-ing unmasked"
+                    )
+            if boxes and cfg.layout_isolate_footnotes:
+                try:
+                    fn_crops = crop_labeled_regions(
+                        img,
+                        boxes,
+                        label=cfg.layout_footnote_label,
+                        margin_frac=cfg.layout_footnote_margin_frac,
+                        min_px=cfg.layout_footnote_margin_min_px,
+                        box_margin_frac=cfg.layout_footnote_box_margin_frac,
+                    )
+                    if fn_crops:
+                        footnote_images = fn_crops
+                        n_footnotes = len(fn_crops)
+                except Exception as e:  # noqa: BLE001 — never fail a page on footnotes
+                    logger.warning(
+                        f"[paddleocr] footnote isolate failed for {filename}: {e}"
+                    )
+                    footnote_images = None
+                    n_footnotes = 0
+            if boxes and cfg.layout_split_columns:
+                try:
+                    crops = crop_body_regions(
+                        img,
+                        boxes,
+                        label=cfg.layout_column_label,
+                        min_vert_overlap=cfg.layout_column_min_vert_overlap,
+                        max_horiz_overlap=cfg.layout_column_max_horiz_overlap,
+                        margin_frac=cfg.layout_column_margin_frac,
+                    )
+                    if crops:
+                        column_images = crops
+                        n_columns = len(crops)
+                except Exception as e:  # noqa: BLE001 — never fail a page on split
+                    logger.warning(
+                        f"[paddleocr] column split failed for {filename}: {e}; OCR-ing full page"
+                    )
             ok_by_filename[filename] = _FetchedPage(
-                filename=filename, etag=etag, image=img, res_scale=res_scale
+                filename=filename,
+                etag=etag,
+                image=img,
+                res_scale=res_scale,
+                layout_masked=layout_masked,
+                n_masked_boxes=n_masked_boxes,
+                column_images=column_images,
+                n_columns=n_columns,
+                footnote_images=footnote_images,
+                n_footnotes=n_footnotes,
+                removed=removed,
             )
 
         with ThreadPoolExecutor(max_workers=cfg.s3_fetch_concurrency) as pool:
@@ -678,14 +867,34 @@ class PaddleOCRJobWorker:
         high-severity pages (``dry_fires >= dry_retry_min_fires`` or leftover
         ``rep_score >= dry_retry_min_rep``) at temperature, keeping the lowest-rep
         sample.
+
+        Two-column pages contribute one request per crop; results are joined
+        left-to-right with ``cfg.layout_column_join`` after decode (and after
+        any DRY retry).
         """
         cfg = self.cfg
-        prompts = []
-        for p in pages:
-            assert p.image is not None, f"image for {p.filename} was cleared before OCR"
-            prompts.append(
-                {"prompt": self.prompt_text, "multi_modal_data": {"image": p.image}}
-            )
+        prompts: list[dict[str, Any]] = []
+        owners: list[tuple[int, str]] = []  # (page index, "body"|"footnote")
+        for i, p in enumerate(pages):
+            body_images = p.column_images if p.column_images else None
+            if body_images:
+                for im in body_images:
+                    prompts.append(
+                        {"prompt": self.prompt_text, "multi_modal_data": {"image": im}}
+                    )
+                    owners.append((i, "body"))
+            else:
+                assert p.image is not None, f"image for {p.filename} was cleared before OCR"
+                prompts.append(
+                    {"prompt": self.prompt_text, "multi_modal_data": {"image": p.image}}
+                )
+                owners.append((i, "body"))
+            if p.footnote_images:
+                for im in p.footnote_images:
+                    prompts.append(
+                        {"prompt": self.prompt_text, "multi_modal_data": {"image": im}}
+                    )
+                    owners.append((i, "footnote"))
 
         dry_on = bool(cfg.dry_multiplier and cfg.dry_multiplier > 0)
         stats_dir = tempfile.mkdtemp(prefix="bec_dry_") if dry_on else None
@@ -707,12 +916,12 @@ class PaddleOCRJobWorker:
                 else {}
             )
 
-            results: list[_OCRResult] = []
+            unit_results: list[_OCRResult] = []
             for i, o in enumerate(outputs):
                 out = o.outputs[0]
                 finish_reason = out.finish_reason or ""
                 st = dry_stats.get(f"{i:06d}", {})
-                results.append(
+                unit_results.append(
                     _OCRResult(
                         raw_text=out.text or "",
                         output_tokens=len(out.token_ids),
@@ -725,12 +934,73 @@ class PaddleOCRJobWorker:
                 )
 
             if dry_on and cfg.dry_retry_temp and cfg.dry_retry_temp > 0:
-                self._apply_dry_retry(prompts, results)
+                self._apply_dry_retry(prompts, unit_results)
 
-            return results
+            return self._merge_page_results(owners, unit_results, n_pages=len(pages))
         finally:
             if stats_dir:
                 shutil.rmtree(stats_dir, ignore_errors=True)
+
+    def _merge_page_results(
+        self,
+        owners: list[tuple[int, str]],
+        unit_results: list[_OCRResult],
+        *,
+        n_pages: int,
+    ) -> list[_OCRResult]:
+        """Join per-crop OCR results back into one result per page.
+
+        Body crops (full page or columns) become ``raw_text``; footnote crops
+        are merged into ``footnote_text`` and kept out of the body.
+        """
+        body: list[list[_OCRResult]] = [[] for _ in range(n_pages)]
+        notes: list[list[_OCRResult]] = [[] for _ in range(n_pages)]
+        for (page_i, kind), res in zip(owners, unit_results, strict=True):
+            if kind == "footnote":
+                notes[page_i].append(res)
+            else:
+                body[page_i].append(res)
+        join = self.cfg.layout_column_join
+
+        def _combine(parts: list[_OCRResult], *, as_footnote: bool) -> _OCRResult:
+            if not parts:
+                return _OCRResult(raw_text="", output_tokens=0, truncated=False, finish_reason="")
+            text = (
+                parts[0].raw_text
+                if len(parts) == 1
+                else join_column_texts([p.raw_text for p in parts], sep=join)
+            )
+            combined = _OCRResult(
+                raw_text=text if not as_footnote else "",
+                output_tokens=sum(p.output_tokens for p in parts),
+                truncated=any(p.truncated for p in parts),
+                finish_reason=(
+                    "length" if any(p.truncated for p in parts) else (parts[-1].finish_reason or "")
+                ),
+                dry_fires=sum(p.dry_fires for p in parts),
+                dry_max_L=max((p.dry_max_L for p in parts), default=0),
+                dry_sum_penalty=sum(p.dry_sum_penalty for p in parts),
+                retried=any(p.retried for p in parts),
+                footnote_text=text if as_footnote else "",
+                n_footnotes=len(parts) if as_footnote else 0,
+            )
+            return combined
+
+        merged: list[_OCRResult] = []
+        for i in range(n_pages):
+            body_res = _combine(body[i], as_footnote=False)
+            note_res = _combine(notes[i], as_footnote=True)
+            body_res.footnote_text = note_res.footnote_text
+            body_res.n_footnotes = note_res.n_footnotes
+            body_res.output_tokens += note_res.output_tokens
+            body_res.truncated = body_res.truncated or note_res.truncated
+            body_res.dry_fires += note_res.dry_fires
+            body_res.dry_max_L = max(body_res.dry_max_L, note_res.dry_max_L)
+            body_res.retried = body_res.retried or note_res.retried
+            if note_res.truncated:
+                body_res.finish_reason = "length"
+            merged.append(body_res)
+        return merged
 
     def _apply_dry_retry(
         self, prompts: list[dict[str, Any]], results: list[_OCRResult]

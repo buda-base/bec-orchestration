@@ -1,9 +1,9 @@
 """Configuration for the PaddleOCR-VL OCR job(s).
 
 One dataclass drives every PaddleOCR-VL job. ``paddleocr_v1`` uses the
-defaults below verbatim; a future ``paddleocr_v2`` only needs to override
-``checkpoint_s3_uri`` (and possibly ``prompt`` / generation knobs) at
-registration or job-creation time — no code change required.
+defaults below verbatim; ``paddleocr_v2`` reuses the same checkpoint and
+turns on ``layout_mask_enabled`` so header/footer regions from
+``layout_detection_v1`` are painted with page-background colour before OCR.
 
 Serving stack (see ``bec-ocr-training/docs/eval_in_production.md``):
     **vLLM + DRY-a12 + adaptive per-page resolution**, greedy decoding.
@@ -264,6 +264,70 @@ class PaddleOCRConfig:
     filter_required: bool = False
 
     # ------------------------------------------------------------------
+    # layout_detection_v1 header/footer background fill (paddleocr_v2)
+    # ------------------------------------------------------------------
+    # When True, load the sibling ``layout_detection_v1`` parquet for the same
+    # volume+version and paint detected header/footer boxes with an estimate of
+    # the page background colour before OCR. Footnotes are never painted.
+    # ``paddleocr_v1`` leaves this False; ``paddleocr_v2`` turns it on at
+    # registration. Missing layout output is a warning (OCR proceeds unmasked)
+    # unless ``layout_mask_required`` is True.
+    layout_mask_enabled: bool = False
+
+    layout_mask_job_name: str = "layout_detection_v1"
+
+    # Class names to blank. ``layout_detection_v1`` emits header / text-area /
+    # footnote / footer; we only want running titles and folio numbers gone.
+    layout_mask_labels: tuple[str, ...] = ("header", "footer")
+
+    # Regions that must never be blanked by the header/footer pass, even if a
+    # header/footer box overlaps them. Footnote is listed so the H/F pass
+    # cannot wipe notes before they are cropped for isolated OCR.
+    layout_mask_protect_labels: tuple[str, ...] = ("text-area", "footnote")
+
+    # Extra pixels grown around each painted box (helps slightly tight
+    # detections). 0 = exact box.
+    layout_mask_pad_px: int = 2
+
+    # If True, a missing layout artifact makes the volume a terminal failure.
+    # If False (default), the worker logs a warning and OCRs the raw pages.
+    layout_mask_required: bool = False
+
+    # ------------------------------------------------------------------
+    # Two-column split (paddleocr_v2, uses the same layout parquet)
+    # ------------------------------------------------------------------
+    # When two ``text-area`` boxes overlap >= ``layout_column_min_vert_overlap``
+    # vertically and < ``layout_column_max_horiz_overlap`` horizontally, crop
+    # each (with a background-padded margin) and OCR them as separate requests.
+    # Transcriptions are concatenated left-to-right with ``layout_column_join``
+    # (two line breaks). ``paddleocr_v1`` leaves this off.
+    layout_split_columns: bool = False
+
+    layout_column_label: str = "text-area"
+    layout_column_min_vert_overlap: float = 0.60
+    layout_column_max_horiz_overlap: float = 0.05
+    # Synthetic background margin around each cropped column, as a fraction
+    # of min(page_w, page_h). The pad is not cropped from the scan and may
+    # extend past the page edge.
+    layout_column_margin_frac: float = 0.02
+    layout_column_join: str = "\n\n"
+
+    # Isolate footnotes: crop each ``footnote`` box, OCR it separately, and
+    # write the merged transcription to ``footnote_text`` (not ``page_text``).
+    # After cropping, the footnote regions are painted with background so they
+    # do not leak into the body OCR. ``paddleocr_v1`` leaves this off.
+    layout_isolate_footnotes: bool = False
+    layout_footnote_label: str = "footnote"
+    # Padding around each footnote crop. The pad is synthetic page
+    # background (not cropped from the scan) and may extend past the page
+    # edge. Size is the max of this fraction of min(page_w, page_h),
+    # ``layout_footnote_margin_min_px``, and
+    # ``layout_footnote_box_margin_frac`` of the box height.
+    layout_footnote_margin_frac: float = 0.05
+    layout_footnote_margin_min_px: int = 32
+    layout_footnote_box_margin_frac: float = 0.5
+
+    # ------------------------------------------------------------------
     # Failure handling
     # ------------------------------------------------------------------
     volume_timeout_s: float = 3600.0
@@ -359,3 +423,35 @@ class PaddleOCRConfig:
             raise ValueError(f"s3_fetch_concurrency must be >= 1, got {self.s3_fetch_concurrency}")
         if not 0.0 <= self.max_page_failure_rate <= 1.0:
             raise ValueError(f"max_page_failure_rate out of [0,1]: {self.max_page_failure_rate}")
+        if self.layout_mask_pad_px < 0:
+            raise ValueError(f"layout_mask_pad_px must be >= 0, got {self.layout_mask_pad_px}")
+        if not self.layout_mask_labels:
+            raise ValueError("layout_mask_labels must be non-empty")
+        if not 0.0 <= self.layout_column_min_vert_overlap <= 1.0:
+            raise ValueError(
+                f"layout_column_min_vert_overlap out of [0,1]: "
+                f"{self.layout_column_min_vert_overlap}"
+            )
+        if not 0.0 <= self.layout_column_max_horiz_overlap <= 1.0:
+            raise ValueError(
+                f"layout_column_max_horiz_overlap out of [0,1]: "
+                f"{self.layout_column_max_horiz_overlap}"
+            )
+        if self.layout_column_margin_frac < 0.0:
+            raise ValueError(
+                f"layout_column_margin_frac must be >= 0, got {self.layout_column_margin_frac}"
+            )
+        if self.layout_footnote_margin_frac < 0.0:
+            raise ValueError(
+                f"layout_footnote_margin_frac must be >= 0, got {self.layout_footnote_margin_frac}"
+            )
+        if self.layout_footnote_margin_min_px < 0:
+            raise ValueError(
+                f"layout_footnote_margin_min_px must be >= 0, got "
+                f"{self.layout_footnote_margin_min_px}"
+            )
+        if self.layout_footnote_box_margin_frac < 0.0:
+            raise ValueError(
+                f"layout_footnote_box_margin_frac must be >= 0, got "
+                f"{self.layout_footnote_box_margin_frac}"
+            )

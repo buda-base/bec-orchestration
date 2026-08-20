@@ -21,8 +21,8 @@ resolution**, greedy decoding, with a high-severity temperature retry.
 
 This package is **version-agnostic**: everything model-specific lives in
 `PaddleOCRConfig`. The registered job `paddleocr_v1` uses the defaults verbatim.
-A future `paddleocr_v2` (same code, different checkpoint) is a one-line registry
-entry — see the comment in `core/registry.py`.
+`paddleocr_v2` reuses the same checkpoint and turns on header/footer
+background fill from `layout_detection_v1` (see below).
 
 ## At a glance
 
@@ -101,6 +101,82 @@ label doesn't reliably win, but they always sit below the wide empty gap
 (~0.40–0.84) that separates them from real content (~0.3% of real pages fall
 below 0.30). Set `filter_min_prob: 0.0` to disable and skip on labels only.
 
+## Header/footer background fill (`paddleocr_v2`)
+
+When `layout_detection_v1` output exists for the same volume + version, v2
+paints detected **header** and **footer** boxes with an estimate of the page
+background colour before OCR, so running titles and folio numbers don't leak
+into the transcription. The `removed` column records what was blanked:
+`none`, `h` (header only), `f` (footer only), or `hf` (both). Overlap with
+`text-area` / `footnote` is subtracted from the H/F mask so an oversized
+header box cannot wipe body text or notes.
+
+**Footnotes** are cropped and OCR'd as separate requests
+(`layout_isolate_footnotes`). A footnote fully inside another — or ≥95% of
+its area covered by another (so a few-pixel overhang still counts) — is
+dropped so the same note isn't OCR'd twice. Their text is **not** in `page_text`; it is merged (top-to-bottom,
+`\n\n`) into `footnote_text`. Each crop is the detection box on synthetic
+page-background padding. A footer (or header) that sits inside the note is
+painted out on that crop.
+
+**Text-areas** are always extracted the same way when column split is on:
+one crop per kept box (two-column pair if the overlap heuristic matches,
+otherwise **every** non-nested text-area), synthetic margin, and anything
+outside the box is background. Overlapping footnotes are blanked on the
+body crop so they only appear in `footnote_text`.
+
+When a page has three or more text-areas, the crops are OCR'd in **reading
+order** computed by a recursive **XY-cut** (`reading_order_xycut`): the page
+is split at the widest whitespace valley (horizontal or vertical), recursing
+until each region is a single box. This reads a spanning title band first,
+then the columns beneath it top-to-bottom (column-major), which handles
+modern book pages such as a top two-column band, a centred title, then a
+second two-column band. The transcriptions are joined with `\n\n` in that
+order.
+
+If the layout artifact is missing, the worker logs a warning and OCRs the
+unmodified pages (`layout_mask_required=false`). v1 leaves this path off.
+
+| config key | v1 | v2 | meaning |
+|---|---|---|---|
+| `layout_mask_enabled` | `false` | `true` | load sibling layout parquet and paint |
+| `layout_mask_job_name` | `layout_detection_v1` | same | sibling job |
+| `layout_mask_labels` | `("header","footer")` | same | classes to blank |
+| `layout_mask_protect_labels` | `("text-area","footnote")` | same | never blank these |
+| `layout_mask_pad_px` | `2` | same | extra pixels around each painted box |
+| `layout_mask_required` | `false` | same | missing layout fails the volume if true |
+
+## Two-column split (`paddleocr_v2`)
+
+When two `text-area` boxes overlap **≥ 60% vertically** and **< 5%
+horizontally**, v2 crops each column. Otherwise each remaining text-area
+(after dropping boxes fully inside another) is cropped the same way. Crops
+sit on synthetic background margin, including past the page edge, and are
+queued as **separate** OCR requests. Column transcriptions are concatenated
+**left-to-right** with two line breaks (`\n\n`). A full-width text-area
+sitting on top of two columns will not pair with either (horizontal overlap
+is high); the pair is kept and the envelope is ignored.
+
+| config key | v1 | v2 | meaning |
+|---|---|---|---|
+| `layout_split_columns` | `false` | `true` | crop + OCR columns separately |
+| `layout_column_label` | `text-area` | same | class used as a column candidate |
+| `layout_column_min_vert_overlap` | `0.60` | same | shorter-box vertical overlap |
+| `layout_column_max_horiz_overlap` | `0.05` | same | narrower-box horizontal overlap |
+| `layout_column_margin_frac` | `0.02` | same | margin as a fraction of min(w,h) |
+| `layout_column_join` | `"\\n\\n"` | same | separator when reassembling |
+| `layout_isolate_footnotes` | `false` | `true` | OCR footnotes into `footnote_text` |
+| `layout_footnote_label` | `footnote` | same | class cropped as a footnote |
+| `layout_footnote_margin_frac` | `0.05` | same | footnote crop margin vs min(page_w, page_h) |
+| `layout_footnote_margin_min_px` | `32` | same | floor on footnote crop margin |
+| `layout_footnote_box_margin_frac` | `0.5` | same | also at least this fraction of the box height |
+
+Create the job (empty config is valid; masking, column split, and footnote isolation are on via the registry default):
+
+```bash
+bec jobs create --name paddleocr_v2 --config-text '{}'
+```
+
 ## Output
 
     s3://<dest-bucket>/paddleocr_v1/<W>/<I>/<version>/<W>-<I>-<version>.parquet
@@ -126,6 +202,12 @@ Parquet schema (one row per page):
 | `retried` | bool | page re-decoded at temperature (`dry_fires` ≥ threshold); `page_text` is the retry pick |
 | `skipped` | bool | page skipped by the pre-filter (no OCR run) |
 | `skip_reason` | string | classifier label / rule that caused the skip |
+| `layout_masked` | bool | header/footer boxes were painted with page background |
+| `n_masked_boxes` | int32 | number of header+footer boxes painted (0 if none) |
+| `n_columns` | int32 | number of text-area crops OCR'd (`1` if none / full page) |
+| `footnote_text` | string | isolated footnote transcription (merged with `\n\n`, or empty) |
+| `n_footnotes` | int32 | number of footnote boxes OCR'd |
+| `removed` | string | header/footer left out of `page_text`: `none` / `h` / `f` / `hf` |
 | `error_stage` | string | `""` / `"fetch"` / `"decode"` / `"ocr"` / `"postprocess"` |
 | `error_message` | string | short error (max 512 chars) |
 | `model_id` | string | checkpoint identifier that produced the row |
